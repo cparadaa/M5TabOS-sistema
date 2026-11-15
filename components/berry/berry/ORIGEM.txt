@@ -1,0 +1,10 @@
+origem: github.com/berry-lang/berry @ 65fce31
+
+MUDANCAS DO M5tabOS NO UPSTREAM (procure "M5tabOS" nos fontes). Ao atualizar
+o Berry, reaplicar - sem elas um script le e escreve qualquer endereco da
+memoria (docs/ANALISE_2026-10-21.md, B2):
+- src/be_vm.c, OP_SETMBR: recusa atribuir a nome que comeca com '.' (os
+  atributos internos do bytes: '.p', '.len', '.size').
+- src/be_byteslib.c, m_init e m_change_buffer: recusam o buffer mapeado
+  (bytes(comptr, tamanho)).
+- (em port/berry_conf.h) BE_USE_INTROSPECT_MODULE 0: toptr/fromptr/set.

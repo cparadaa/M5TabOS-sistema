@@ -1,8 +1,10 @@
 #include "fundo.h"
 #include "app.h"
+#include "idioma.h"
 #include "tab5_donos.hpp"
 #include "pool_tarefas.h"
 #include "parada.hpp"      // pedir/confirmar a saida - o mesmo de GPS, Mesh e Mesh BLE
+#include "internal.hpp"    // sistema_na_interface
 
 #include <string.h>
 #include <stdio.h>
@@ -41,14 +43,18 @@ struct fundo_s {
   parada_t            parada;         // pedido de parada e confirmacao de saida
   SemaphoreHandle_t   acordar;        // tira o loop de fundo_esperar(); criado 1x, nunca apagado
   int                 notif;
+  bool                visivel;        // a pastilha ja foi publicada (ver aviso_ms)
   int64_t             desde_us;
   int64_t             cedeu_us;
+  int64_t             pediu_us;       // parada pedida SEM ESPERA (0 = nao): o prazo conta daqui
   char                resumo[NOTIF_RESUMO];
 };
 
 static fundo_s          s_f[FUNDO_MAX];
 static portMUX_TYPE     s_mux = portMUX_INITIALIZER_UNLOCKED;
 static std::atomic<bool> s_perfil_sujo{false};
+// Os pedidos de fora da interface (sistema_fundo_pedir), ate a vaga liberar.
+static std::atomic<const fundo_def_t*> s_pedidos[FUNDO_MAX];
 
 static void trampolim(void* arg)
 {
@@ -124,13 +130,14 @@ bool sistema_fundo_iniciar(const fundo_def_t* d)
   f->def      = d;
   f->desde_us = esp_timer_get_time();
   f->cedeu_us = f->desde_us;
-  snprintf(f->resumo, sizeof(f->resumo), "rodando");
+  snprintf(f->resumo, sizeof(f->resumo), tr("rodando"));
 
   // VISIVEL DESDE O PRIMEIRO INSTANTE - a pastilha cinza e a promessa de
   // "nada roda escondido". O registro e idempotente pelo nome.
   f->notif = notif_registrar(d->nome);
   notif_silenciar(f->notif, d->com_som ? !d->com_som() : false);
-  notif_publicar(f->notif, 1, NOTIF_ESTADO, f->resumo);
+  f->visivel = d->aviso_ms == 0;
+  if (f->visivel) { notif_publicar(f->notif, 1, NOTIF_ESTADO, f->resumo); }
 
   const bool pronta = f->acordar && parada_preparar(&f->parada);
   taskENTER_CRITICAL(&s_mux);
@@ -138,7 +145,7 @@ bool sistema_fundo_iniciar(const fundo_def_t* d)
   taskEXIT_CRITICAL(&s_mux);
   if (!pronta
    || !pool_criar(nullptr, trampolim, f, d->nome, d->pilha ? d->pilha : 4096,
-                  FUNDO_PRIORIDADE, DONO_FUNDO, d->nome)) {   // dono: ver hal/tab5_donos.hpp
+                  d->prioridade ? d->prioridade : FUNDO_PRIORIDADE, DONO_FUNDO, d->nome)) {   // dono: ver hal/tab5_donos.hpp
     ESP_LOGE(TAG, "sem memoria para a tarefa de '%s'", d->nome);
     parada_desistir(&f->parada);
     finalizar(f);
@@ -168,10 +175,36 @@ bool sistema_fundo_parar(const fundo_def_t* d)
   // de pe, ela sai quando puder, e fundo_manter() limpa nessa hora. A
   // pastilha diz a verdade enquanto isso.
   ESP_LOGE(TAG, "'%s' nao saiu em %d ms - fica parando em fundo", d->nome, FUNDO_PARAR_MS);
-  notif_publicar(f->notif, 1, NOTIF_ESTADO, "parando...");
+  notif_publicar(f->notif, 1, NOTIF_ESTADO, tr("parando..."));
   f->abandonada = true;
   f->parando = false;
   return false;
+}
+
+bool sistema_fundo_pedir(const fundo_def_t* d)
+{
+  if (!d || !d->corpo || !d->nome) { return false; }
+  bool ok = false;
+  for (int i = 0; i < FUNDO_MAX && !ok; ++i) { ok = s_pedidos[i].load() == d; }
+  for (int i = 0; i < FUNDO_MAX && !ok; ++i) {
+    const fundo_def_t* livre = nullptr;
+    ok = s_pedidos[i].compare_exchange_strong(livre, d);
+  }
+  if (!ok) { ESP_LOGW(TAG, "sem vaga para o pedido de '%s'", d->nome); return false; }
+  if (sistema_na_interface()) { fundo_manter(); } else { sistema_acordar_interface(); }
+  return true;
+}
+
+// Na interface: liga o que foi pedido e ja tem a vaga livre. O que ainda esta
+// saindo fica pedido - o trampolim acorda a interface quando ele sair.
+static void atender_pedidos(void)
+{
+  for (int i = 0; i < FUNDO_MAX; ++i) {
+    const fundo_def_t* d = s_pedidos[i].load();
+    if (!d || achar(d)) { continue; }
+    s_pedidos[i] = nullptr;
+    if (!sistema_fundo_iniciar(d)) { ESP_LOGW(TAG, "o pedido de '%s' nao ligou", d->nome); }
+  }
 }
 
 bool sistema_fundo_ativo(const fundo_def_t* d)
@@ -193,7 +226,7 @@ int sistema_fundo_listar(fundo_info_t* out, int max)
   taskENTER_CRITICAL(&s_mux);
   for (int i = 0; i < FUNDO_MAX && n < max; ++i) {
     const fundo_s* f = &s_f[i];
-    if (!f->em_uso) { continue; }
+    if (!f->em_uso || !f->visivel) { continue; }
     out[n].nome = f->def->nome;
     out[n].ha_s = (uint32_t)((agora - f->desde_us) / 1000000);
     memcpy(out[n].resumo, f->resumo, sizeof(out[n].resumo));
@@ -253,10 +286,14 @@ void fundo_estado(fundo_t* f, int quantidade, const char* resumo)
   memcpy(f->resumo, r, sizeof(r));
   taskEXIT_CRITICAL(&s_mux);
   // Quantidade minima 1: a pastilha nunca some enquanto o fundo roda.
-  notif_publicar(f->notif, quantidade > 0 ? quantidade : 1, NOTIF_ESTADO, r);
+  if (f->visivel) { notif_publicar(f->notif, quantidade > 0 ? quantidade : 1, NOTIF_ESTADO, r); }
 }
 
 // ---- o kernel ---------------------------------------------------------------
+
+// app.h. A mesma marca que um fundo subindo ou parando deixa: quem a atende e
+// fundo_manter(), na interface.
+void sistema_perfil_mudou(void) { s_perfil_sujo = true; sistema_acordar_interface(); }
 
 // Sob a trava: sistema_impor_preferencias() pode ser chamada fora da
 // interface. So SOMA - e o teto de clock (cpu_max) fica com a tela: um fundo
@@ -280,34 +317,44 @@ void fundo_somar_perfil(tab5_perfil_t& p)
   taskEXIT_CRITICAL(&s_mux);
 }
 
-int fundo_piso_repouso(void)
-{
-  int piso = 0;
-  taskENTER_CRITICAL(&s_mux);
-  for (int i = 0; i < FUNDO_MAX; ++i) {
-    if (s_f[i].em_uso && s_f[i].def->piso_repouso_mhz > piso) {
-      piso = s_f[i].def->piso_repouso_mhz;
-    }
-  }
-  taskEXIT_CRITICAL(&s_mux);
-  return piso;
-}
-
 void fundo_manter(void)
 {
   for (int i = 0; i < FUNDO_MAX; ++i) {
     fundo_s* f = &s_f[i];
     if (!f->em_uso || f->parando) { continue; }
+    if (!f->visivel && !saiu(f)
+     && esp_timer_get_time() - f->desde_us >= (int64_t)f->def->aviso_ms * 1000) {
+      // Passou do aviso_ms e ainda roda: agora aparece, com o ultimo resumo.
+      char r[NOTIF_RESUMO];
+      taskENTER_CRITICAL(&s_mux);
+      memcpy(r, f->resumo, sizeof(r));
+      taskEXIT_CRITICAL(&s_mux);
+      f->visivel = true;
+      notif_publicar(f->notif, 1, NOTIF_ESTADO, r);
+    }
     if (saiu(f)) {
       // O loop terminou sozinho, ou a abandonada por fim saiu: recolhe o
       // semaforo (ele foi dado) e limpa.
       parada_pedir(&f->parada, 0);
       finalizar(f);
     } else if (f->parar_pedido && !f->abandonada) {
+      // SEM ESPERAR: quem pediu foi o usuario (o X da central) ou o console.
+      // Esperar aqui seria a interface congelada ate o loop sair - e o loop
+      // pode estar justamente esperando a interface (o tocador, ligando o
+      // alto-falante). Pede, acorda o loop e segue: quando ele sair, o
+      // ramo de cima (saiu) chama ao_parar() e limpa, como promete o contrato.
       f->parar_pedido = false;
-      sistema_fundo_parar(f->def);
+      f->parada.pedido = true;
+      f->pediu_us = esp_timer_get_time();
+      xSemaphoreGive(f->acordar);
+      notif_publicar(f->notif, 1, NOTIF_ESTADO, tr("parando..."));
+    } else if (f->pediu_us && !f->abandonada
+            && esp_timer_get_time() - f->pediu_us > (int64_t)FUNDO_PARAR_MS * 1000) {
+      ESP_LOGE(TAG, "'%s' nao saiu em %d ms - fica parando em fundo", f->def->nome, FUNDO_PARAR_MS);
+      f->abandonada = true;
     }
   }
+  atender_pedidos();   // depois da limpeza: a vaga de quem acabou de sair ja serve
   // O conjunto mudou: o perfil efetivo (tela + fundos) e reaplicado aqui, na
   // interface, e so aqui. EM REPOUSO ESPERA: aplicar perfil mexe em brilho e
   // teto de clock, que o repouso esta segurando - vale ao acordar.

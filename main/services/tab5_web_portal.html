@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab5</title>
+<!-- O PORTAL (services/tab5_web_portal): a raiz do servidor do Tab5. Sem nada
+     de fora - funciona com o PC sem internet. Cada app aparece aqui dentro,
+     numa moldura propria que fica viva ao trocar (o terminal nao reconecta). -->
+<style>
+:root { --fundo:#0f1115; --painel:#171a21; --cartao:#1c1f27; --linha:#2a2e38; --texto:#dfe3ea; --apagado:#8a91a0;
+        --azul:#5ea2ff; --verde:#a6e22e; --laranja:#ff9f43; --erro:#ff6b6b; }
+* { box-sizing:border-box; }
+html, body { height:100%; margin:0; background:var(--fundo); color:var(--texto);
+             font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+button { font:inherit; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; background:#3a3f4c; color:#fff; }
+button:hover { filter:brightness(1.15); }
+button:disabled { opacity:.5; cursor:default; filter:none; }
+button.prim { background:#2c6fb0; }
+#tudo { display:flex; height:100%; }
+nav { width:232px; flex:none; background:var(--painel); border-right:1px solid var(--linha); display:flex; flex-direction:column; }
+#marca { padding:16px 16px 12px; border-bottom:1px solid var(--linha); }
+#marca b { display:block; font-size:16px; letter-spacing:.2px; }
+#marca small { color:var(--apagado); }
+#itens { flex:1; overflow:auto; padding:8px; display:flex; flex-direction:column; gap:2px; }
+#itens a { display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:var(--texto); text-decoration:none; }
+#itens a:hover { background:var(--linha); }
+#itens a.atual { background:#26324a; color:#fff; }
+#itens a .ic { width:20px; height:20px; flex:none; color:var(--apagado); }
+#itens a.atual .ic { color:var(--azul); }
+#itens a span { flex:1; }
+#itens .sep { color:var(--apagado); font-size:11px; text-transform:uppercase; letter-spacing:.8px; padding:12px 10px 4px; }
+.ponto { width:8px; height:8px; border-radius:50%; background:#444a57; flex:none; }
+.ponto.on { background:var(--verde); }
+#rodape { padding:12px; border-top:1px solid var(--linha); font-size:12px; color:var(--apagado); display:flex; flex-direction:column; gap:8px; }
+#rodape button { font-size:13px; padding:6px 10px; background:#4a2a2a; }
+main { flex:1; min-width:0; position:relative; display:flex; flex-direction:column; }
+#aviso { display:none; background:#4a3412; color:#ffd9a8; padding:8px 16px; font-size:13px; }
+#aviso.on { display:block; }
+#vistas { flex:1; position:relative; min-height:0; }
+.vista { position:absolute; inset:0; display:none; }
+.vista.on { display:block; }
+iframe.vista { width:100%; height:100%; border:0; background:var(--fundo); }
+.rolar { overflow:auto; padding:28px 32px; }
+h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:15px; margin:28px 0 12px; color:var(--apagado); font-weight:600; }
+.sub { color:var(--apagado); margin:0; }
+.grade { display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:14px; }
+.cartao { background:var(--cartao); border:1px solid var(--linha); border-radius:12px; padding:16px; }
+.cartao .rot { color:var(--apagado); font-size:12px; text-transform:uppercase; letter-spacing:.6px; }
+.cartao .val { font-size:26px; font-weight:650; margin:6px 0 2px; font-variant-numeric:tabular-nums; }
+.cartao .det { color:var(--apagado); font-size:13px; font-variant-numeric:tabular-nums; }
+.barra { height:6px; background:#2a2e38; border-radius:3px; margin-top:10px; overflow:hidden; }
+.barra i { display:block; height:100%; background:var(--azul); border-radius:3px; }
+.app { display:flex; flex-direction:column; gap:10px; }
+.app .topo { display:flex; align-items:center; gap:12px; }
+.app .ic { width:36px; height:36px; border-radius:10px; background:#26324a; color:var(--azul); display:flex; align-items:center; justify-content:center; flex:none; }
+.app .ic svg { width:20px; height:20px; }
+.app b { font-size:15px; } .app p { margin:0; color:var(--apagado); flex:1; }
+.app .est { font-size:12px; color:var(--apagado); display:flex; align-items:center; gap:6px; }
+.centro { display:flex; align-items:center; justify-content:center; height:100%; padding:24px; }
+.centro .cartao { max-width:420px; text-align:center; padding:28px; }
+.centro p { color:var(--apagado); }
+@media (max-width:720px) {
+  #tudo { flex-direction:column; }
+  nav { width:auto; flex-direction:row; align-items:center; border-right:0; border-bottom:1px solid var(--linha); }
+  #marca { border:0; padding:10px 12px; } #marca small { display:none; }
+  #itens { flex-direction:row; overflow-x:auto; padding:6px; } #itens .sep { display:none; }
+  #itens a { white-space:nowrap; } #rodape { display:none; }
+  .rolar { padding:18px 16px; }
+}
+</style>
+</head>
+<body>
+<div id="tudo">
+  <nav>
+    <div id="marca"><b>M5tabOS</b><small id="nome">Tab5</small></div>
+    <div id="itens"></div>
+    <div id="rodape">
+      <span id="ipTxt">—</span>
+      <button id="desligar" title="Fecha todos os apps no PC e desliga o servidor do Tab5">Desligar acesso pelo PC</button>
+    </div>
+  </nav>
+  <main>
+    <div id="aviso"></div>
+    <div id="vistas">
+      <div class="vista rolar" id="geral">
+        <h1>Visão geral</h1>
+        <p class="sub" id="geralSub">lendo o Tab5...</p>
+        <div class="grade" style="margin-top:20px">
+          <div class="cartao"><div class="rot">Bateria</div><div class="val" id="bPct">—</div><div class="det" id="bDet"></div><div class="barra"><i id="bBarra" style="width:0"></i></div></div>
+          <div class="cartao"><div class="rot">Rede</div><div class="val" id="rSsid" style="font-size:20px">—</div><div class="det" id="rDet"></div></div>
+          <div class="cartao"><div class="rot">Memória interna</div><div class="val" id="mInt">—</div><div class="det" id="mIntDet"></div><div class="barra"><i id="mIntBarra" style="width:0"></i></div></div>
+          <div class="cartao"><div class="rot">PSRAM</div><div class="val" id="mPs">—</div><div class="det" id="mPsDet"></div><div class="barra"><i id="mPsBarra" style="width:0"></i></div></div>
+          <div class="cartao"><div class="rot">Ligado há</div><div class="val" id="sLig">—</div><div class="det" id="sDet"></div></div>
+        </div>
+        <h2>Apps no PC</h2>
+        <div class="grade" id="apps"></div>
+        <p class="sub" style="margin-top:24px;font-size:13px" id="rodapeGeral"></p>
+      </div>
+      <div class="vista" id="fechado"><div class="centro"><div class="cartao">
+        <h1 id="fNome"></h1>
+        <p id="fTxt">Este app não está aberto no PC agora.</p>
+        <button class="prim" id="fAbrir">Abrir</button>
+        <p id="fErro" style="color:var(--erro);min-height:20px"></p>
+      </div></div></div>
+    </div>
+  </main>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const POST = { method: "POST", headers: { "X-Tab5": "1" } };
+// O que cada app faz e o icone (o portal so conhece os nomes; app novo cai no generico).
+const SOBRE = {
+  Terminal: ["Os comandos do Tab5 e o SSH, com o teclado do PC.",
+             '<path d="M4 6l5 5-5 5M11 17h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'],
+  Editor:   ["Os scripts Berry do cartão: editar, verificar e rodar no Tab5.",
+             '<path d="M8 6l-5 6 5 6M16 6l5 6-5 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'],
+  Camera:   ["A câmera do Tab5 ao vivo, e a foto em resolução cheia para baixar.",
+             '<path d="M4 8h3l2-2h6l2 2h3v10H4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/>'],
+  Mesh:     ["Conversas, nós e mapa da rede Meshtastic.",
+             '<circle cx="5" cy="12" r="2.2" fill="currentColor"/><circle cx="19" cy="6" r="2.2" fill="currentColor"/><circle cx="19" cy="18" r="2.2" fill="currentColor"/><path d="M7 11l10-4M7 13l10 4M19 8v8" stroke="currentColor" stroke-width="1.6"/>'],
+};
+const GERAL_IC = '<rect x="3" y="3" width="7" height="7" rx="1.5" fill="currentColor"/><rect x="14" y="3" width="7" height="7" rx="1.5" fill="currentColor" opacity=".6"/><rect x="3" y="14" width="7" height="7" rx="1.5" fill="currentColor" opacity=".6"/><rect x="14" y="14" width="7" height="7" rx="1.5" fill="currentColor" opacity=".6"/>';
+const svg = (p) => '<svg class="ic" viewBox="0 0 24 24">' + p + "</svg>";
+const sobre = (n) => SOBRE[n] || ["", '<circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="2"/>'];
+
+let sis = null, atual = null, primeira = true;
+const molduras = {};   // nome do app -> iframe (vivo enquanto a parte estiver aberta)
+
+function kb(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.round(n / 1024) + " KB"; }
+function tempo(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? d + " d " + h + " h" : h ? h + " h " + m + " min" : m + " min";
+}
+function esc(t) { return String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]); }
+function app(nome) { return sis && sis.apps.find((a) => a.nome === nome); }
+
+// ---- a barra lateral e a visao geral ---------------------------------------------
+function pintar() {
+  $("nome").textContent = sis.nome + " · " + sis.versao;
+  $("ipTxt").textContent = "http://" + sis.ip + "/";
+  const itens = $("itens");
+  itens.innerHTML = "";
+  const item = (id, rot, ic, on) => {
+    const a = document.createElement("a");
+    a.href = "#" + id;
+    a.className = atual === id ? "atual" : "";
+    a.innerHTML = svg(ic) + "<span>" + esc(rot) + "</span>" + (on === undefined ? "" : '<i class="ponto' + (on ? " on" : "") + '"></i>');
+    itens.appendChild(a);
+  };
+  item("geral", "Visão geral", GERAL_IC);
+  if (sis.apps.length) { const s = document.createElement("div"); s.className = "sep"; s.textContent = "Apps"; itens.appendChild(s); }
+  for (const a of sis.apps) item(a.nome, a.nome, sobre(a.nome)[1], a.aberto);
+
+  const b = sis.bateria;
+  $("bPct").textContent = b.pct >= 0 ? b.pct + "%" : "—";
+  $("bBarra").style.width = Math.max(0, b.pct) + "%";
+  $("bBarra").style.background = b.pct >= 0 && b.pct <= 15 ? "var(--erro)" : "var(--verde)";
+  $("bDet").textContent = b.volts.toFixed(2) + " V · " + (b.mA > 20 ? "carregando " : b.mA < -5 ? "gastando " : "") + Math.abs(b.mA) + " mA";
+  $("rSsid").textContent = sis.ssid || "—";
+  $("rDet").textContent = sis.ip;
+  const mem = (pre, livre, total) => {
+    $(pre).textContent = kb(livre) + " livres";
+    $(pre + "Det").textContent = "de " + kb(total);
+    $(pre + "Barra").style.width = Math.round(100 * (total - livre) / total) + "%";
+  };
+  mem("mInt", sis.mem.interna_livre, sis.mem.interna_total);
+  mem("mPs", sis.mem.psram_livre, sis.mem.psram_total);
+  $("sLig").textContent = tempo(sis.ligado_s);
+  $("sDet").textContent = "CPU a " + sis.cpu_mhz + " MHz · M5tabOS " + sis.versao;
+  $("geralSub").textContent = sis.nome + " na rede " + (sis.ssid || "Wi-Fi") + ". O que mudar no Tab5 aparece aqui sozinho.";
+
+  const g = $("apps");
+  g.innerHTML = "";
+  for (const a of sis.apps) {
+    const [txt, ic] = sobre(a.nome);
+    const c = document.createElement("div");
+    c.className = "cartao app";
+    c.innerHTML = '<div class="topo"><div class="ic">' + svg(ic) + "</div><b>" + esc(a.nome) + "</b></div><p>" + esc(txt) + "</p>" +
+      '<div class="topo"><span class="est" style="flex:1"><i class="ponto' + (a.aberto ? " on" : "") + '"></i>' +
+      (a.aberto ? "aberto no PC" : "fechado") + '</span><button class="prim">' + (a.aberto ? "Entrar" : "Abrir") + "</button></div>";
+    c.querySelector("button").onclick = () => (a.aberto ? (location.hash = a.nome) : abrir(a.nome));
+    g.appendChild(c);
+  }
+  if (!sis.apps.length) g.innerHTML = '<p class="sub">Nenhum app desta variante tem página no PC.</p>';
+  $("rodapeGeral").textContent = "Cada app fecha sozinho depois de " + sis.ocioso_min + " minutos sem uso; o Tab5 mostra na barra o que está aberto.";
+}
+
+// ---- o que aparece no meio ---------------------------------------------------------
+function mostrar() {
+  let alvo = decodeURIComponent(location.hash.slice(1)) || "geral";
+  if (alvo !== "geral" && sis && !app(alvo)) alvo = "geral";
+  const trocou = atual !== alvo;
+  atual = alvo;
+  // As molduras de apps que fecharam no Tab5 saem (a pagina delas ja nao responde).
+  for (const n of Object.keys(molduras)) {
+    const a = app(n);
+    if (!a || !a.aberto) { molduras[n].remove(); delete molduras[n]; }
+  }
+  for (const v of document.querySelectorAll(".vista")) v.classList.remove("on");
+  const a = app(alvo);
+  if (alvo === "geral" || !a) {
+    $("geral").classList.add("on");
+    document.title = "Tab5";
+  } else if (a.aberto) {
+    if (!molduras[alvo]) {
+      const f = document.createElement("iframe");
+      f.className = "vista";
+      f.title = alvo;
+      f.src = "/" + a.pasta + "/";
+      $("vistas").appendChild(f);
+      molduras[alvo] = f;
+    }
+    molduras[alvo].classList.add("on");
+    if (trocou) molduras[alvo].focus();   // so na troca: a releitura de 5 s nao rouba o foco do app
+    document.title = alvo + " · Tab5";
+  } else {
+    $("fNome").textContent = alvo;
+    $("fErro").textContent = "";
+    $("fechado").classList.add("on");
+    document.title = alvo + " · Tab5";
+  }
+  if (sis) pintar();
+}
+
+async function abrir(nome) {
+  $("fErro").textContent = "";
+  $("fAbrir").disabled = true;
+  try {
+    const r = await (await fetch("/api/abrir?app=" + encodeURIComponent(nome), POST)).json();
+    if (!r.ok) { $("fErro").textContent = r.msg || "não abriu"; location.hash = nome; return; }
+    await ler();
+    location.hash = nome;
+    mostrar();
+  } catch (e) {
+    $("fErro").textContent = "sem resposta do Tab5";
+  } finally {
+    $("fAbrir").disabled = false;
+  }
+}
+
+async function ler() {
+  try {
+    const r = await fetch("/api/sistema", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    sis = await r.json();
+    $("aviso").classList.remove("on");
+    if (primeira) {
+      primeira = false;
+      // Sem escolha no endereco: comeca no app que acabou de ser aberto no Tab5.
+      if (!location.hash && sis.ultimo) { history.replaceState(null, "", "#" + sis.ultimo); }
+    }
+    mostrar();
+  } catch (e) {
+    $("aviso").textContent = "Sem resposta do Tab5 - o acesso pelo PC pode ter sido desligado no aparelho, ou ele saiu da rede.";
+    $("aviso").classList.add("on");
+  }
+}
+
+$("fAbrir").onclick = () => abrir(atual);
+$("desligar").onclick = async () => {
+  if (!confirm("Desligar o acesso pelo PC? Todos os apps fecham aqui; para voltar, ligue de novo no Tab5.")) return;
+  try { await fetch("/api/desligar", POST); } catch (e) {}
+  document.body.innerHTML = '<div class="centro"><div class="cartao"><h1>Desligado</h1><p>O Tab5 fechou o acesso pelo PC. Para voltar: Ajustes &rsaquo; Acesso pelo PC no aparelho, ou <code>web ligar</code> no Terminal.</p></div></div>';
+};
+window.addEventListener("hashchange", mostrar);
+ler();
+setInterval(() => { if (!document.hidden) ler(); }, 5000);
+</script>
+</body>
+</html>

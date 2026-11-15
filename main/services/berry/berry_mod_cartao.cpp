@@ -1,0 +1,358 @@
+// Modulos Berry 'cartao' (a pasta do app) e 'arquivos' (os discos, pelo motor
+// de arquivos do sistema). Ver berry_apps.cpp (o motor) e berry_interno.hpp.
+// O cartao so pelas portas de hal/tab5_sd.hpp.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
+#include "tab5_sd.hpp"
+#include "tab5_arquivos.hpp"
+#include "tab5_volumes.hpp"
+#include "berry_interno.hpp"
+
+// MODULO 'cartao' - arquivos na pasta do app: /sdcard/apps/Berry/<nome do app>/
+// ---------------------------------------------------------------------------
+// OS DADOS MORAM AO LADO DOS SCRIPTS: tudo o que e de Berry fica dentro de
+// apps/Berry/ (o .be e a pasta com o mesmo nome) - nada espalhado em apps/
+// no meio das pastas dos apps do sistema, e um app Berry "Azimutal" nao
+// mistura arquivo com o Azimutal em C. A leitura da pasta (ler_pasta) so pega
+// .be, entao as pastas de dados nao viram icone.
+// A pasta e criada (mkdir no cartao) UMA vez por abertura, e o caminho fica
+// guardado: ler/gravar em todo quadro nao paga um stat + mkdir cada vez.
+static bool pasta_do_app(void)
+{
+  if (C->app->pasta[0]) { return true; }
+  if (!tab5_sd_montar()) { return false; }
+  char rel[48];
+  pasta_rel(C->app->nome, rel, sizeof(rel));
+  if (!tab5_sd_pasta(rel, C->app->pasta, sizeof(C->app->pasta))) { C->app->pasta[0] = 0; }
+  tab5_sd_desmontar();
+  return C->app->pasta[0] != 0;
+}
+
+// So nomes simples (sem barra, sem ..): o script nao sai da pasta dele.
+static bool caminho(bvm* vm, char* out, size_t tam)
+{
+  const char* nome = arg_txt(vm, 1);
+  if (!C->app || !nome[0] || strchr(nome, '/') || strchr(nome, '\\') || strstr(nome, "..") || strlen(nome) > 48) {
+    be_raise(vm, "cartao_error", "nome de arquivo invalido (so o nome, sem pasta)");
+    return false;
+  }
+  if (!pasta_do_app()) { return false; }
+  snprintf(out, tam, "%s/%s", C->app->pasta, nome);
+  return true;
+}
+
+static const long LER_MAX = 64 * 1024;
+
+// ler(nome) - o arquivo inteiro como texto, ou nil se nao existe (ate 64 KB).
+static int c_ler(bvm* vm)
+{
+  char cam[160];
+  if (!caminho(vm, cam, sizeof(cam)) || !tab5_sd_montar()) { be_return_nil(vm); }
+  FILE* f = fopen(cam, "rb");
+  char* buf = nullptr;
+  long n = 0;
+  if (f) {
+    n = tab5_sd_tamanho(f);
+    if (n > LER_MAX) { n = LER_MAX; }
+    buf = (char*)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
+    if (buf) { n = (long)fread(buf, 1, n, f); }
+    fclose(f);
+  }
+  tab5_sd_desmontar();
+  if (!buf) { be_return_nil(vm); }
+  be_pushnstring(vm, buf, (size_t)n);
+  heap_caps_free(buf);
+  be_return(vm);
+}
+
+static int escrever(bvm* vm, const char* modo)
+{
+  char cam[160];
+  if (!caminho(vm, cam, sizeof(cam)) || !tab5_sd_montar()) { be_pushbool(vm, false); be_return(vm); }
+  const char* t = arg_txt(vm, 2);
+  FILE* f = fopen(cam, modo);
+  bool ok = false;
+  if (f) { ok = fwrite(t, 1, strlen(t), f) == strlen(t); ok = (fclose(f) == 0) && ok; }
+  tab5_sd_desmontar();
+  be_pushbool(vm, ok);
+  be_return(vm);
+}
+static int c_gravar(bvm* vm)  { return escrever(vm, "wb"); }   // gravar(nome, texto): substitui
+static int c_anexar(bvm* vm)  { return escrever(vm, "ab"); }   // anexar(nome, texto): no fim
+
+static int c_existe(bvm* vm)
+{
+  char cam[160];
+  struct stat st;
+  bool ok = caminho(vm, cam, sizeof(cam)) && tab5_sd_montar();
+  if (ok) { ok = stat(cam, &st) == 0; tab5_sd_desmontar(); }
+  be_pushbool(vm, ok);
+  be_return(vm);
+}
+
+// lista() - os nomes dos arquivos da pasta do app.
+static int c_lista(bvm* vm)
+{
+  lista_nova(vm);
+  if (C->app && pasta_do_app()) {
+    tab5_arq_percorrer(C->app->pasta, [](const tab5_arq_item_t* it, void* v) {
+      l_txt((bvm*)v, it->nome);
+      return true;
+    }, vm);
+  }
+  fim(vm);
+  be_return(vm);
+}
+
+// ---------------------------------------------------------------------------
+// MODULO 'arquivos' - os discos inteiros, pelo motor de arquivos do sistema
+// ---------------------------------------------------------------------------
+// A REGRA: o script ENXERGA o cartao inteiro e o pendrive (com as regras do
+// sistema: senha e nome com '.' nao aparecem), mas so ALTERA a propria pasta
+// (apps/Berry/<nome>/). De fora dela, a unica coisa que ele faz e COPIAR
+// para dentro dela - ler o conteudo, so depois de trazer. Nada fora da pasta
+// e gravado, apagado, movido ou renomeado por script: um app de terceiros
+// nao estraga o sistema nem os arquivos da pessoa.
+static char s_arq_dono[24] = "";   // o app que comecou a copia em curso ("" = nenhum ou o sistema)
+
+static const char* arq_tipo_txt(tab5_arq_tipo_t t)
+{
+  switch (t) {
+    case TAB5_ARQ_PASTA:  return "pasta";
+    case TAB5_ARQ_MUSICA: return "musica";
+    case TAB5_ARQ_IMAGEM: return "imagem";
+    case TAB5_ARQ_TEXTO:  return "texto";
+    case TAB5_ARQ_BERRY:  return "berry";
+    default:              return "outro";
+  }
+}
+
+// Um caminho DENTRO da pasta do app: "" = a propria pasta; "sub/x.txt".
+// Sair dela (absoluto, "..", "\\") e erro no script.
+static bool arq_meu(bvm* vm, const char* rel, char* out, size_t tam)
+{
+  if (!C->app) { be_raise(vm, "arquivos_error", "arquivos so dentro de um app"); return false; }
+  if (rel[0] == '/' || strstr(rel, "..") || strchr(rel, '\\') || strlen(rel) > 160) {
+    be_raise(vm, "arquivos_error", "caminho invalido: relativo a pasta do app (\"sub/x.txt\"), sem ..");
+    return false;
+  }
+  if (!pasta_do_app()) { be_raise(vm, "arquivos_error", "sem cartao"); return false; }
+  if (rel[0]) { snprintf(out, tam, "%s/%s", C->app->pasta, rel); }
+  else        { snprintf(out, tam, "%s", C->app->pasta); }
+  size_t n = strlen(out);
+  while (n > 1 && out[n - 1] == '/') { out[--n] = '\0'; }
+  return true;
+}
+
+// Absoluto ("/usb/Rock") como esta; relativo, dentro da pasta do app.
+static bool arq_qualquer(bvm* vm, const char* c, char* out, size_t tam)
+{
+  if (c[0] != '/') { return arq_meu(vm, c, out, tam); }
+  snprintf(out, tam, "%s", c);
+  size_t n = strlen(out);
+  while (n > 1 && out[n - 1] == '/') { out[--n] = '\0'; }
+  return true;
+}
+
+// volumes() - [{raiz, tipo, nome, disponivel}]: o cartao e, plugado, o pendrive.
+static int a_volumes(bvm* vm)
+{
+  tab5_vol_t v[TAB5_VOL_N];
+  const int n = tab5_volumes_listar(v, TAB5_VOL_N);
+  lista_nova(vm);
+  for (int i = 0; i < n; ++i) {
+    mapa_novo(vm);
+    m_txt(vm, "raiz", v[i].raiz);
+    m_txt(vm, "tipo", v[i].tipo);
+    m_txt(vm, "nome", v[i].nome);
+    m_bool(vm, "disponivel", v[i].disponivel);
+    fim(vm);
+    be_data_push(vm, -2);
+    be_pop(vm, 1);
+  }
+  fim(vm);
+  be_return(vm);
+}
+
+// pasta() - o caminho absoluto da pasta do app (onde ele pode tudo).
+static int a_pasta(bvm* vm)
+{
+  if (!C->app || !pasta_do_app()) { be_return_nil(vm); }
+  be_pushstring(vm, C->app->pasta);
+  be_return(vm);
+}
+
+// lista(pasta [, filtro]) - [{nome, tipo, pasta, bytes, data, caminho}] de
+// QUALQUER pasta visivel (absoluta; relativa = dentro da pasta do app), pastas
+// primeiro. 'filtro': ".mp3;.wav". nil = disco ausente ou pasta que nao abre.
+#define ARQ_LISTA_MAX 256
+static int a_lista(bvm* vm)
+{
+  char pasta[TAB5_ARQ_CAMINHO_MAX];
+  if (!arq_qualquer(vm, arg_txt(vm, 1), pasta, sizeof(pasta))) { be_return_nil(vm); }
+  tab5_arq_item_t* it = (tab5_arq_item_t*)heap_caps_malloc(sizeof(tab5_arq_item_t) * ARQ_LISTA_MAX, MALLOC_CAP_SPIRAM);
+  if (!it) { be_return_nil(vm); }
+  const char* filtro = be_top(vm) >= 2 ? arg_txt(vm, 2) : nullptr;
+  const int n = tab5_arq_listar(pasta, it, ARQ_LISTA_MAX, nullptr, TAB5_ARQ_ORDEM_NOME, filtro);
+  if (n < 0) { heap_caps_free(it); be_return_nil(vm); }
+  lista_nova(vm);
+  for (int i = 0; i < n; ++i) {
+    char cam[TAB5_ARQ_CAMINHO_MAX + TAB5_ARQ_NOME_MAX];
+    snprintf(cam, sizeof(cam), "%s/%s", pasta, it[i].nome);
+    mapa_novo(vm);
+    m_txt(vm, "nome", it[i].nome);
+    m_txt(vm, "tipo", arq_tipo_txt(it[i].tipo));
+    m_bool(vm, "pasta", it[i].tipo == TAB5_ARQ_PASTA);
+    m_int(vm, "bytes", it[i].bytes > 0x7FFFFFFF ? 0x7FFFFFFF : (int)it[i].bytes);
+    m_int(vm, "data", (int)it[i].data);
+    m_txt(vm, "caminho", cam);
+    fim(vm);
+    be_data_push(vm, -2);
+    be_pop(vm, 1);
+  }
+  fim(vm);
+  heap_caps_free(it);
+  be_return(vm);
+}
+
+// ler(caminho) - o conteudo como texto (ate 64 KB), SO dentro da pasta do app
+// ("sub/x.txt"). O que esta fora: copiar() primeiro.
+static int a_ler(bvm* vm)
+{
+  char cam[TAB5_ARQ_CAMINHO_MAX];
+  if (!arq_meu(vm, arg_txt(vm, 1), cam, sizeof(cam)) || !tab5_sd_montar()) { be_return_nil(vm); }
+  FILE* f = fopen(cam, "rb");
+  char* buf = nullptr;
+  long n = 0;
+  if (f) {
+    n = tab5_sd_tamanho(f);
+    if (n > LER_MAX) { n = LER_MAX; }
+    buf = n >= 0 ? (char*)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM) : nullptr;
+    if (buf) { n = (long)fread(buf, 1, n, f); }
+    fclose(f);
+  }
+  tab5_sd_desmontar();
+  if (!buf) { be_return_nil(vm); }
+  be_pushnstring(vm, buf, (size_t)n);
+  heap_caps_free(buf);
+  be_return(vm);
+}
+
+// copiar(origem [, subpasta]) - traz um arquivo ou pasta (ou uma lista deles,
+// ate 64) de QUALQUER disco para a pasta do app (ou uma subpasta dela que ja
+// existe). Em segundo plano: acompanhe com estado() e '# avisos: arquivos'.
+// true = comecou; senao, o texto do motivo ("ja ha uma copia em andamento").
+static int a_copiar(bvm* vm)
+{
+  char destino[TAB5_ARQ_CAMINHO_MAX];
+  if (!arq_meu(vm, be_top(vm) >= 2 ? arg_txt(vm, 2) : "", destino, sizeof(destino))) { be_return_nil(vm); }
+  // As origens: um texto ou uma lista de textos.
+  // A tarefa do Berry e uma so: estatico basta, e na PSRAM (16 KB).
+  EXT_RAM_BSS_ATTR static char origens[TAB5_ARQ_ITENS_MAX][TAB5_ARQ_CAMINHO_MAX];
+  const char* ptrs[TAB5_ARQ_ITENS_MAX];
+  int n = 0;
+  if (be_top(vm) >= 1 && be_islistinstance(vm, 1)) {
+    be_getmember(vm, 1, ".p");
+    const int total = be_data_size(vm, -1);
+    for (int i = 0; i < total && n < TAB5_ARQ_ITENS_MAX; ++i) {
+      be_pushint(vm, i);
+      be_getindex(vm, -2);
+      const char* c = be_isstring(vm, -1) ? be_tostring(vm, -1) : "";
+      if (c[0]) { arq_qualquer(vm, c, origens[n], sizeof(origens[n])); ptrs[n] = origens[n]; ++n; }
+      be_pop(vm, 2);
+    }
+    be_pop(vm, 1);
+  } else if (be_top(vm) >= 1) {
+    arq_qualquer(vm, arg_txt(vm, 1), origens[0], sizeof(origens[0]));
+    ptrs[0] = origens[0];
+    n = 1;
+  }
+  const tab5_arq_erro_t r = n ? tab5_arq_copiar(ptrs, n, destino, false) : TAB5_ARQ_ERRO_NOME;
+  if (r == TAB5_ARQ_OK) {
+    snprintf(s_arq_dono, sizeof(s_arq_dono), "%s", C->app->nome);
+    be_pushbool(vm, true);
+  } else {
+    be_pushstring(vm, tab5_arq_erro_texto(r));
+  }
+  be_return(vm);
+}
+
+// estado() - {fase, pct, itens, feitos, atual, erro, meu}. fase: "parado",
+// "contando", "copiando", "apagando", "feito", "falhou", "cancelado".
+// 'meu' = foi este app que comecou.
+static int a_estado(bvm* vm)
+{
+  tab5_arq_trabalho_t t;
+  tab5_arq_trabalho(&t);
+  static const char* const FASE[] = { "parado", "contando", "copiando", "apagando", "feito", "falhou", "cancelado" };
+  const int pct = t.bytes ? (int)(t.bytes_feitos * 100 / t.bytes) : t.itens ? t.itens_feitos * 100 / t.itens : 0;
+  mapa_novo(vm);
+  m_txt(vm, "fase", FASE[t.fase <= TAB5_ARQ_CANCELADO ? t.fase : 0]);
+  m_int(vm, "pct", pct > 100 ? 100 : pct);
+  m_int(vm, "itens", t.itens);
+  m_int(vm, "feitos", t.itens_feitos);
+  m_txt(vm, "atual", t.atual);
+  m_txt(vm, "erro", t.erro);
+  m_bool(vm, "meu", C->app && !strcmp(s_arq_dono, C->app->nome));
+  fim(vm);
+  be_return(vm);
+}
+
+// cancelar() - so a copia que ESTE app comecou.
+static int a_cancelar(bvm* vm)
+{
+  if (C->app && !strcmp(s_arq_dono, C->app->nome)) { tab5_arq_cancelar(); }
+  be_return_nil(vm);
+}
+
+// apagar(caminho), renomear(caminho, novo_nome), criar_pasta(nome_ou_sub/nome):
+// SO dentro da pasta do app. Apagar vai para a lixeira do cartao.
+static int a_apagar(bvm* vm)
+{
+  char c[TAB5_ARQ_CAMINHO_MAX];
+  const char* rel = arg_txt(vm, 1);
+  if (!rel[0]) { be_raise(vm, "arquivos_error", "apagar(caminho): o que apagar?"); be_return_nil(vm); }
+  if (!arq_meu(vm, rel, c, sizeof(c))) { be_return_nil(vm); }
+  be_pushbool(vm, tab5_arq_apagar(c) == TAB5_ARQ_OK);
+  be_return(vm);
+}
+
+static int a_renomear(bvm* vm)
+{
+  char c[TAB5_ARQ_CAMINHO_MAX];
+  const char* rel = arg_txt(vm, 1);
+  if (!rel[0]) { be_raise(vm, "arquivos_error", "renomear(caminho, nome): o que renomear?"); be_return_nil(vm); }
+  if (!arq_meu(vm, rel, c, sizeof(c))) { be_return_nil(vm); }
+  be_pushbool(vm, tab5_arq_renomear(c, arg_txt(vm, 2)) == TAB5_ARQ_OK);
+  be_return(vm);
+}
+
+static int a_criar_pasta(bvm* vm)
+{
+  char c[TAB5_ARQ_CAMINHO_MAX];
+  const char* rel = arg_txt(vm, 1);
+  if (!arq_meu(vm, rel, c, sizeof(c))) { be_return_nil(vm); }
+  char* b = strrchr(c, '/');
+  if (!rel[0] || !b) { be_raise(vm, "arquivos_error", "criar_pasta(nome): que nome?"); be_return_nil(vm); }
+  *b = '\0';
+  be_pushbool(vm, tab5_arq_criar_pasta(c, b + 1) == TAB5_ARQ_OK);
+  be_return(vm);
+}
+
+const membro_t BERRY_MOD_CARTAO[] = {
+  { "ler", c_ler }, { "gravar", c_gravar }, { "anexar", c_anexar }, { "existe", c_existe },
+  { "lista", c_lista },
+  { nullptr },
+};
+
+const membro_t BERRY_MOD_ARQUIVOS[] = {
+  { "volumes", a_volumes }, { "pasta", a_pasta }, { "lista", a_lista }, { "ler", a_ler },
+  { "copiar", a_copiar }, { "estado", a_estado }, { "cancelar", a_cancelar },
+  { "apagar", a_apagar }, { "renomear", a_renomear }, { "criar_pasta", a_criar_pasta },
+  { nullptr },
+};

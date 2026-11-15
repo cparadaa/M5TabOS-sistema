@@ -8,6 +8,6 @@
 cmake_minimum_required(VERSION 3.16)
 # Versao do APLICATIVO (o esp_hosted tem a dele, 3.0.7). Sobe junto com
 # C6_PROTO_VERSAO de compartilhado/tab5_c6.h.
-set(PROJECT_VER "m5tabos-c6-4")
+set(PROJECT_VER "m5tabos-c6-5")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tab5_c6)

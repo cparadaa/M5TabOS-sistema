@@ -1,6 +1,7 @@
 #include "lista.hpp"
 #include "internal.hpp"   // diag_toque_ligado
 #include "esp_log.h"
+#include <algorithm>
 #include "app.h"   // sistema_area - o toque chega em coordenadas da area
 
 static const int BARRA_MARGEM = 8;   // rolagem_barra desenha 4px a 8px da borda
@@ -85,14 +86,27 @@ static int y_do_primeiro(const lista_t* l, const area_t& j)
 
 static int largura_item(const area_t& j) { return j.largura - BARRA_MARGEM - BARRA_LARG; }
 
-// Desenha os itens que cruzam 'rec' (ja recortado pelo chamador).
-static void desenhar_faixa(lista_t* l, lgfx::LovyanGFX& d, const area_t& j, const area_t& rec, uint16_t fundo)
+static bool dentro_do_recorte(lgfx::LovyanGFX& d, const area_t& j)
 {
-  if (rec.largura <= 0 || rec.altura <= 0) { return; }
-  d.fillRect(rec.x, rec.y, rec.largura, rec.altura, fundo);
-
   int32_t cx, cy, cl, ca;
   d.getClipRect(&cx, &cy, &cl, &ca);
+  return j.x >= cx && j.y >= cy && j.x + j.largura <= cx + cl && j.y + j.altura <= cy + ca;
+}
+
+// Desenha os itens que cruzam 'rec' (ja recortado pelo chamador).
+static void desenhar_faixa(lista_t* l, lgfx::LovyanGFX& d, const area_t& j, const area_t& faixa, uint16_t fundo)
+{
+  // DENTRO DO RECORTE QUE JA VEM. Com a tela inteira rolando (app deitado), o
+  // sistema recorta o app na area dele; trocar esse recorte pelo da faixa
+  // deixava a janela da lista - que rolou junto - pintar por cima das barras.
+  int32_t cx, cy, cl, ca;
+  d.getClipRect(&cx, &cy, &cl, &ca);
+  const int x0 = std::max<int>(faixa.x, cx), y0 = std::max<int>(faixa.y, cy);
+  const int x1 = std::min<int>(faixa.x + faixa.largura, cx + cl);
+  const int y1 = std::min<int>(faixa.y + faixa.altura, cy + ca);
+  if (x1 <= x0 || y1 <= y0) { return; }
+  const area_t rec = { x0, y0, x1 - x0, y1 - y0 };
+  d.fillRect(rec.x, rec.y, rec.largura, rec.altura, fundo);
   d.setClipRect(rec.x, rec.y, rec.largura, rec.altura);
 
   const int fim = rec.y + rec.altura;
@@ -158,6 +172,12 @@ bool lista_desenhar(lista_t* l, lgfx::LovyanGFX& d, const area_t& j, uint16_t fu
     desenhar_faixa(l, d, j, j, fundo);
     rolagem_sincronizar(&l->rol);
     l->sujo_de = 1; l->sujo_ate = 0;   // a janela inteira ja cobriu os marcados
+  } else if (rolagem_pendente(&l->rol) && !dentro_do_recorte(d, j)) {
+    // Mover pixels da janela levaria junto o que esta fora do recorte (as
+    // barras): desenha de novo, recortado.
+    desenhar_faixa(l, d, j, j, fundo);
+    rolagem_sincronizar(&l->rol);
+    tudo = true;
   } else if (rolagem_pendente(&l->rol)) {
     const rolagem_passada_t p = rolagem_deslocar(&l->rol, j, fundo);
     if (p.deslocou) { desenhar_faixa(l, d, j, p.exposta, fundo); }
@@ -205,6 +225,11 @@ int lista_item_tocado(lista_t* l, int x, int y, int* dy)
     if (diag_toque_ligado()) { ESP_LOGI("lista", "toque recusado como arrasto da lista (%d px)", afastou); }
     return LISTA_ARRASTE;
   }
+  return lista_item_em(l, x, y, dy);
+}
+
+int lista_item_em(lista_t* l, int x, int y, int* dy)
+{
   int ty = 0;
   if (!na_janela(l, x, y, &ty)) { return -1; }
   int yi = y_do_primeiro(l, l->janela_ant);

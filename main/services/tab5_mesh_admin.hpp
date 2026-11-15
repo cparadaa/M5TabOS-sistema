@@ -1,7 +1,7 @@
 // CONFIGURACAO DO NO MESHTASTIC A PARTIR DO TAB5 - sem PC nem celular.
 //
 // Fala o AdminMessage do proprio Meshtastic (porta ADMIN_APP, 6), o mesmo que o
-// cliente web e o app do celular usam. Detalhes do protocolo em MESHTASTIC.md.
+// cliente web e o app do celular usam. Detalhes do protocolo em docs/MESHTASTIC.md.
 //
 // COMO UMA MUDANCA VIAJA
 //   1. O dump de configuracao (FromRadio 5 e 9) traz cada SECAO inteira; os
@@ -28,7 +28,8 @@
 //     power (o dump troca ls_secs pelo padrao), security (chaves) e o modulo
 //     serial (e o proprio enlace do Grove).
 //   - O canal PRIMARIO so e reenviado (set_channel) quando a precisao da
-//     posicao muda; nome, chave, uplink e o resto seguem como o no mandou.
+//     posicao ou o uplink (mandar ao MQTT o que o no recebe) mudam; nome,
+//     chave, downlink e o resto seguem como o no mandou.
 //   - AdminMessage acima de 233 bytes (o teto do Data.payload) e recusado aqui.
 #pragma once
 
@@ -50,6 +51,13 @@ typedef enum {
   MESH_CFG_MQTT_PROXY,     // ModuleConfig.mqtt.proxy_to_client_enabled (o Tab5 empresta a internet)
   MESH_CFG_POS_INTELIGENTE,// Config.position.position_broadcast_smart_enabled (manda ao se mover)
   MESH_CFG_GPS_MODO,       // Config.position.gps_mode: 0 desligado, 1 ligado, 2 sem GPS na placa
+  MESH_CFG_TELA_S,         // Config.display.screen_on_secs (0 = o padrao do firmware, 10 min)
+  // Config.lora.config_ok_to_mqtt: o no AUTORIZA que as mensagens DELE subam
+  // ao MQTT por outros gateways. Ele carimba cada mensagem com isso
+  // (Data.bitfield, OK_TO_MQTT - firmware Router.cpp); um gateway num servidor
+  // publico (endereco que nao e IP privado) descarta a mensagem de outro no
+  // sem o carimbo (MQTT.cpp, onSend: "DontMqttMeBro"). Desligado e o padrao.
+  MESH_CFG_OK_MQTT,
   MESH_CFG_N
 } mesh_cfg_campo_t;
 
@@ -70,6 +78,7 @@ typedef struct {
   // com bits a menos). -1 = o canal nao veio no dump. Editada por
   // mesh_cfg_mudanca_t.precisao.
   int32_t  precisao;
+  int8_t   uplink;                 // canal primario manda ao MQTT o que o no recebe; -1 = nao veio
 
   // So leitura.
   bool     pos_fixa;               // Config.position.fixed_position
@@ -91,9 +100,6 @@ typedef struct {
 // Copia o estado atual (valores confirmados pelo no).
 void mesh_cfg_ler(mesh_cfg_t* saida);
 
-// Muda a cada informacao nova (dump, gravacao, aviso): a tela repinta.
-uint32_t mesh_cfg_versao(void);
-
 // Uma transacao com TUDO o que mudou. muda[i] = true leva v[i]; nomes vazios
 // ficam como estao. O no grava e reinicia. false = nada enviado (sem no, sem
 // dump, ou secao desconhecida) - e o motivo vai para o log.
@@ -109,8 +115,20 @@ typedef struct {
   bool    wifi_liga;               // valor de wifi_enabled quando wifi_muda
   bool    precisao_muda;           // set_channel no canal primario com a precisao nova
   int32_t precisao;                // ver mesh_cfg_t.precisao
+  bool    uplink_muda;             // set_channel no primario com o uplink novo
+  bool    uplink;
 } mesh_cfg_mudanca_t;
 bool mesh_cfg_gravar(const mesh_cfg_mudanca_t* m);
+
+// A REGRA MQTT x PROXY do no, aplicada nas duas pontas da MESMA transacao
+// (o app chama depois de decidir o valor novo do campo que a pessoa tocou e
+// marca o proprio campo por conta; estas so ajustam o "outro"):
+//  - desligar o MQTT leva o proxy junto (sem MQTT ele nao tem o que levar);
+//    religar devolve o proxy ao que o no tinha;
+//  - ligar o proxy leva o MQTT junto; desligar o proxy nao mexe no MQTT, e
+//    desistir de ligar devolve o MQTT ao que o no tinha.
+void mesh_cfg_mqtt_ligar(mesh_cfg_mudanca_t* m, const mesh_cfg_t* c, bool ligar);
+void mesh_cfg_proxy_ligar(mesh_cfg_mudanca_t* m, const mesh_cfg_t* c, bool ligar);
 // Por que o ultimo mesh_cfg_gravar() nao mandou nada, curto, para a tela
 // ("" = mandou, ou o motivo esta so no log).
 const char* mesh_cfg_motivo(void);
@@ -132,6 +150,9 @@ int32_t mesh_admin_precisao_primario(void);
 
 // ---- ganchos do servico (tab5_mesh.cpp), com a trava dele tomada ----------
 void mesh_admin_guardar_secao(bool modulo, int secao, const uint8_t* bytes, size_t n);
+// DIAGNOSTICO (console 'mesh no'): cada secao guardada do dump, campo a campo
+// (varint e tamanho dos textos/bytes - nunca o conteudo, que pode ser senha).
+void mesh_admin_despejar(void);
 void mesh_admin_guardar_user(const uint8_t* bytes, size_t n);         // o User do NOSSO no
 void mesh_admin_guardar_metadata(const uint8_t* bytes, size_t n);     // FromRadio 13
 void mesh_admin_guardar_my_info(const uint8_t* bytes, size_t n);      // FromRadio 3

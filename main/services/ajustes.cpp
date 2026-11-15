@@ -4,8 +4,13 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "tab5_wifi.hpp"   // tab5_wifi_cifrar_texto (senhas dos servidores MQTT)
+#include "esp_attr.h"       // EXT_RAM_BSS_ATTR
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_memory_utils.h"   // esp_ptr_external_ram
 #include <cstring>
+#include <cstddef>   // offsetof
 #include <cstdio>
 #include <cmath>
 
@@ -15,10 +20,10 @@ static const char *NAMESPACE = "sistema";
 static uint8_t s_brilho = 80;
 static uint8_t s_volume = 128;   // meio da escala - nem mudo nem no talo na primeira vez
 static bool    s_wifi   = false;
-static bool    s_teclado = false;
 static bool    s_grove   = false;
+static bool    s_usb_a   = true;    // o pendrive no USB-A funciona sem configurar nada
 static uint8_t s_tela_s  = 30;   // padrao antigo do sistema, em segundos
-static uint8_t s_relogio_painel = 60;  // padrao de fabrica do M5GFX
+static uint8_t s_relogio_painel = 80;  // padrao do M5GFX p/ o ILI9881C; 60 real deu underrun
 static bool    s_pronto = false;
 
 // Graus x 1.000.000 (microgaus), inteiro: cabe num i32 da NVS sem depender
@@ -29,63 +34,209 @@ static int32_t s_casa_lat_ue6 = 0;
 static int32_t s_casa_lon_ue6 = 0;
 
 static bool s_beep_trilha = true;   // default TOCAR - ver o aviso grande em ajustes.h
+static uint8_t s_tema_espectro = 0;   // 0 = arco-iris
+static uint16_t s_cor_tocador = 0;    // 0 = a do sistema
+static uint8_t s_modo_tocador = 0;    // bit 0 aleatorio, bits 1-2 repetir (services/tab5_musica)
 static bool s_beep_mesh   = true;   // idem, par do Mesh
 static uint8_t  s_espnow_canal = 0;
+static uint8_t  s_espnow_letra = 0;
+static uint8_t  s_bateria_soc = AJUSTES_SOC_NENHUM;
+static bool     s_c6_sono  = false;       // o C6 dorme associado no repouso (hal/tab5_c6_sono)
+static bool     s_capa_net = true;        // capa da musica buscada na internet (titulo/artista vao ao iTunes)
+static bool     s_wifi_cochilo = false;   // de fabrica conectado: o cochilo e a economia MAXIMA, opcional
+static bool     s_sono_leve = true;
 static uint8_t  s_mesh_via = AJUSTES_MESH_SERIAL;
 static uint32_t s_mesh_pin = 123456;
 static char     s_mesh_end[18] = "";
 static bool     s_mesh_pin_tela = false;
 static uint8_t  s_mesh_pos_min = 0;
 static bool     s_mesh_internet = true;
-static bool     s_mesh_eua = false;
 static bool     s_bluetooth = false;
 static uint8_t  s_parede    = AJUSTES_PAREDE_SORTEIO;
 static bool     s_bloqueio  = false;   // tela de bloqueio ao acordar (desligada de fabrica)
+static char     s_idioma[8] = "pt";    // o codigo do idioma (services/idioma.h)
 static bool     s_pendrive  = false;   // abrir o Pendrive ao ligar num computador (desligado de fabrica)
+static uint8_t  s_lixeira_dias = 0;    // limpar a lixeira sozinho: 0 = nunca (padrao), N = itens com mais de N dias
 // Escala do giroscopio em partes por milhao (1000000 = 1,0), por eixo: i32 da
 // NVS, como a casa, sem blob.
 static int32_t  s_giro_esc_ppm[3] = { 1000000, 1000000, 1000000 };
-static const char* const GIRO_ESC_CHAVE[3] = { "giro_esc_x", "giro_esc_y", "giro_esc_z" };
+static bool     s_config_ini = false;   // ver ajustes_config_inicial (lido no boot)
+static int16_t  s_fuso_min   = -180;    // UTC-3
+static uint8_t  s_mqtt_srv   = AJUSTES_MQTT_AUTOMATICO;
 #define GIRO_ESC_MIN_PPM  900000
 #define GIRO_ESC_MAX_PPM 1100000
 
-static void gravar_u8(const char* chave, uint8_t valor)
+// GRAVAR NA FLASH DESLIGA O CACHE, E SEM CACHE A PSRAM SOME. Uma tarefa com a
+// PILHA na PSRAM (a do Berry, por exemplo) que grave a NVS derruba o aparelho
+// (assert em spi_flash_disable_interrupts_caches_and_other_cpu). So os blobs
+// (lista MQTT, ensaio) ainda gravam direto e conferem isto; os ajustes da
+// tabela abaixo nunca gravam de quem chamou.
+static bool pilha_na_psram(void)
 {
-  if (!s_pronto) { return; }
+  int aqui = 0;
+  return esp_ptr_external_ram(&aqui);
+}
+
+static void mq_carregar(void);   // a lista dos servidores MQTT, la embaixo
+
+// ---------------------------------------------------------------------------
+// A TABELA DOS AJUSTES: chave na NVS, variavel, tipo e faixa valida. Ler no
+// boot e gravar sao um laco so sobre ela. Valor lido fora da faixa (versao
+// antiga, lixo) e ignorado: fica o padrao da variavel.
+// ---------------------------------------------------------------------------
+typedef enum { AJ_BOOL, AJ_U8, AJ_U16, AJ_U32, AJ_I16, AJ_I32, AJ_TXT } aj_tipo_t;
+typedef struct { const char* chave; void* var; aj_tipo_t tipo; int64_t min, max; } ajuste_t;
+#define BOOL_(c, v)        { c, &v, AJ_BOOL, 0, 255 }
+#define U8_(c, v, a, b)    { c, &v, AJ_U8,  a, b }
+#define U16_(c, v)         { c, &v, AJ_U16, 0, 65535 }
+
+static const ajuste_t AJUSTES[] = {
+  U8_("brilho", s_brilho, AJUSTES_BRILHO_MIN, 255),
+  U8_("volume", s_volume, 0, 255),
+  BOOL_("wifi", s_wifi),
+  BOOL_("grove", s_grove),
+  BOOL_("usb_a", s_usb_a),
+  U8_("tela_s", s_tela_s, AJUSTES_TELA_MIN_S, AJUSTES_TELA_MAX_S),   // nunca uma tela que nao apaga
+  U8_("relogio_p", s_relogio_painel, AJUSTES_RELOGIO_MIN, AJUSTES_RELOGIO_MAX),
+  { "casa_lat", &s_casa_lat_ue6, AJ_I32, INT32_MIN, INT32_MAX },
+  { "casa_lon", &s_casa_lon_ue6, AJ_I32, INT32_MIN, INT32_MAX },
+  { "giro_esc_x", &s_giro_esc_ppm[0], AJ_I32, GIRO_ESC_MIN_PPM, GIRO_ESC_MAX_PPM },
+  { "giro_esc_y", &s_giro_esc_ppm[1], AJ_I32, GIRO_ESC_MIN_PPM, GIRO_ESC_MAX_PPM },
+  { "giro_esc_z", &s_giro_esc_ppm[2], AJ_I32, GIRO_ESC_MIN_PPM, GIRO_ESC_MAX_PPM },
+  BOOL_("beep_trilha", s_beep_trilha),
+  U8_("esp_tema", s_tema_espectro, 0, 255),
+  U16_("cor_tocador", s_cor_tocador),
+  U8_("mus_modo", s_modo_tocador, 0, 255),
+  BOOL_("beep_mesh", s_beep_mesh),
+  U8_("espnow_c", s_espnow_canal, 0, 13),
+  U8_("espnow_l", s_espnow_letra, 0, AJUSTES_ESPNOW_LETRA_MAX),
+  U8_("bat_soc", s_bateria_soc, 0, 100),
+  BOOL_("wifi_coch", s_wifi_cochilo),
+  BOOL_("capa_net", s_capa_net),
+  BOOL_("c6_sono", s_c6_sono),
+  BOOL_("sono_lv", s_sono_leve),
+  U8_("mesh_via", s_mesh_via, 0, AJUSTES_MESH_INTERNET),
+  U8_("mesh_pos", s_mesh_pos_min, 0, 255),
+  BOOL_("mesh_net", s_mesh_internet),
+  BOOL_("bluetooth", s_bluetooth),
+  U8_("mqtt_srv", s_mqtt_srv, 0, 255),
+  { "fuso_min", &s_fuso_min, AJ_I16, AJUSTES_FUSO_MIN_MIN, AJUSTES_FUSO_MAX_MIN },
+  BOOL_("config_ini", s_config_ini),
+  BOOL_("bloqueio", s_bloqueio),
+  BOOL_("pendrive", s_pendrive),
+  U8_("lixo_dias", s_lixeira_dias, 0, 255),
+  U8_("parede", s_parede, 0, AJUSTES_PAREDE_NENHUM),
+  { "lingua", s_idioma, AJ_TXT, 0, sizeof(s_idioma) },
+  { "mesh_pin", &s_mesh_pin, AJ_U32, 0, 999999 },
+  BOOL_("mesh_pin_t", s_mesh_pin_tela),
+  { "mesh_end", s_mesh_end, AJ_TXT, 0, sizeof(s_mesh_end) },
+};
+#define N_AJUSTES (int)(sizeof(AJUSTES) / sizeof(AJUSTES[0]))
+static_assert(N_AJUSTES <= 64, "a mascara de sujos e um uint64_t");
+
+static int64_t valor_de(const ajuste_t& a)
+{
+  switch (a.tipo) {
+    case AJ_BOOL: return *(bool*)a.var ? 1 : 0;
+    case AJ_U8:   return *(uint8_t*)a.var;
+    case AJ_U16:  return *(uint16_t*)a.var;
+    case AJ_U32:  return *(uint32_t*)a.var;
+    case AJ_I16:  return *(int16_t*)a.var;
+    default:      return *(int32_t*)a.var;
+  }
+}
+
+static void por_valor(const ajuste_t& a, int64_t v)
+{
+  switch (a.tipo) {
+    case AJ_BOOL: *(bool*)a.var     = (v != 0);     break;
+    case AJ_U8:   *(uint8_t*)a.var  = (uint8_t)v;   break;
+    case AJ_U16:  *(uint16_t*)a.var = (uint16_t)v;  break;
+    case AJ_U32:  *(uint32_t*)a.var = (uint32_t)v;  break;
+    case AJ_I16:  *(int16_t*)a.var  = (int16_t)v;   break;
+    default:      *(int32_t*)a.var  = (int32_t)v;   break;
+  }
+}
+
+static void ler_ajuste(nvs_handle_t h, const ajuste_t& a)
+{
+  if (a.tipo == AJ_TXT) {
+    size_t tam = (size_t)a.max;
+    if (nvs_get_str(h, a.chave, (char*)a.var, &tam) != ESP_OK) { ((char*)a.var)[0] = 0; }
+    return;
+  }
+  int64_t v;
+  esp_err_t e;
+  if (a.tipo == AJ_BOOL || a.tipo == AJ_U8) { uint8_t x;  e = nvs_get_u8(h, a.chave, &x);  v = x; }
+  else if (a.tipo == AJ_U16)                { uint16_t x; e = nvs_get_u16(h, a.chave, &x); v = x; }
+  else if (a.tipo == AJ_U32)                { uint32_t x; e = nvs_get_u32(h, a.chave, &x); v = x; }
+  else                                      { int32_t x;  e = nvs_get_i32(h, a.chave, &x); v = x; }   // I16 mora num i32
+  if (e == ESP_OK && v >= a.min && v <= a.max) { por_valor(a, v); }
+}
+
+static void gravar_ajuste(nvs_handle_t h, const ajuste_t& a)
+{
+  const int64_t v = a.tipo == AJ_TXT ? 0 : valor_de(a);
+  switch (a.tipo) {
+    case AJ_BOOL: case AJ_U8: nvs_set_u8(h, a.chave, (uint8_t)v);   break;
+    case AJ_U16:              nvs_set_u16(h, a.chave, (uint16_t)v); break;
+    case AJ_U32:              nvs_set_u32(h, a.chave, (uint32_t)v); break;
+    case AJ_TXT:              nvs_set_str(h, a.chave, (const char*)a.var); break;
+    default:                  nvs_set_i32(h, a.chave, (int32_t)v);  break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GRAVACAO: SEMPRE ADIADA, POR UM CAMINHO SO. Quem muda um ajuste so marca a
+// variavel como suja; 1 s depois da ULTIMA marca, a tarefa do esp_timer (pilha
+// interna) grava os sujos de uma vez, com um commit. Isso resolve junto:
+//   - o arraste (brilho, volume): a NVS recebe so o valor final, e a tarefa da
+//     interface nunca para com o cache desligado;
+//   - quem tem pilha na PSRAM (Berry): nunca grava, so marca.
+// O que nao foi marcado nao e escrito - um ajuste nunca mexido continua
+// seguindo o padrao do firmware.
+// ---------------------------------------------------------------------------
+#define ADIAR_GRAVACAO_US 1000000
+static esp_timer_handle_t     s_adiar = nullptr;
+static std::atomic<uint64_t>  s_sujos{0};
+
+static void gravar_sujos(void*)
+{
+  const uint64_t sujos = s_sujos.exchange(0);
+  if (!sujos) { return; }
   nvs_handle_t h;
   if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
-  nvs_set_u8(h, chave, valor);
+  for (int i = 0; i < N_AJUSTES; ++i) {
+    if (sujos & (1ull << i)) { gravar_ajuste(h, AJUSTES[i]); }
+  }
   nvs_commit(h);      // sem o commit, o valor some no proximo boot
   nvs_close(h);
 }
 
-// GRAVACAO ADIADA do que se ajusta ARRASTANDO (brilho, volume). A barra de
-// Ajustes manda um valor novo a cada quadro do arraste, e cada gravacao era
-// um nvs_commit na tarefa da interface: flash gravada com o cache desligado
-// (os dois nucleos param alguns ms - o arraste engasgava) e dezenas de
-// gravacoes de valores intermediarios que ninguem quer guardar. Agora o
-// hardware muda NA HORA e a NVS recebe so o valor final, 1 s depois do
-// ultimo movimento (na tarefa do esp_timer).
-#define ADIAR_GRAVACAO_US 1000000
-static esp_timer_handle_t s_adiar = nullptr;
-static volatile bool s_brilho_pendente = false, s_volume_pendente = false;
-
-static void gravar_adiados(void*)
-{
-  if (s_brilho_pendente) { s_brilho_pendente = false; gravar_u8("brilho", s_brilho); }
-  if (s_volume_pendente) { s_volume_pendente = false; gravar_u8("volume", s_volume); }
-}
-
-static void adiar_gravacao(void)
+static void adiar_gravacao(uint64_t prazo_us)
 {
   if (!s_adiar) {
-    const esp_timer_create_args_t a = { .callback = gravar_adiados, .arg = nullptr,
+    const esp_timer_create_args_t a = { .callback = gravar_sujos, .arg = nullptr,
                                         .dispatch_method = ESP_TIMER_TASK, .name = "ajustes_gravar",
                                         .skip_unhandled_events = true };
-    if (esp_timer_create(&a, &s_adiar) != ESP_OK) { s_adiar = nullptr; gravar_adiados(nullptr); return; }
+    if (esp_timer_create(&a, &s_adiar) != ESP_OK) { s_adiar = nullptr; return; }
   }
   esp_timer_stop(s_adiar);   // cada valor novo empurra o prazo
-  esp_timer_start_once(s_adiar, ADIAR_GRAVACAO_US);
+  esp_timer_start_once(s_adiar, prazo_us);
+}
+
+// A variavel mudou: marca e agenda. 'var' e o endereco que esta na tabela.
+static void marcar(const void* var)
+{
+  if (!s_pronto) { return; }
+  for (int i = 0; i < N_AJUSTES; ++i) {
+    if (AJUSTES[i].var == var) { s_sujos.fetch_or(1ull << i); adiar_gravacao(ADIAR_GRAVACAO_US); return; }
+  }
+}
+
+void ajustes_gravar_agora(void)
+{
+  if (s_pronto && s_sujos.load()) { adiar_gravacao(0); }
 }
 
 void ajustes_iniciar(void)
@@ -108,48 +259,25 @@ void ajustes_iniciar(void)
   nvs_handle_t h;
   if (nvs_open(NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
     uint8_t v;
-    if (nvs_get_u8(h, "brilho", &v) == ESP_OK) { s_brilho = v; }
-    if (nvs_get_u8(h, "volume", &v) == ESP_OK) { s_volume = v; }
-    if (nvs_get_u8(h, "wifi",   &v) == ESP_OK) { s_wifi = (v != 0); }
-    if (nvs_get_u8(h, "teclado",&v) == ESP_OK) { s_teclado = (v != 0); }
-    if (nvs_get_u8(h, "grove",  &v) == ESP_OK) { s_grove = (v != 0); }
-    if (nvs_get_u8(h, "tela_s", &v) == ESP_OK) {
-      // Limita na LEITURA tambem, nao so na escrita: um valor gravado por uma
-      // versao antiga (ou lixo) nao pode virar uma tela que nunca apaga.
-      s_tela_s = (v < AJUSTES_TELA_MIN_S) ? AJUSTES_TELA_MIN_S
-               : (v > AJUSTES_TELA_MAX_S) ? AJUSTES_TELA_MAX_S : v;
-    }
-    if (nvs_get_u8(h, "relogio_p", &v) == ESP_OK) {
-      s_relogio_painel = (v < AJUSTES_RELOGIO_MIN) ? AJUSTES_RELOGIO_MIN
-                       : (v > AJUSTES_RELOGIO_MAX) ? AJUSTES_RELOGIO_MAX : v;
-    }
-    int32_t vi;
-    if (nvs_get_i32(h, "casa_lat", &vi) == ESP_OK) { s_casa_lat_ue6 = vi; }
-    if (nvs_get_i32(h, "casa_lon", &vi) == ESP_OK) { s_casa_lon_ue6 = vi; }
-    for (int e = 0; e < 3; ++e) {
-      if (nvs_get_i32(h, GIRO_ESC_CHAVE[e], &vi) == ESP_OK
-          && vi >= GIRO_ESC_MIN_PPM && vi <= GIRO_ESC_MAX_PPM) { s_giro_esc_ppm[e] = vi; }
-    }
-    if (nvs_get_u8(h, "beep_trilha", &v) == ESP_OK) { s_beep_trilha = (v != 0); }
-    if (nvs_get_u8(h, "beep_mesh", &v) == ESP_OK) { s_beep_mesh = (v != 0); }
-    if (nvs_get_u8(h, "espnow_c", &v) == ESP_OK && v <= 13) { s_espnow_canal = v; }
-    if (nvs_get_u8(h, "mesh_via", &v) == ESP_OK && v <= AJUSTES_MESH_INTERNET) { s_mesh_via = v; }
-    if (nvs_get_u8(h, "mesh_pos", &v) == ESP_OK) { s_mesh_pos_min = v; }
-    if (nvs_get_u8(h, "mesh_net", &v) == ESP_OK) { s_mesh_internet = (v != 0); }
-    if (nvs_get_u8(h, "mesh_eua", &v) == ESP_OK) { s_mesh_eua = (v != 0); }
-    if (nvs_get_u8(h, "bluetooth", &v) == ESP_OK) { s_bluetooth = (v != 0); }
-    if (nvs_get_u8(h, "bloqueio", &v) == ESP_OK) { s_bloqueio = (v != 0); }
-    if (nvs_get_u8(h, "pendrive", &v) == ESP_OK) { s_pendrive = (v != 0); }
-    if (nvs_get_u8(h, "parede", &v) == ESP_OK && v <= AJUSTES_PAREDE_NENHUM) { s_parede = v; }
-    uint32_t vu;
-    if (nvs_get_u32(h, "mesh_pin", &vu) == ESP_OK && vu <= 999999) { s_mesh_pin = vu; }
-    if (nvs_get_u8(h, "mesh_pin_t", &v) == ESP_OK) { s_mesh_pin_tela = (v != 0); }
-    size_t tam = sizeof(s_mesh_end);
-    if (nvs_get_str(h, "mesh_end", s_mesh_end, &tam) != ESP_OK) { s_mesh_end[0] = 0; }
+    const bool tem_marca = nvs_get_u8(h, "config_ini", &v) == ESP_OK;
+    for (int i = 0; i < N_AJUSTES; ++i) { ler_ajuste(h, AJUSTES[i]); }
     nvs_close(h);
+    // PRIMEIRO USO: sem a marca, mas com QUALQUER outro ajuste ja gravado, o
+    // aparelho ja rodava o sistema antes desta versao - nao e primeiro uso.
+    if (!tem_marca) {
+      nvs_iterator_t it = nullptr;
+      s_config_ini = nvs_entry_find(NVS_DEFAULT_PART_NAME, NAMESPACE, NVS_TYPE_ANY, &it) == ESP_OK;
+      nvs_release_iterator(it);
+      // Aparelho novo: grava a marca ja como "falta fazer". Assim, desligado no
+      // meio do assistente (com brilho ou Wi-Fi ja gravados), o assistente
+      // volta no proximo boot em vez de passar a contar como configurado.
+      if (!s_config_ini) { marcar(&s_config_ini); }
+    }
   }
-  // Um valor absurdo gravado por engano nao pode deixar a tela inutilizavel.
-  if (s_brilho < AJUSTES_BRILHO_MIN) { s_brilho = AJUSTES_BRILHO_MIN; }
+  // A chave das senhas (hal/tab5_wifi) antes de qualquer cifra: no primeiro
+  // boot ela e sorteada e gravada - aqui, com a pilha do boot na RAM interna.
+  tab5_wifi_chave_preparar();
+  mq_carregar();   // a lista dos servidores MQTT (e a passagem do formato antigo)
 
   ESP_LOGI(TAG, "ajustes lidos: brilho %d, WiFi %s", (int)s_brilho, s_wifi ? "ligado" : "desligado");
 }
@@ -166,8 +294,32 @@ void ajustes_definir_brilho(uint8_t brilho)
   // OFICIAL - e o valor que o tab5_power vai restaurar ao acordar do repouso.
   M5.Display.setBrightness(s_brilho);
 
-  s_brilho_pendente = true;
-  adiar_gravacao();   // a NVS recebe so o valor final (ver ADIAR_GRAVACAO_US)
+  marcar(&s_brilho);   // gravada 1 s depois do ultimo valor
+}
+
+// O PWM e linear na luz, mas o olho nao: 4% de duty ja parece "um quarto do
+// brilho". Por isso a posicao passa pela curva gama 2,2 - a metade de baixo da
+// escala cobre de 0,9% a ~22% do duty, em degraus finos.
+int ajustes_brilho_para_pos(int brilho)
+{
+  const float f = (float)(brilho - AJUSTES_BRILHO_MIN) / (float)(AJUSTES_BRILHO_MAX - AJUSTES_BRILHO_MIN);
+  return (int)(powf(f < 0 ? 0 : f, 1.0f / 2.2f) * AJUSTES_BRILHO_POS_MAX + 0.5f);
+}
+
+int ajustes_pos_para_brilho(int pos)
+{
+  const float f = (float)pos / (float)AJUSTES_BRILHO_POS_MAX;
+  return AJUSTES_BRILHO_MIN + (int)(powf(f, 2.2f) * (AJUSTES_BRILHO_MAX - AJUSTES_BRILHO_MIN) + 0.5f);
+}
+
+uint8_t ajustes_brilho_pct(void)
+{
+  return (uint8_t)((ajustes_brilho_para_pos(s_brilho) + 5) / 10);
+}
+
+void ajustes_definir_brilho_pct(uint8_t pct)
+{
+  ajustes_definir_brilho((uint8_t)ajustes_pos_para_brilho((pct > 100 ? 100 : pct) * 10));
 }
 
 uint8_t ajustes_volume(void) { return s_volume; }
@@ -185,8 +337,7 @@ void ajustes_definir_volume(uint8_t volume)
   // aqui.
   M5.Speaker.setVolume(s_volume);
 
-  s_volume_pendente = true;
-  adiar_gravacao();   // idem: so o valor final vai para a NVS
+  marcar(&s_volume);   // gravada 1 s depois do ultimo valor
 }
 
 bool ajustes_wifi(void) { return s_wifi; }
@@ -194,16 +345,7 @@ bool ajustes_wifi(void) { return s_wifi; }
 void ajustes_definir_wifi(bool ligado)
 {
   s_wifi = ligado;
-  gravar_u8("wifi", ligado ? 1 : 0);
-}
-
-bool ajustes_teclado(void) { return s_teclado; }
-
-void ajustes_definir_teclado(bool ligado)
-{
-  s_teclado = ligado;
-  gravar_u8("teclado", ligado ? 1 : 0);
-  ESP_LOGI(TAG, "teclado: %s", ligado ? "ativado" : "desativado");
+  marcar(&s_wifi);
 }
 
 bool ajustes_grove(void) { return s_grove; }
@@ -214,14 +356,23 @@ void ajustes_definir_tela_s(uint8_t segundos)
 {
   s_tela_s = (segundos < AJUSTES_TELA_MIN_S) ? AJUSTES_TELA_MIN_S
            : (segundos > AJUSTES_TELA_MAX_S) ? AJUSTES_TELA_MAX_S : segundos;
-  gravar_u8("tela_s", s_tela_s);
+  marcar(&s_tela_s);
 }
 
 void ajustes_definir_grove(bool ligado)
 {
   s_grove = ligado;
-  gravar_u8("grove", ligado ? 1 : 0);
+  marcar(&s_grove);
   ESP_LOGI(TAG, "5V do Grove sempre ligado: %s", ligado ? "sim" : "nao");
+}
+
+bool ajustes_usb_a(void) { return s_usb_a; }
+
+void ajustes_definir_usb_a(bool ligado)
+{
+  s_usb_a = ligado;
+  marcar(&s_usb_a);
+  ESP_LOGI(TAG, "USB-A (pendrive): %s", ligado ? "ligado" : "desligado");
 }
 
 uint8_t ajustes_relogio_painel(void) { return s_relogio_painel; }
@@ -230,7 +381,7 @@ void ajustes_definir_relogio_painel(uint8_t mhz)
 {
   s_relogio_painel = (mhz < AJUSTES_RELOGIO_MIN) ? AJUSTES_RELOGIO_MIN
                    : (mhz > AJUSTES_RELOGIO_MAX) ? AJUSTES_RELOGIO_MAX : mhz;
-  gravar_u8("relogio_p", s_relogio_painel);
+  marcar(&s_relogio_painel);
   ESP_LOGI(TAG, "relogio do painel = %d MHz", (int)s_relogio_painel);
 }
 
@@ -246,15 +397,9 @@ void ajustes_definir_casa(float lat, float lon)
 {
   s_casa_lat_ue6 = (int32_t)(lat * 1000000.0f);
   s_casa_lon_ue6 = (int32_t)(lon * 1000000.0f);
-  ESP_LOGI(TAG, "casa gravada: %.6f, %.6f", (double)lat, (double)lon);
-
-  if (!s_pronto) { return; }
-  nvs_handle_t h;
-  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
-  nvs_set_i32(h, "casa_lat", s_casa_lat_ue6);
-  nvs_set_i32(h, "casa_lon", s_casa_lon_ue6);
-  nvs_commit(h);
-  nvs_close(h);
+  ESP_LOGI(TAG, "casa gravada");   // sem as coordenadas: o log mora no cartao
+  marcar(&s_casa_lat_ue6);
+  marcar(&s_casa_lon_ue6);
 }
 
 bool ajustes_beep_trilha(void) { return s_beep_trilha; }
@@ -262,8 +407,37 @@ bool ajustes_beep_trilha(void) { return s_beep_trilha; }
 void ajustes_definir_beep_trilha(bool tocar)
 {
   s_beep_trilha = tocar;
-  gravar_u8("beep_trilha", tocar ? 1 : 0);
+  marcar(&s_beep_trilha);
   ESP_LOGI(TAG, "beep da Trilha: %s", tocar ? "ligado" : "desligado");
+}
+
+uint16_t ajustes_cor_tocador(void) { return s_cor_tocador; }
+
+// Um app Berry chama isto (musica.cor), da tarefa do Berry - pilha na PSRAM:
+// por isso so marca (a gravacao e sempre adiada, ver marcar).
+void ajustes_definir_cor_tocador(uint16_t cor565)
+{
+  if (cor565 == s_cor_tocador) { return; }   // sem gravar a flash a toa
+  s_cor_tocador = cor565;
+  marcar(&s_cor_tocador);   // gravada 1 s depois do ultimo valor
+}
+
+uint8_t ajustes_modo_tocador(void) { return s_modo_tocador; }
+
+// O modulo Berry tambem troca o modo.
+void ajustes_definir_modo_tocador(uint8_t modo)
+{
+  if (modo == s_modo_tocador) { return; }
+  s_modo_tocador = modo;
+  marcar(&s_modo_tocador);   // gravada 1 s depois do ultimo valor
+}
+
+uint8_t ajustes_tema_espectro(void) { return s_tema_espectro; }
+
+void ajustes_definir_tema_espectro(uint8_t tema)
+{
+  s_tema_espectro = tema;
+  marcar(&s_tema_espectro);   // gravada 1 s depois do ultimo valor
 }
 
 bool ajustes_beep_mesh(void) { return s_beep_mesh; }
@@ -271,7 +445,7 @@ bool ajustes_beep_mesh(void) { return s_beep_mesh; }
 void ajustes_definir_beep_mesh(bool tocar)
 {
   s_beep_mesh = tocar;
-  gravar_u8("beep_mesh", tocar ? 1 : 0);
+  marcar(&s_beep_mesh);
   ESP_LOGI(TAG, "beep do Mesh: %s", tocar ? "ligado" : "desligado");
 }
 
@@ -282,7 +456,86 @@ void ajustes_definir_espnow_canal(uint8_t canal)
   if (canal > 13) { canal = 0; }
   if (canal == s_espnow_canal) { return; }   // o servico reaplica no boot: sem regravar a flash a toa
   s_espnow_canal = canal;
-  gravar_u8("espnow_c", canal);
+  marcar(&s_espnow_canal);
+}
+
+uint8_t ajustes_espnow_letra(void) { return s_espnow_letra; }
+
+void ajustes_definir_espnow_letra(uint8_t nivel)
+{
+  if (nivel > AJUSTES_ESPNOW_LETRA_MAX) { nivel = 0; }
+  if (nivel == s_espnow_letra) { return; }
+  s_espnow_letra = nivel;
+  marcar(&s_espnow_letra);
+}
+
+uint8_t ajustes_bateria_soc(void) { return s_bateria_soc; }
+
+void ajustes_definir_bateria_soc(uint8_t pct)
+{
+  if (pct > 100 || pct == s_bateria_soc) { return; }
+  s_bateria_soc = pct;
+  marcar(&s_bateria_soc);
+}
+
+bool ajustes_wifi_cochilo(void) { return s_wifi_cochilo; }
+
+bool ajustes_sono_leve(void) { return s_sono_leve; }
+
+void ajustes_definir_sono_leve(bool ligado)
+{
+  if (ligado == s_sono_leve) { return; }
+  s_sono_leve = ligado;
+  marcar(&s_sono_leve);
+}
+
+// O ensaio de energia (services/tab5_ensaio) desliga servicos de verdade; os
+// originais ficam aqui ate ele devolver, para um reinicio no meio nao deixar
+// Wi-Fi/Bluetooth/Grove desligados para sempre. Da interface (pilha interna).
+bool ajustes_ensaio_originais(uint8_t out[AJUSTES_ENSAIO_N])
+{
+  if (!s_pronto) { return false; }
+  nvs_handle_t h;
+  if (nvs_open(NAMESPACE, NVS_READONLY, &h) != ESP_OK) { return false; }
+  size_t t = AJUSTES_ENSAIO_N;
+  const bool ok = nvs_get_blob(h, "ensaio_o", out, &t) == ESP_OK && t == AJUSTES_ENSAIO_N;
+  nvs_close(h);
+  return ok;
+}
+
+void ajustes_definir_ensaio_originais(const uint8_t* o)
+{
+  if (!s_pronto || pilha_na_psram()) { return; }
+  nvs_handle_t h;
+  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
+  if (o) { nvs_set_blob(h, "ensaio_o", o, AJUSTES_ENSAIO_N); } else { nvs_erase_key(h, "ensaio_o"); }
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+bool ajustes_c6_sono(void) { return s_c6_sono; }
+
+void ajustes_definir_c6_sono(bool ligado)
+{
+  if (ligado == s_c6_sono) { return; }
+  s_c6_sono = ligado;
+  marcar(&s_c6_sono);
+}
+
+bool ajustes_capa_internet(void) { return s_capa_net; }
+
+void ajustes_definir_capa_internet(bool ligado)
+{
+  if (ligado == s_capa_net) { return; }
+  s_capa_net = ligado;
+  marcar(&s_capa_net);
+}
+
+void ajustes_definir_wifi_cochilo(bool ligado)
+{
+  if (ligado == s_wifi_cochilo) { return; }
+  s_wifi_cochilo = ligado;
+  marcar(&s_wifi_cochilo);
 }
 
 uint8_t ajustes_mesh_via(void) { return s_mesh_via; }
@@ -292,7 +545,7 @@ void ajustes_definir_mesh_via(uint8_t via)
   if (via > AJUSTES_MESH_INTERNET) { via = AJUSTES_MESH_SERIAL; }
   if (via == s_mesh_via) { return; }   // a NVS tem ciclos de escrita finitos
   s_mesh_via = via;
-  gravar_u8("mesh_via", via);
+  marcar(&s_mesh_via);
   ESP_LOGI(TAG, "Mesh vai pelo %s", via == AJUSTES_MESH_BLUETOOTH ? "Bluetooth"
                                   : via == AJUSTES_MESH_INTERNET  ? "internet" : "cabo Grove");
 }
@@ -303,12 +556,7 @@ void ajustes_definir_mesh_pin(uint32_t pin)
 {
   if (pin > 999999) { return; }
   s_mesh_pin = pin;
-  if (!s_pronto) { return; }
-  nvs_handle_t h;
-  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
-  nvs_set_u32(h, "mesh_pin", pin);
-  nvs_commit(h);
-  nvs_close(h);
+  marcar(&s_mesh_pin);
 }
 
 void ajustes_mesh_ble_endereco(char out[18]) { memcpy(out, s_mesh_end, sizeof(s_mesh_end)); }
@@ -319,7 +567,7 @@ void ajustes_definir_mesh_pin_na_tela(bool sim)
 {
   if (sim == s_mesh_pin_tela) { return; }
   s_mesh_pin_tela = sim;
-  gravar_u8("mesh_pin_t", sim ? 1 : 0);
+  marcar(&s_mesh_pin_tela);
 }
 
 void ajustes_definir_mesh_ble_endereco(const char* end)
@@ -327,12 +575,7 @@ void ajustes_definir_mesh_ble_endereco(const char* end)
   // Outro no: o que se sabia sobre o PIN do anterior nao vale para ele.
   if (strcmp(end ? end : "", s_mesh_end) != 0) { ajustes_definir_mesh_pin_na_tela(false); }
   snprintf(s_mesh_end, sizeof(s_mesh_end), "%s", end ? end : "");
-  if (!s_pronto) { return; }
-  nvs_handle_t h;
-  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
-  nvs_set_str(h, "mesh_end", s_mesh_end);
-  nvs_commit(h);
-  nvs_close(h);
+  marcar(s_mesh_end);
 }
 
 bool ajustes_mesh_internet(void) { return s_mesh_internet; }
@@ -341,16 +584,7 @@ void ajustes_definir_mesh_internet(bool ligado)
 {
   if (ligado == s_mesh_internet) { return; }
   s_mesh_internet = ligado;
-  gravar_u8("mesh_net", ligado ? 1 : 0);
-}
-
-bool ajustes_mesh_eua(void) { return s_mesh_eua; }
-
-void ajustes_definir_mesh_eua(bool ligado)
-{
-  if (ligado == s_mesh_eua) { return; }
-  s_mesh_eua = ligado;
-  gravar_u8("mesh_eua", ligado ? 1 : 0);
+  marcar(&s_mesh_internet);
 }
 
 uint8_t ajustes_mesh_posicao_min(void) { return s_mesh_pos_min; }
@@ -359,7 +593,7 @@ void ajustes_definir_mesh_posicao_min(uint8_t minutos)
 {
   if (minutos == s_mesh_pos_min) { return; }
   s_mesh_pos_min = minutos;
-  gravar_u8("mesh_pos", minutos);
+  marcar(&s_mesh_pos_min);
 }
 
 bool ajustes_bluetooth(void) { return s_bluetooth; }
@@ -367,7 +601,7 @@ bool ajustes_bluetooth(void) { return s_bluetooth; }
 void ajustes_definir_bluetooth(bool ligado)
 {
   s_bluetooth = ligado;
-  gravar_u8("bluetooth", ligado ? 1 : 0);
+  marcar(&s_bluetooth);
 }
 
 bool ajustes_bloqueio(void) { return s_bloqueio; }
@@ -375,7 +609,16 @@ bool ajustes_bloqueio(void) { return s_bloqueio; }
 void ajustes_definir_bloqueio(bool ligado)
 {
   s_bloqueio = ligado;
-  gravar_u8("bloqueio", ligado ? 1 : 0);
+  marcar(&s_bloqueio);
+}
+
+uint8_t ajustes_lixeira_dias(void) { return s_lixeira_dias; }
+
+void ajustes_definir_lixeira_dias(uint8_t dias)
+{
+  if (dias == s_lixeira_dias) { return; }
+  s_lixeira_dias = dias;
+  marcar(&s_lixeira_dias);
 }
 
 bool ajustes_pendrive(void) { return s_pendrive; }
@@ -383,7 +626,15 @@ bool ajustes_pendrive(void) { return s_pendrive; }
 void ajustes_definir_pendrive(bool ligado)
 {
   s_pendrive = ligado;
-  gravar_u8("pendrive", ligado ? 1 : 0);
+  marcar(&s_pendrive);
+}
+
+const char* ajustes_idioma(void) { return s_idioma; }
+
+void ajustes_definir_idioma(const char* codigo)
+{
+  snprintf(s_idioma, sizeof(s_idioma), "%s", codigo ? codigo : "pt");
+  marcar(s_idioma);
 }
 
 uint8_t ajustes_parede(void) { return s_parede; }
@@ -392,7 +643,7 @@ void ajustes_definir_parede(uint8_t opcao)
 {
   if (opcao > AJUSTES_PAREDE_NENHUM) { opcao = AJUSTES_PAREDE_SORTEIO; }
   s_parede = opcao;
-  gravar_u8("parede", opcao);
+  marcar(&s_parede);
 }
 
 float ajustes_giro_escala(int eixo)
@@ -408,13 +659,7 @@ void ajustes_definir_giro_escala(int eixo, float escala)
   if (ppm < GIRO_ESC_MIN_PPM || ppm > GIRO_ESC_MAX_PPM) { return; }
   s_giro_esc_ppm[eixo] = ppm;
   ESP_LOGI(TAG, "escala do giro, eixo %c: %.4f", "xyz"[eixo], (double)escala);
-
-  if (!s_pronto) { return; }
-  nvs_handle_t h;
-  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) != ESP_OK) { return; }
-  nvs_set_i32(h, GIRO_ESC_CHAVE[eixo], ppm);
-  nvs_commit(h);
-  nvs_close(h);
+  marcar(&s_giro_esc_ppm[eixo]);
 }
 
 // ORDEM DOS ICONES - ver ajustes.h. Lida da NVS na hora (so no boot e no
@@ -441,4 +686,207 @@ void ajustes_definir_ordem_apps(const char* nomes)
   nvs_commit(h);
   nvs_close(h);
   ESP_LOGI(TAG, "ordem dos apps: %s", (nomes && nomes[0]) ? nomes : "(padrao)");
+}
+
+// ---- primeiro uso, fuso e servidor MQTT (ver ajustes.h) ----------------------
+bool ajustes_config_inicial(void) { return s_config_ini; }
+
+void ajustes_definir_config_inicial(bool feita)
+{
+  s_config_ini = feita;
+  marcar(&s_config_ini);
+}
+
+int16_t ajustes_fuso_min(void) { return s_fuso_min; }
+
+void ajustes_definir_fuso_min(int16_t minutos)
+{
+  if (minutos < AJUSTES_FUSO_MIN_MIN) { minutos = AJUSTES_FUSO_MIN_MIN; }
+  if (minutos > AJUSTES_FUSO_MAX_MIN) { minutos = AJUSTES_FUSO_MAX_MIN; }
+  if (minutos == s_fuso_min) { return; }
+  s_fuso_min = minutos;
+  marcar(&s_fuso_min);
+  ESP_LOGI(TAG, "fuso: UTC%+d:%02d", minutos / 60, abs(minutos) % 60);
+}
+
+uint8_t ajustes_mqtt_servidor(void) { return s_mqtt_srv; }
+
+void ajustes_definir_mqtt_servidor(uint8_t escolha)
+{
+  if (escolha == s_mqtt_srv) { return; }
+  s_mqtt_srv = escolha;
+  marcar(&s_mqtt_srv);
+}
+
+// ---- a lista dos servidores MQTT (ver ajustes.h) ---------------------------
+// UM BLOB SO na NVS ("mqtt_lista"): a versao, quantos, e os servidores com a
+// senha ja cifrada. Copia DECIFRADA em RAM (PSRAM - e so leitura fora daqui):
+// o modo internet consulta a cada conexao, e decifrar toda vez seria
+// desperdicio. Lida no boot (ajustes_iniciar), que tambem passa o formato
+// antigo para este.
+//
+// Quem grava e a interface (Ajustes, Mesh, boas-vindas), na tarefa dela -
+// pilha interna. Nao ha API Berry para isto (ver pilha_na_psram).
+typedef struct { char nome[24], srv[64], usr[32], raiz[48]; char pwd_hex[112]; } mq_guardado_t;
+typedef struct { uint8_t versao, n; uint8_t vago[2]; mq_guardado_t s[AJUSTES_MQTT_MAX]; } mq_blob_t;
+#define MQ_VERSAO 1
+EXT_RAM_BSS_ATTR static ajustes_mqtt_srv_t s_mq[AJUSTES_MQTT_MAX];
+static int s_mq_n = 0;
+
+static void mq_guardar(void)
+{
+  if (!s_pronto) { return; }
+  if (pilha_na_psram()) { ESP_LOGE(TAG, "lista MQTT nao gravada: pilha na PSRAM"); return; }
+  // O blob vai da RAM interna: gravar a flash desliga o cache, e com ele a PSRAM.
+  mq_blob_t* b = (mq_blob_t*)heap_caps_calloc(1, sizeof(mq_blob_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!b) { ESP_LOGE(TAG, "lista MQTT nao gravada: sem memoria"); return; }
+  b->versao = MQ_VERSAO;
+  b->n = (uint8_t)s_mq_n;
+  for (int i = 0; i < s_mq_n; ++i) {
+    const ajustes_mqtt_srv_t& s = s_mq[i];
+    mq_guardado_t& g = b->s[i];
+    snprintf(g.nome, sizeof(g.nome), "%s", s.nome);
+    snprintf(g.srv,  sizeof(g.srv),  "%s", s.srv);
+    snprintf(g.usr,  sizeof(g.usr),  "%s", s.usr);
+    snprintf(g.raiz, sizeof(g.raiz), "%s", s.raiz);
+    char hex[TAB5_WIFI_CIFRA_HEX] = "";
+    if (s.pwd[0] && !tab5_wifi_cifrar_texto(s.pwd, hex, sizeof(hex))) { hex[0] = 0; }
+    snprintf(g.pwd_hex, sizeof(g.pwd_hex), "%s", hex);
+  }
+  // So os usados: o blob encolhe com a lista.
+  const size_t tam = offsetof(mq_blob_t, s) + sizeof(mq_guardado_t) * (size_t)s_mq_n;
+  nvs_handle_t h;
+  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_blob(h, "mqtt_lista", b, tam);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+  memset(b, 0, sizeof(*b));
+  heap_caps_free(b);
+}
+
+static void mq_por(const char* nome, const char* srv, const char* usr, const char* pwd, const char* raiz)
+{
+  if (s_mq_n >= AJUSTES_MQTT_MAX) { return; }
+  ajustes_mqtt_srv_t& s = s_mq[s_mq_n++];
+  snprintf(s.nome, sizeof(s.nome), "%s", nome);
+  snprintf(s.srv,  sizeof(s.srv),  "%s", srv);
+  snprintf(s.usr,  sizeof(s.usr),  "%s", usr);
+  snprintf(s.pwd,  sizeof(s.pwd),  "%s", pwd);
+  snprintf(s.raiz, sizeof(s.raiz), "%s", raiz);
+}
+
+// O FORMATO ANTIGO: uma lista fixa (1 Mesh Brasil, 2 EUA, 3 Europa, 4 ANZ, 5
+// Brasil global) e um servidor "proprio" (255) em quatro chaves soltas. Vira
+// a lista de fabrica, mais o que a pessoa usava, com a escolha apontando para
+// o mesmo servidor de antes.
+static void mq_migrar(void)
+{
+  s_mq_n = 0;
+  mq_por("Mesh Brasil", "platform.meshbrasil.com", "meshdev", "large4cats", "meshdev");
+  mq_por("Meshtastic Brasil", "mqtt.meshtastic.org", "meshdev", "large4cats", "msh/BR");
+  uint8_t nova = AJUSTES_MQTT_AUTOMATICO;
+  switch (s_mqtt_srv) {
+    case 1: nova = 1; break;
+    case 5: nova = 2; break;
+    case 2: mq_por("Meshtastic EUA", "mqtt.meshtastic.org", "meshdev", "large4cats", "msh/US");
+            nova = (uint8_t)s_mq_n; break;
+    case 3: mq_por("Meshtastic Europa", "mqtt.meshtastic.org", "meshdev", "large4cats", "msh/EU_868");
+            nova = (uint8_t)s_mq_n; break;
+    case 4: mq_por("Meshtastic Austrália", "mqtt.meshtastic.org", "meshdev", "large4cats", "msh/ANZ");
+            nova = (uint8_t)s_mq_n; break;
+    default: break;
+  }
+  nvs_handle_t h;
+  if (nvs_open(NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+    char srv[64] = "", usr[32] = "", raiz[48] = "", pwd[32] = "", hex[TAB5_WIFI_CIFRA_HEX] = "";
+    size_t t = sizeof(srv);  nvs_get_str(h, "mqtt_p_srv", srv, &t);
+    t = sizeof(usr);         nvs_get_str(h, "mqtt_p_usr", usr, &t);
+    t = sizeof(raiz);        nvs_get_str(h, "mqtt_p_raiz", raiz, &t);
+    t = sizeof(hex);
+    if (nvs_get_str(h, "mqtt_p_pwd", hex, &t) != ESP_OK || !tab5_wifi_decifrar_texto(hex, pwd, sizeof(pwd))) { pwd[0] = 0; }
+    if (srv[0]) {
+      mq_por("Servidor próprio", srv, usr, pwd, raiz[0] ? raiz : "msh");
+      if (s_mqtt_srv == 255) { nova = (uint8_t)s_mq_n; }
+    }
+    memset(pwd, 0, sizeof(pwd));
+    nvs_erase_key(h, "mqtt_p_srv");
+    nvs_erase_key(h, "mqtt_p_usr");
+    nvs_erase_key(h, "mqtt_p_raiz");
+    nvs_erase_key(h, "mqtt_p_pwd");
+    nvs_commit(h);
+    nvs_close(h);
+  }
+  mq_guardar();
+  if (nova != s_mqtt_srv) { s_mqtt_srv = nova; marcar(&s_mqtt_srv); }
+  ESP_LOGI(TAG, "servidores MQTT: lista criada (%d), escolha %u", s_mq_n, (unsigned)s_mqtt_srv);
+}
+
+static void mq_carregar(void)
+{
+  s_mq_n = 0;
+  if (!s_pronto) { return; }
+  mq_blob_t* b = (mq_blob_t*)heap_caps_calloc(1, sizeof(mq_blob_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!b) { return; }
+  bool lido = false;
+  nvs_handle_t h;
+  if (nvs_open(NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+    size_t tam = sizeof(*b);
+    lido = nvs_get_blob(h, "mqtt_lista", b, &tam) == ESP_OK && b->versao == MQ_VERSAO
+        && b->n <= AJUSTES_MQTT_MAX && tam >= offsetof(mq_blob_t, s) + sizeof(mq_guardado_t) * b->n;
+    nvs_close(h);
+  }
+  bool legado = false;   // alguma senha na cifra antiga (chave do MAC): regrava
+  if (lido) {
+    for (int i = 0; i < b->n; ++i) {
+      const mq_guardado_t& g = b->s[i];
+      char pwd[32] = "";
+      bool velha = false;
+      if (g.pwd_hex[0] && !tab5_wifi_decifrar_texto(g.pwd_hex, pwd, sizeof(pwd), &velha)) { pwd[0] = 0; }
+      if (g.pwd_hex[0] && velha) { legado = true; }
+      mq_por(g.nome, g.srv, g.usr, pwd, g.raiz);
+      memset(pwd, 0, sizeof(pwd));
+    }
+  }
+  memset(b, 0, sizeof(*b));
+  heap_caps_free(b);
+  if (!lido) { mq_migrar(); }
+  else if (legado) { mq_guardar(); ESP_LOGW(TAG, "servidores MQTT: senhas regravadas com a chave nova"); }
+  if (s_mqtt_srv > s_mq_n) { s_mqtt_srv = AJUSTES_MQTT_AUTOMATICO; }   // apontava para alem da lista
+}
+
+int ajustes_mqtt_n(void) { return s_mq_n; }
+
+bool ajustes_mqtt_ler(int i, ajustes_mqtt_srv_t* out)
+{
+  if (i < 0 || i >= s_mq_n || !out) { return false; }
+  *out = s_mq[i];
+  return true;
+}
+
+int ajustes_mqtt_gravar(int i, const ajustes_mqtt_srv_t* s)
+{
+  if (!s) { return -1; }
+  if (i < 0 || i >= s_mq_n) {
+    if (s_mq_n >= AJUSTES_MQTT_MAX) { return -1; }
+    i = s_mq_n++;
+  }
+  s_mq[i] = *s;
+  mq_guardar();
+  ESP_LOGI(TAG, "servidor MQTT %d: %s (%s, raiz %s)", i + 1, s->nome, s->srv, s->raiz);
+  return i;
+}
+
+void ajustes_mqtt_apagar(int i)
+{
+  if (i < 0 || i >= s_mq_n) { return; }
+  for (int k = i; k < s_mq_n - 1; ++k) { s_mq[k] = s_mq[k + 1]; }
+  --s_mq_n;
+  memset(&s_mq[s_mq_n], 0, sizeof(s_mq[s_mq_n]));
+  mq_guardar();
+  // A escolha segue o mesmo servidor: o apagado volta ao automatico, os de
+  // depois dele andaram uma casa.
+  const int e = (int)s_mqtt_srv - 1;
+  if (e == i)     { ajustes_definir_mqtt_servidor(AJUSTES_MQTT_AUTOMATICO); }
+  else if (e > i) { ajustes_definir_mqtt_servidor((uint8_t)e); }
 }

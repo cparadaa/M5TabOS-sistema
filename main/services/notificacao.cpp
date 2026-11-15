@@ -25,17 +25,10 @@ typedef struct {
 static fonte_t          s_fontes[NOTIF_MAX_FONTES];
 static int              s_n = 0;
 static uint32_t         s_versao = 0;
-static SemaphoreHandle_t s_trava = nullptr;
+static Trava s_trava;
 
-// Mutex criado na PRIMEIRA chamada, e nao num notif_iniciar() - assim o
-// modulo nao impoe ordem de inicializacao a ninguem: um servico que suba
-// antes do sistema pode registrar-se sem que exista uma "fase 0" para manter
-// em dia. Mecanismo e risco documentados em tab5_mutex.hpp; a razao de ser
-// seguro AQUI especificamente e a mesma de sempre: o primeiro registro
-// acontece antes de existirem duas tarefas disputando - servicos registram
-// ao subir, um de cada vez, a partir da mesma tarefa.
-static inline void travar(void)    { tab5_mutex_travar(&s_trava); }
-static inline void destravar(void) { tab5_mutex_destravar(&s_trava); }
+static inline void travar(void)    { s_trava.travar(); }
+static inline void destravar(void) { s_trava.destravar(); }
 
 int notif_registrar(const char* nome)
 {
@@ -91,7 +84,7 @@ void notif_publicar(int id, int quantidade, notif_nivel_t nivel, const char* res
   }
   destravar();
 
-  // PRIMEIRO PRODUTOR ATIVO DA QUEUE DE EVENTOS - Etapa 2 do ARQUITETURA.md
+  // PRIMEIRO PRODUTOR ATIVO DA QUEUE DE EVENTOS - Etapa 2 do docs/ARQUITETURA.md
   // . "mudou" e conferido FORA da secao travada de proposito:
   // sistema_acordar_interface() so poe um evento numa queue diferente e nunca
   // bloqueia, mas nao ha motivo para segurar o mutex deste modulo emprestado
@@ -182,20 +175,4 @@ int notif_listar(notif_item_t* saida, int max)
   for (int i = 0; i < n; ++i) { copiar(&saida[i], &s_fontes[ordem[i]]); }
   destravar();
   return n;
-}
-
-bool notif_destaque(notif_item_t* saida, int* outras)
-{
-  travar();
-  int melhor = -1, ativas = 0;
-  for (int k = 0; k < s_n; ++k) {
-    const fonte_t* f = &s_fontes[k];
-    if (!f->usada || f->quantidade <= 0) { continue; }
-    ++ativas;
-    if (melhor < 0 || antes(f, &s_fontes[melhor])) { melhor = k; }
-  }
-  if (melhor >= 0 && saida) { copiar(saida, &s_fontes[melhor]); }
-  destravar();
-  if (outras) { *outras = ativas > 0 ? ativas - 1 : 0; }
-  return melhor >= 0;
 }

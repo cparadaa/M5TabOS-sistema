@@ -52,14 +52,13 @@
 // tab5_camera_parar(). Abrir o app Camera enquanto o comando 'foto' ainda
 // segura a camera (ou vice-versa) e seguro: nenhum dos dois derruba o outro.
 //
-// UMA UNICA RESOLUCAO POR VEZ, DE PROPOSITO - so existe UM par de buffers de
-// saida (ver TAB5_CAM_NBUF em tab5_camera.cpp). Enquanto ja houver alguem
-// usando a camera, um segundo tab5_camera_iniciar() com largura/altura
-// DIFERENTES e recusado (devolve false, log explica) em vez de reconfigurar
-// o sensor por baixo de quem ja esta lendo. Hoje so existe UM consumidor por
-// resolucao (o app Camera usa a area da tela; 'foto' usa um tamanho fixo
-// proprio) - o dia em que isso incomodar, a solucao e um segundo par de
-// buffers, nao esta funcao.
+// O SENSOR TEM UM MODO SO (1600x1200, ver a foto abaixo); O TAMANHO E DE
+// QUEM USA. Ligar nao escolhe resolucao: o preview tem o tamanho do destino
+// (tab5_camera_definir_destino) e cada quadro pedido, o seu
+// (tab5_camera_pedir_quadro). Assim o app Camera, um app Berry, o console e
+// o navegador do PC (services/tab5_camera_web) usam a camera ao mesmo tempo
+// sem um recusar o outro. (Antes iniciar() levava o tamanho do preview e
+// recusava um segundo consumidor com outro tamanho.)
 //
 // A CAMERA SE ALIMENTA SOZINHA AGORA - antes, CAM_RST (o pino de reset do
 // sensor) so era ligado porque o app Camera declarava perfil.camera=true, e
@@ -95,15 +94,14 @@
 // compartilhado, esp_video_init, abre o dispositivo, aloca os buffers de
 // captura, registra o PPA (escala + rotaciona 270 graus - o sensor esta
 // montado de lado na placa) e sobe a tarefa que produz frames.
-// 'largura'/'altura' e o tamanho do buffer de SAIDA (RGB565, ja pronto para
-// pushImage) - a foto cheia do sensor (1600x1200) e reduzida para isto a
-// cada frame.
 //
-// CHAMAR SO DA TAREFA DE INTERFACE - ver o aviso grande acima. Nao depende
-// mais de perfil.camera, ela mesma liga CAM_RST. Devolve false se qualquer
-// passo falhar (log explica qual, inclusive um pedido de resolucao
-// diferente da que ja esta em uso) - nesse caso nao ha nada para desligar.
-bool tab5_camera_iniciar(int largura, int altura);
+// De qualquer tarefa: o SCCB passa pela trava do I2C interno
+// (hal/tab5_sccb.cpp). Nao depende de perfil.camera, ela mesma liga CAM_RST.
+// Devolve false se qualquer passo falhar (o log explica qual) - nesse caso
+// nao ha nada para desligar.
+// 'quem' (app, "navegador", "console") e quem aparece usando o recurso
+// CAMERA (kernel/recursos.h) - o mesmo nome no parar.
+bool tab5_camera_iniciar(const char* quem);
 
 // Descarta UM interesse (ver a contagem de referencia acima). So quando o
 // ULTIMO cai e que a tarefa desce de verdade (tarefa_app_encerrar, com
@@ -113,7 +111,27 @@ bool tab5_camera_iniciar(int largura, int altura);
 // aviso grande acima) - de onde tab5_camera_iniciar() foi chamada
 // (ao_fechar()). Seguro chamar mesmo se tab5_camera_iniciar() nunca rodou,
 // falhou, ou ja foi parada por outro caminho.
-void tab5_camera_parar(void);
+void tab5_camera_parar(const char* quem);
+
+// PAUSA COM A TELA APAGADA - uma regra do SISTEMA, nao do app (06/11/2026,
+// docs/SUSPENSAO_2026-11-05.md). Quem chama e o kernel (kernel/core.cpp), no
+// repouso, pelo app em primeiro plano: com a tela apagada ninguem ve o
+// preview, e a camera ligada a toa segura 180 MHz e o sono leve (o recurso
+// CAMERA). Antes cada app fazia isto no proprio ao_repouso (app Camera,
+// apps Berry) - e o consumidor que esquecia ficava filmando no escuro.
+//
+// tab5_camera_pausar(quem): se 'quem' usa a camera, solta o uso dele (como
+// tab5_camera_parar) e guarda o destino do preview. O preview para de
+// escrever na superficie mesmo se outro consumidor (o navegador) mantiver a
+// camera ligada. Devolve true se pausou. Um quadro pedido que morrer com a
+// camera volta como pronto com ok = false (quem pediu ja trata a falha).
+// tab5_camera_despausar(religar): religar = true liga de novo pelo mesmo
+// 'quem' e devolve o destino; false so esquece a pausa (o app fechou).
+// Se o dono pausado chamar tab5_camera_parar/iniciar no meio (fechou ou o
+// script religou), a pausa e esquecida e a contagem segue certa.
+// So da tarefa de interface, como iniciar/parar.
+bool tab5_camera_pausar(const char* quem);
+void tab5_camera_despausar(bool religar);
 
 // Ha algum interessado vivo agora (contagem de referencia > 0)? Existe para
 // sistema_impor_preferencias() (kernel/core.cpp) nao cortar CAM_RST por
@@ -129,10 +147,11 @@ bool tab5_camera_ativa(void);
 // 'avisar' (opcional) e chamado da tarefa da camera a cada frame escrito -
 // sistema_acordar_interface, para a interface levar o frame na hora.
 typedef struct {
-  void*  buf;          // nulo = nenhum destino (so fotos)
+  void*  buf;          // nulo = nenhum destino (so quadros pedidos)
   size_t bytes;        // tamanho total de buf
   int    pic_l, pic_a; // dimensoes da imagem inteira
   int    x, y;         // canto do retangulo dentro dela
+  int    l, a;         // tamanho do retangulo: o preview (escala uniforme, preenchendo)
   void (*avisar)(void);
 } tab5_cam_destino_t;
 
@@ -141,36 +160,47 @@ void tab5_camera_definir_destino(const tab5_cam_destino_t* d);   // nullptr = ne
 // true UMA vez por frame escrito no destino desde a ultima chamada.
 bool tab5_camera_quadro_escrito(void);
 
-// FOTO EM RESOLUCAO CHEIA: 1200x1600, o quadro INTEIRO do sensor girado,
-// sem escala - independente do tamanho do preview.
+// QUADRO SOB PEDIDO: o proximo frame inteiro, no tamanho l x a de quem pediu
+// (RGB565, linha a linha de cima para baixo), com a mesma escala uniforme do
+// preview - so o que nao cabe na proporcao sai das bordas. E a FOTO
+// (TAB5_CAM_FOTO_L x _A em pe: o quadro inteiro do sensor, sem escala) e o
+// VIDEO do navegador (menor, comprimido em JPEG por quem pediu).
+//
+// EM PE OU COMO O SENSOR VE. O sensor esta de lado na placa: em pe, o PPA
+// gira 270 graus e espelha (como a tela e a foto) - e GIRAR CUSTA: ~117 ms
+// por quadro de 480x640 (medido 05/11/2026; o PPA le a PSRAM coluna a
+// coluna), contra os ~32 ms entre dois frames. 'em_pe' = false entrega o
+// quadro deitado (l x a na proporcao 4:3 do sensor), so reduzido, e quem
+// mostra gira - o navegador faz isso de graca. Para mostrar em pe: girar 90
+// graus no sentido horario e espelhar na horizontal (= transpor).
 //
 // O SENSOR RODA NO MODO 1600x1200 (sdkconfig.defaults). O modo 1280x720 do
 // driver nao reduz a imagem: ele liga uma JANELA no meio do sensor (colunas
 // 160-1447, linhas 240-967), 80% da largura e 60% da altura - a foto saia
 // como se tivesse zoom.
 //
-// A CAMERA SO CAPTURA; QUEM GRAVA E QUEM PEDIU. A versao anterior gravava o
-// .bmp na propria tarefa da camera, linha a linha: o preview parava e o app
-// ficava travado (INICIO bloqueado) por mais de 10 s. Agora o pedido e
-// atendido no proximo frame com UMA operacao de PPA (poucos ms) para o
-// buffer de quem pediu; gravar e com o worker do sistema (app) ou com a
-// tarefa do console - ver services/tab5_bmp.
+// A CAMERA SO CAPTURA; QUEM GRAVA OU COMPRIME E QUEM PEDIU. O pedido e
+// atendido no proximo frame com UMA operacao de PPA (poucos ms): o preview
+// nao para. Ate TAB5_CAM_PEDIDOS (2) pedidos ao mesmo tempo - a foto de um
+// app e o video do PC nao disputam a vez.
 #define TAB5_CAM_FOTO_L 1200
 #define TAB5_CAM_FOTO_A 1600
 
-// Buffer certo para a foto (PSRAM, alinhado a linha de cache, o tamanho que o
-// PPA exige). Liberar com heap_caps_free.
-uint16_t* tab5_camera_foto_alocar(void);
-size_t    tab5_camera_foto_bytes(void);
+// Buffer certo para um quadro l x a (PSRAM, alinhado a linha de cache, o
+// tamanho que o PPA exige). Liberar com heap_caps_free.
+uint16_t* tab5_camera_quadro_alocar(int l, int a);
+size_t    tab5_camera_quadro_bytes(int l, int a);
 
-// Pede a proxima foto para 'destino' (de tab5_camera_foto_alocar). false = a
-// camera nao esta ligada ou ja ha um pedido pendente. 'destino' e escrito pela
-// tarefa da camera ate tab5_camera_foto_pronta() devolver true - nao libere
-// antes disso (tab5_camera_parar() tambem espera a tarefa terminar).
-bool tab5_camera_pedir_foto(uint16_t* destino);
+// Pede o proximo frame em 'destino' (de tab5_camera_quadro_alocar, no mesmo
+// l x a). false = camera desligada, sem vaga, ou este destino ja tem pedido.
+// 'destino' e escrito pela tarefa da camera ate tab5_camera_quadro_pronto()
+// devolver true - nao libere antes disso (tab5_camera_parar() tambem espera
+// a tarefa terminar).
+bool tab5_camera_pedir_quadro(uint16_t* destino, int l, int a, bool em_pe = true);
 
-// true UMA vez quando a foto pedida chegou ao buffer (ok = PPA deu certo).
-bool tab5_camera_foto_pronta(bool* ok);
+// true UMA vez quando o quadro pedido para 'destino' chegou (ok = PPA deu
+// certo); a vaga fica livre para o proximo pedido.
+bool tab5_camera_quadro_pronto(const uint16_t* destino, bool* ok);
 
 // REGISTRADOR DO SENSOR, para diagnostico (comando 'camera' do console).
 // valor >= 0 escreve antes de ler; -1 so le. false = camera desligada ou o

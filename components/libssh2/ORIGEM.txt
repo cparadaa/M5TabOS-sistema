@@ -1,0 +1,10 @@
+libssh2 1.11.1 - https://github.com/libssh2/libssh2 (commit 455f062)
+Licenca BSD-3-Clause: libssh2/COPYING.
+
+Veio pelo port para ESP-IDF skuodi/libssh2_esp v1.1.0
+(https://github.com/skuodi/libssh2_esp, commit 198771d, BSD-3-Clause:
+LICENSE.port), de onde sao o libssh2_config.h e o compat.h.
+
+Copiado sem mudanca: so os fontes do backend mbedTLS (src/*.c que o
+CMakeLists lista) e os cabecalhos. O CMakeLists.txt e nosso (ver o topo dele).
+O clone completo fica em ../../../terceiros/libssh2_esp (fora do repositorio).

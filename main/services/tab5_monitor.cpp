@@ -12,8 +12,11 @@
 #include <stdarg.h>
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_memory_utils.h"             // esp_ptr_external_ram
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_image_format.h"
 #include "tab5_sd.hpp"
 #include "tab5_hora.hpp"
 #include "tab5_quadro.hpp"
@@ -328,6 +331,10 @@ static void amostrar(bool primeira)
     t.numero      = s_status[i].xTaskNumber;
     t.prioridade  = s_status[i].uxCurrentPriority;
     t.pilha_livre = (uint32_t)s_status[i].usStackHighWaterMark * sizeof(StackType_t);
+    // ONDE MORA A PILHA: so o endereco do comeco, sem ler nada da tarefa (ela
+    // pode ter morrido depois da foto). O TAMANHO nao sai daqui com seguranca:
+    // o FreeRTOS nao o guarda, e o retrato que o teria so vale no panico.
+    t.pilha_psram = esp_ptr_external_ram(s_status[i].pxStackBase);
     const char* dono = nullptr;
     t.tipo = (uint8_t)tab5_dono_de(s_status[i].xHandle, &dono);
     snprintf(t.dono, sizeof(t.dono), "%s", dono ? dono : "");
@@ -457,7 +464,12 @@ static void amostrar(bool primeira)
     static uint32_t s_presa_desde = 0;
     sistema_diag_t d;
     sistema_diag_interface(&d);
-    if (!s_presa && d.voltas > 0 && d.ms_desde_volta > 3000) {
+    // Em repouso o laco espera de proposito ate o prazo do contrato de
+    // economia (5-10 s, app.h): 3 s ali era alarme falso - e logo ao acordar,
+    // a ultima volta ainda e a de antes do sono.
+    const bool dormindo = d.repouso || (d.etapa && strncmp(d.etapa, "repouso", 7) == 0);
+    const uint32_t limite = dormindo ? 12000 : 3000;
+    if (!s_presa && d.voltas > 0 && d.ms_desde_volta > limite) {
       s_presa = true;
       s_presa_desde = d.voltas;
       evento("INTERFACE PRESA ha %lus em: %s", (unsigned long)(d.ms_desde_volta / 1000), d.etapa);
@@ -484,7 +496,8 @@ static void amostrar(bool primeira)
              app ? app : "a home");
       int nucleo = -1; char t0[16], t1[16];
       tab5_quadro_atraso_quem(&nucleo, t0, t1);
-      evento("  atraso: ISR no nucleo %d; rodando c0=%s c1=%s", nucleo, t0, t1);
+      evento("  atraso: ISR no nucleo %d; rodando c0=%s c1=%s; pc 0x%08lx", nucleo, t0, t1,
+             (unsigned long)tab5_quadro_atraso_pc());
       // O QUE ACONTECEU PERTO: quanto tempo antes do atraso o cartao montou/
       // desmontou de verdade e saiu o ultimo frame (e de que tamanho).
       const int64_t t = tab5_quadro_atraso_quando();
@@ -689,16 +702,15 @@ static void vTaskMonitor(void*)
   amostrar(true);
   TickType_t marca = xTaskGetTickCount();
   for (;;) {
-    vTaskDelayUntil(&marca, pdMS_TO_TICKS(1000));
+    // TELA APAGADA: uma amostra a cada 10 s, e a tarefa DORME os 10 s - antes
+    // ela acordava todo segundo so para pular nove (cada acordada tira o P4
+    // do sono leve). A foto das tarefas e uma secao critica (~1 ms, a pilha
+    // de cada tarefa lida byte a byte) e ninguem olha o app Tarefas no
+    // escuro; os alarmes de RAM/CPU chegam ate 10 s depois. Ao acordar, volta
+    // a 1 s na proxima volta - ate 10 s depois (a CPU de cada janela vem de
+    // deltas, vale para qualquer intervalo).
+    vTaskDelayUntil(&marca, pdMS_TO_TICKS(tab5_power_em_repouso() ? 10000 : 1000));
     if (s_zerar_pedido) { s_zerar_pedido = false; zerar_agora(); }
-    // TELA APAGADA: uma amostra a cada 10 s. A foto das tarefas e uma secao
-    // critica (~1 ms, a pilha de cada tarefa lida byte a byte) e ninguem olha
-    // o app Tarefas no escuro; os alarmes de RAM/CPU so chegam ate 10 s depois.
-    // Acordou, volta a 1 s na hora (a CPU de cada janela vem de deltas, vale
-    // para qualquer intervalo).
-    static uint32_t s_pulou = 0;
-    if (tab5_power_em_repouso() && ++s_pulou < 10) { continue; }
-    s_pulou = 0;
     amostrar(false);
   }
 }
@@ -768,6 +780,20 @@ uint32_t tab5_monitor_total_eventos(void) { return s_ev_total; }
 // comeco da proxima amostra - o estado dos gatilhos e a queue do cartao sao
 // dela, e mexer neles de outra tarefa seria corrida.
 void tab5_monitor_zerar_picos(void) { s_zerar_pedido = true; }
+
+bool tab5_monitor_programa(uint32_t* usado, uint32_t* total)
+{
+  const esp_partition_t* p = esp_ota_get_running_partition();
+  if (!p) { return false; }
+  if (usado) {
+    esp_partition_pos_t pos = { .offset = p->address, .size = p->size };
+    esp_image_metadata_t meta;
+    if (esp_image_get_metadata(&pos, &meta) != ESP_OK) { return false; }
+    *usado = meta.image_len;
+  }
+  if (total) { *total = (uint32_t)p->size; }
+  return true;
+}
 
 static void zerar_agora(void)
 {

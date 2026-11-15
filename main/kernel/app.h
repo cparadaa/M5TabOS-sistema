@@ -17,6 +17,7 @@
 #include "tab5_power.hpp"
 #include "tab5_sd.hpp"
 #include "fundo.h"      // parte de fundo de um app (trabalho que sobrevive a janela)
+#include "recursos.h"   // o que cada um usa: o sistema decide a suspensao
 
 // Retangulo onde o app pode desenhar. Fica entre a barra de status (topo) e a
 // barra de navegacao (base) - o app nunca precisa saber a altura delas.
@@ -40,6 +41,10 @@ typedef enum {
   // gravidade, entre os mesmos dois estados. Com o teclado fisico encaixado,
   // fica deitado - e a unica postura em que ele faz sentido.
   ORI_SEGUE_IMU,
+  // Em pe SEMPRE, mesmo com o teclado fisico encaixado (que deita todos os
+  // outros, kernel/orientacao). Para quem nao funciona girado: a Camera (a
+  // superficie de DMA do preview so existe com a tela em rotacao 0).
+  ORI_FIXO_EM_PE,
 } orientacao_t;
 
 // COMANDO DE CONSOLE DE UM APP (campo .comandos do app_t, abaixo).
@@ -125,11 +130,9 @@ typedef struct {
   // para outro - medida de texto, posicao de botao - tem que ser refeita.
   orientacao_t orientacao;
 
-  // Clock minimo, em MHz, que este app precisa MESMO COM A TELA APAGADA.
-  // Serve para apps com trabalho de fundo: se o mapa azimutal continua lendo
-  // o GPS durante o repouso, ele diz aqui o quanto precisa. O sistema baixa o
-  // clock ate esse piso e nao alem. 0 = pode descer ao minimo (40 MHz).
-  int piso_repouso_mhz;
+  // (O teto do clock com a tela apagada nao e mais do app: e da politica dos
+  // RECURSOS em uso - kernel/recursos.h. O app que toca, filma ou atende a
+  // rede usa o servico, e o servico declara.)
 
   // ---- ciclo de vida ------------------------------------------------------
   // Chamado ao abrir. E AQUI que o app cria suas tarefas e queues.
@@ -157,9 +160,19 @@ typedef struct {
   // em uso, e o driver quebra dentro de dw_gdma_channel_use_link_list()
   // com um "Store access fault".
   //
+  // O DEFEITO DO DMA FOI CONSERTADO NO SISTEMA (05/11/2026): era o
+  // esp_lcd_panel_del apagando o canal ainda rodando, e hoje hal/tab5_dma.cpp
+  // para o canal antes - vale para qualquer consumidor do DMA, inclusive os
+  // que nao sao app (a camera do navegador caiu justamente por nao ter este
+  // gancho). Nao use estes ganchos para contornar defeito de hardware nem para
+  // segurar a suspensao: isso e do sistema (docs/SUSPENSAO_2026-11-05.md).
+  // Eles ficam para o que e do app: gravar o que esta aberto (Notas).
+  // A CAMERA TAMBEM SAIU DAQUI (06/11/2026): o kernel pausa a camera do app
+  // aberto ao apagar a tela e a religa ao acordar (tab5_camera_pausar) - o
+  // app Camera e os apps Berry nao tem mais gancho nenhum.
+  //
   // ao_repouso(): chamado ANTES do sistema desligar a tela (ainda com o
-  // painel de pe) - solte aqui qualquer DMA/hardware que nao pode conviver
-  // com a desmontagem do painel.
+  // painel de pe).
   // ao_retomar(): chamado DEPOIS do painel ja estar remontado - religue
   // aqui o que foi solto.
   //
@@ -258,6 +271,12 @@ typedef struct {
   // o clique se ela passar do limiar. Sem isso, todo fim de rolagem apertaria
   // o que estivesse embaixo do dedo.
   int altura_conteudo;
+  // A mesma altura, decidida AGORA (opcional; ganha de altura_conteudo). Para
+  // o app cujo conteudo muda com a orientacao: deitado (teclado fisico
+  // encaixado, kernel/orientacao) a area tem ~584 px de altura em vez de
+  // ~1144, e o que cabia em pe passa a precisar rolar. Recebe a area visivel
+  // (largura e altura de agora); 0 = nao rola.
+  int (*altura_agora)(const area_t& a);
 
   // Desenho do icone na tela inicial, dentro do quadrado (x, y, lado).
   //
@@ -269,7 +288,8 @@ typedef struct {
   // O nome continua sendo desenhado embaixo pelo sistema, nos dois casos.
   void (*icone)(lgfx::LovyanGFX& d, int x, int y, int lado);
 
-  // A TELA GIROU com o app aberto (so acontece com ORI_SEGUE_IMU). Chamado
+  // A TELA GIROU com o app aberto (ORI_SEGUE_IMU, ou o teclado fisico
+  // encaixado/retirado em qualquer app que nao seja ORI_FIXO_EM_PE). Chamado
   // na tarefa de interface, DEPOIS de a rotacao nova valer (sistema_area()
   // ja devolve as dimensoes novas) e ANTES da passada completa que a
   // redesenha. Serve para o app trocar de layout - nao precisa pedir
@@ -279,6 +299,23 @@ typedef struct {
 
   // Comandos de console deste app (ver app_comando_t acima). nullptr = nenhum.
   const app_comando_t* comandos;
+
+  // FORA DA TELA INICIAL: o app existe e abre (sistema_abrir_app), mas nao
+  // tem icone na home - mora dentro de outro (a Energia, aberta pelo Ajustes).
+  bool fora_da_home;
+
+  // NO NAVEGADOR DO PC: abre a parte deste app no servidor web do sistema
+  // (services/tab5_web - a funcao de ligar do servico dele, ex.:
+  // berry_web_ligar). O portal (http://<ip>/) lista os apps que tem isto e
+  // abre por aqui; o painel "No PC" do app tambem. nullptr = so no aparelho.
+  // De qualquer tarefa (o portal chama de dentro de um pedido).
+  bool (*no_pc)(void);
+
+  // NO TEMA NOVO (repaginacao 2026-11): true = o sistema limpa a area deste
+  // app com TEMA_FUNDO em vez de preto, e os componentes comuns (tab5_celula,
+  // tab5_escrever) desenham o texto sobre essa cor. Cada app liga isto quando
+  // for migrado para o tema - enquanto false, continua tudo no preto de antes.
+  bool fundo_tema;
 } app_t;
 
 // ---------------------------------------------------------------------------
@@ -293,11 +330,16 @@ void sistema_pedir_redesenho(void);
 // tarefa de interface (fala I2C com o codec).
 //
 // Existe porque o alto-falante e desligado depois de alguns segundos ocioso
-// (ver SPEAKER_OCIOSO_MS em core.cpp) e o ES8388 leva um tempo para subir: um
+// (ver SPEAKER_OCIOSO_MS em core_som.cpp) e o ES8388 leva um tempo para subir: um
 // tone() direto, com o codec frio, termina ANTES de o DAC ficar audivel - o
 // primeiro bip depois de uma pausa saia mudo. Aqui, com o codec frio, o tom
 // vai precedido de silencio ate o codec aquecer.
 void sistema_beep(float hz, uint32_t ms);
+
+// RECADO: uma frase curta na barra de status, no lugar do nome do app, por
+// ~2 s - a confirmacao de algo que nao muda a tela ("Copiado", "Colado").
+// Da tarefa de interface.
+void sistema_recado(const char* texto);
 
 // OS PINOS DO ALTO-FALANTE PARA O USB - so o pendrive usa (services/
 // tab5_pendrive). O I2S do alto-falante (GPIO 26/27) e o PHY USB que o ESP-IDF
@@ -308,7 +350,26 @@ void sistema_beep(float hz, uint32_t ms);
 bool sistema_som_ceder_pinos(uint32_t espera_ms);
 void sistema_som_devolver_pinos(void);
 
-// ACORDA A INTERFACE AGORA - Etapa 2 do ARQUITETURA.md. Em
+// SOM EM FLUXO - musica, tocada em blocos pela parte de fundo de um app
+// (app_musica). O codec so liga pela interface (I2C), entao abrir PEDE e
+// espera; dali em diante a parte de fundo alimenta sozinha, um bloco por vez,
+// sem passar pela interface. De qualquer tarefa, menos a interface.
+//   abrir:  liga o alto-falante (e espera o codec aquecer); false = sem som
+//           (pinos cedidos ao pendrive, ou a interface nao respondeu).
+//   livre:  cabe mais um bloco agora (o alto-falante guarda dois: o que toca e
+//           o proximo). O dono dos blocos usa TRES buffers em rodizio.
+//   tocar:  enfileira 'quadros' (estereo: pares L/R). false = o fluxo foi
+//           fechado por baixo (pendrive) - pare de tocar.
+//   calar:  descarta o que esta na fila (pausa, troca de musica).
+//   fechar: solta o alto-falante (ele desliga sozinho depois de ocioso).
+bool sistema_som_fluxo_abrir(uint32_t espera_ms);
+bool sistema_som_fluxo_livre(void);
+int  sistema_som_fluxo_na_fila(void);   // blocos no alto-falante agora (0 = a fila secou: falhou o som)
+bool sistema_som_fluxo_tocar(const int16_t* pcm, size_t quadros, uint32_t hz, bool estereo);
+void sistema_som_fluxo_calar(void);
+void sistema_som_fluxo_fechar(void);
+
+// ACORDA A INTERFACE AGORA - Etapa 2 do docs/ARQUITETURA.md. Em
 // repouso, a interface pode estar dormindo ate ~1s esperando o proximo prazo
 // periodico (ver kernel/core.cpp); isto pula a espera na hora que algo
 // realmente novo aconteceu, em vez de deixar o aviso esperar. Pensado para
@@ -316,6 +377,36 @@ void sistema_som_devolver_pinos(void);
 // nada impede um app de usar se um dia precisar do mesmo efeito - so poe um
 // evento na queue, nunca bloqueia, seguro de qualquer tarefa.
 void sistema_acordar_interface(void);
+
+// ---------------------------------------------------------------------------
+// CONTRATO DE ECONOMIA - o software acompanha o hardware no repouso
+// ---------------------------------------------------------------------------
+// Com a tela apagada o P4 entra em SONO LEVE entre um evento e outro (tickless
+// + light sleep, ver tab5_power_sono_leve). Cada acordada custa: quem tem um
+// laco periodico ESCOLHE o prazo pelo nivel, em vez de girar sempre no ritmo
+// de tela acesa:
+//     xQueueReceive(fila, &c, pdMS_TO_TICKS(sistema_ritmo_ms(1000, 10000)));
+// Nao perde rendimento: evento de verdade (fila, interrupcao, aviso) acorda na
+// hora - so o "olhar de novo por via das duvidas" fica mais espacado.
+//
+// Quem PRECISA de resposta rapida com a tela apagada (o ESP-NOW conversando:
+// o SDIO do C6 nao acorda o P4) SEGURA o sono com o proprio bit, e solta quando
+// nao precisar mais - o mesmo desenho de tab5_wifi_manter_acordado. Seguro de
+// qualquer tarefa.
+typedef enum { ECONOMIA_ACORDADO = 0, ECONOMIA_REPOUSO = 1 } economia_t;
+economia_t sistema_economia(void);
+static inline uint32_t sistema_ritmo_ms(uint32_t acordado_ms, uint32_t repouso_ms)
+{
+  return sistema_economia() == ECONOMIA_REPOUSO ? repouso_ms : acordado_ms;
+}
+//
+// SERVICO NAO USA ISTO DIRETO: declara o RECURSO que usa (kernel/recursos.h)
+// e a politica dele decide o sono leve. Sobram os bits do proprio sistema:
+#define ECONOMIA_SEGURA_WIFI     (1u << 0)   // Wi-Fi com receptor pedido - services/tab5_wifi_cochilo
+#define ECONOMIA_SEGURA_TESTE    (1u << 1)   // console: 'energia sono segurar'
+#define ECONOMIA_SEGURA_RECURSOS (1u << 2)   // algum recurso em uso proibe o sono leve (kernel/recursos)
+void     sistema_economia_segurar(uint32_t quem, bool sim);
+uint32_t sistema_economia_seguros(void);   // os bits de quem segura agora (0 = ninguem)
 
 // ---------------------------------------------------------------------------
 // AVISOS - o servico diz o que mudou, o app interessado e redesenhado na hora
@@ -329,31 +420,16 @@ void sistema_acordar_interface(void);
 #define AVISO_TRILHA      (1u << 4)   // amostra nova da trilha
 #define AVISO_TRABALHO    (1u << 5)   // um sistema_trabalho() deste app terminou (kernel/trabalho.hpp)
 #define AVISO_ESPNOW      (1u << 6)   // ESP-NOW: mensagem, estado de envio ou canal mudou (services/tab5_espnow)
+#define AVISO_VOLUMES     (1u << 7)   // um disco entrou ou saiu (pendrive no USB-A) - services/tab5_volumes
+#define AVISO_ARQUIVOS    (1u << 8)   // copiar/mover/esvaziar andou ou terminou - services/tab5_arquivos
+#define AVISO_WEB         (1u << 9)   // o servidor web ligou, desligou ou atendeu um pedido - services/tab5_web
+#define AVISO_SSH         (1u << 10)  // a sessao SSH compartilhada mudou (estado ou tela) - services/tab5_ssh
+#define AVISO_VIDEO       (1u << 11)  // quadro novo, pausa, fim ou erro do video - services/tab5_video
 void sistema_avisar(uint32_t avisos);
 
 // Para quando a tela inteira muda de conteudo (virar pagina, trocar de nivel):
 // limpa a area e repinta pelo double buffer, sem piscar. Ver kernel/core.cpp.
 void sistema_pedir_redesenho_completo(void);
-
-// Volta a rolagem do app para o topo e pede redesenho completo.
-//
-// Para quando um app tem mais de uma "tela" interna dividindo o MESMO
-// altura_conteudo (o campo e fixo, nao da para trocar por tela em runtime -
-// ver o app_config, Ajustes/galeria de fontes). Chame ao trocar de tela por
-// dentro do app: sem isto a rolagem de uma tela vaza para a outra, visual ou
-// funcionalmente (um toque interpretado com o deslocamento errado).
-void sistema_zerar_rolagem(void);
-
-// Liga/desliga a rolagem por arraste do sistema inteiro, pelo tempo que
-// durar a trava (nao esquece sozinha - desligue vc mesmo ao trocar de volta,
-// ha uma rede de seguranca so para quando o APP FECHA com a trava ligada).
-//
-// Mesmo problema do sistema_zerar_rolagem() acima, faltando a outra metade:
-// zerar poe a rolagem em 0 uma vez, mas nao impede o dedo de mexer nela de
-// novo no proximo arraste - so ISTO impede. Chame com true ao entrar numa
-// tela interna que nao usa a rolagem do sistema (ex.: a galeria de fontes,
-// que pagina) e com false ao sair dela.
-void sistema_travar_rolagem(bool travar);
 
 // Verdadeiro quando o sistema acabou de LIMPAR a area antes de chamar o
 // desenhar() do app - na abertura, ao voltar do repouso, ao trocar de pagina.
@@ -437,11 +513,26 @@ void sistema_impor_preferencias(tab5_perfil_t& p);
 // PREFIXADAS. Sem o "SIS_" o COR_BORDA daqui colidia com uma constante de
 // mesmo nome dentro do app Cobra - macro em header compartilhado nao respeita
 // escopo, e o erro sai no arquivo de quem nem sabia da existencia dela.
-#define SIS_FUNDO   0x2124      /* rgb(36, 38, 40) - fundo de barra e coluna */
-#define SIS_LINHA   0x39E7      /* rgb(56, 60, 60) - separador discreto      */
-#define SIS_BORDA   0x5B0D      /* rgb(90, 96,104) - moldura de coluna       */
+//
+// REPAGINACAO (2026-11): os tres nomes continuam, mas agora sao APELIDOS do
+// tema central (tab5_tema.hpp). Codigo novo deve usar os TEMA_* direto.
+#include "tab5_tema.hpp"
+#define SIS_FUNDO   TEMA_SUPERFICIE    /* fundo de barra, coluna e cartao   */
+#define SIS_LINHA   TEMA_LINHA         /* separador discreto                */
+#define SIS_BORDA   TEMA_TEXTO_3       /* moldura de coluna                 */
+
+// A COR DE FUNDO DA AREA AGORA: TEMA_FUNDO na home sem papel de parede e nos
+// apps com fundo_tema; preto no resto. E com ela que o sistema limpa a area,
+// e e o fundo padrao do texto dos componentes comuns (tab5_ui).
+uint16_t sistema_cor_fundo(void);
 
 void sistema_reaplicar_perfil(void);
+
+// O PERFIL DE ENERGIA MUDOU POR FORA DE UM APP (um servico passou a precisar
+// de um trilho, ou deixou de precisar): a interface o reaplica no proximo
+// ciclo - com a tela acesa; em repouso, quando ela acordar. Seguro de
+// QUALQUER tarefa (so marca). E o caminho para quem nao pode falar I2C.
+void sistema_perfil_mudou(void);
 
 // Pede uma nova sondagem do Grove - para quando alguem TROCA o modulo do cabo
 // com o aparelho ligado. Nao bloqueia: marca o pedido e o loop de interface o
@@ -453,19 +544,6 @@ bool sistema_grove_redetectar(void);
 // dizer o que esta acontecendo durante os ~4s que ela leva.
 bool sistema_grove_sondando(void);
 
-// -------------------------------------------------------------------------
-// CAMERA - pode ser chamada de QUALQUER tarefa
-// -------------------------------------------------------------------------
-// Ate aqui estas duas funcoes eram uma PONTE: o pedido esperava a tarefa de
-// interface executar, porque o SCCB do sensor (driver I2C do IDF) e o resto
-// do I2C interno (M5GFX) disputavam o mesmo controlador sem trava entre si -
-// e isso ja tinha quebrado ("Set format regs fail"). O SCCB agora passa pelas
-// transacoes do M5GFX, que travam a porta (hal/tab5_sccb.cpp): todo o I2C
-// interno e serializado por UMA trava, inclusive o controle automatico de
-// exposicao que o esp_video faz durante a captura. Ficam os nomes, para quem
-// ja chama; por dentro, chamada direta.
-bool sistema_camera_iniciar(int largura, int altura);
-void sistema_camera_parar(void);
 
 // TODOS OS DEDOS DA AMOSTRA ATUAL, para quem precisa de mais de um - o
 // teclado virtual. O ao_tocar_nivel() so conta o primeiro dedo: digitando
@@ -494,14 +572,40 @@ void sistema_consumir_toque(void);
 // trilho do C6).
 void sistema_bluetooth(bool ligar);
 
+// OS OUTROS SERVICOS, NO MESMO CONTRATO: grava a escolha (vale no proximo
+// boot) e aplica agora - o app nao repete os passos nem as dependencias. Da
+// tarefa de interface (mexem em trilho/I2C).
+void sistema_wifi(bool ligar);         // so age se mudou
+void sistema_grove(bool ligar);        // 5V do Grove sempre ligado + nova sondagem do cabo
+// A via do Mesh (AJUSTES_MESH_*). Bluetooth liga o Bluetooth junto; sempre
+// reinicia o servico pela via nova.
+void sistema_mesh_via(uint8_t via);
+// O servico Mesh de novo, pela via gravada (servidor MQTT, endereco do no ou
+// via mudaram). Nao bloqueia: roda no worker.
+void sistema_mesh_reiniciar(void);
+
 // Liga o diagnostico de toque: cada clique imprime no log onde caiu, cru e
 // convertido. Existe para medir o desvio do dedo em vez de adivinha-lo.
 void sistema_diag_toque(bool ligar);
+// Pede o reinicio do GT911 pelo pino de reset (o mesmo do vigia, quando o
+// chip fica "mudo"). Feito pela interface na volta seguinte: o I2C e dela.
+void sistema_pedir_reinicio_toque(void);
+// Pede o "raio-x" do GT911 no log (identificacao, firmware, configuracao e a
+// soma dela). So le. Feito pela interface na volta seguinte.
+void sistema_pedir_regs_toque(void);
 // BANCADA (console): um clique em x,y de TELA (como o dedo, barra e navegacao
 // inclusive), e abrir um app (nullptr = voltar para a home). A interface
 // executa na volta seguinte; acorda a tela se estiver em repouso.
 void sistema_simular_toque(int x, int y);
+// Arraste simulado (bancada): de (x0,y0) ate (x1,y1), como o dedo - desbloqueia,
+// fecha ou rola a central, troca a pagina da home.
+void sistema_simular_gesto(int x0, int y0, int x1, int y1);
 void sistema_simular_abrir(const app_t* app);
+
+// ABRIR OUTRO APP PELO NOME ("Música") - o "abrir com" do Arquivos. A troca
+// acontece na volta seguinte da interface (seguro de dentro de um ao_tocar).
+// false = nao ha app com esse nome nesta variante.
+bool sistema_abrir_app(const char* nome);
 
 // ORDEM DOS ICONES NA TELA INICIAL. SISTEMA_APPS (apps.cpp) e a ordem de
 // fabrica; por cima dela vale a do usuario, gravada na NVS (ajustes.h) e
@@ -521,8 +625,10 @@ typedef struct {
   uint32_t    ms_desde_dedo;   // ha quanto tempo o toque leu um dedo (UINT32_MAX = nunca)
   // Vigia do toque (core.cpp): pulsos do GT911 desde o boot, falhas de I2C,
   // relatorios presos, segundos "surdos" (pulsos sem dedo lido), e o ultimo
-  // registrador de estado lido (0x814E).
+  // registrador de estado lido (0x814E). toque_reinicios: quantas vezes o
+  // GT911 "mudo" foi reiniciado pelo pino de reset (tab5_toque_reiniciar).
   uint32_t    toque_pulsos, toque_falhas, toque_presos, toque_surdos;
+  uint32_t    toque_reinicios;
   uint8_t     toque_status;
   bool        repouso;
   const char* app;             // nullptr = home
@@ -548,12 +654,17 @@ void sistema_travar_navegacao(bool travar);
 // repouso em curso tambem segura o clock no piso). O do app (SISTEMA_ACORDADO_APP) o sistema solta
 // sozinho ao fechar qualquer app.
 #define SISTEMA_ACORDADO_APP       (1u << 0)
-#define SISTEMA_ACORDADO_PENDRIVE  (1u << 1)   // computador usando o cartao (services/tab5_pendrive)
+#define SISTEMA_ACORDADO_RECURSOS  (1u << 1)   // RECURSO_TELA_ACESA em uso (kernel/recursos) - servico declara o recurso
 void sistema_manter_acordado(uint32_t motivo, bool sim);
 
 // O app em primeiro plano EXIGE o cartao (app_t.exige_sd). Seguro de
 // qualquer tarefa: e o que o pendrive consulta antes de emprestar o cartao.
 bool sistema_app_exige_sd(void);
+
+// O app em primeiro plano esta com o cartao montado para ele (app_t.usa_sd),
+// ou abrindo e montando. Seguro de qualquer tarefa (so leitura): o pendrive
+// recusa na hora em vez de esperar o cartao ficar livre.
+bool sistema_app_segura_sd(void);
 
 // A tela de bloqueio esta na frente (home ou app por baixo). Seguro de
 // qualquer tarefa (leitura de uma bandeira).
@@ -576,7 +687,39 @@ tab5_perfil_t sistema_perfil_de_boot(void);
 // Cria a tarefa de interface. Chamar depois do M5.begin().
 void sistema_iniciar(void);
 
-// Tabela de aplicativos. Definida em apps.cpp a partir das pastas main/app_*
-// (gerada no build - ninguem edita).
-extern const app_t* const SISTEMA_APPS[];
-extern const int         SISTEMA_NUM_APPS;
+// Tabela de aplicativos. Definida em apps.cpp: primeiro os fixos (das pastas
+// main/app_*, gerada no build), depois os registrados no boot (apps Berry do
+// cartao). So leitura fora do boot.
+#define SISTEMA_APPS_MAX 48
+extern const app_t* SISTEMA_APPS[];
+extern int          SISTEMA_NUM_APPS;
+
+// Acrescenta um app a tabela. No boot, antes de a interface subir, ou na
+// interface depois de sistema_apps_truncar. 'app' tem que viver para sempre.
+// false = tabela cheia.
+bool sistema_apps_registrar(const app_t* app);
+
+// Tira da tabela os registrados de 'n' em diante (os fixos ficam). SO NA
+// INTERFACE, com a tela inicial no ar, e seguido de novos registros e da
+// ordem dos icones remontada - e assim que os apps Berry sao relidos.
+void sistema_apps_truncar(int n);
+
+// APPS DE FORA - os que nao sao compilados junto (scripts do cartao). O nucleo
+// so conhece estas tres funcoes; quem as implementa e services/apps_de_fora.cpp,
+// que na variante berry liga os apps Berry e na completa nao faz nada (ver
+// docs/VARIANTES.md). Nenhum outro arquivo do nucleo sabe que o Berry existe.
+//   iniciar: no boot, depois do cartao e antes da home montar a ordem;
+//   atender: na interface, com a tela inicial no ar - aplica uma releitura;
+//            true = a lista mudou (a home remonta a ordem e redesenha);
+//   reler:   de qualquer tarefa MENOS a interface (le o cartao) - o cartao
+//            mudou (voltou do pendrive, console).
+void sistema_apps_de_fora_iniciar(void);
+bool sistema_apps_de_fora_atender(void);
+void sistema_apps_de_fora_reler(void);
+// REMOVER (a tela inicial: arrastar o icone para "Remover").
+//   removivel: o app e de fora (um script do cartao)? Os do sistema nao saem.
+//   remover:   tira o app - em segundo plano (para a parte de fundo dele,
+//              manda o script e os dados para a lixeira do cartao e rele);
+//              o icone some quando a releitura for atendida. Da interface.
+bool sistema_apps_de_fora_removivel(const app_t* app);
+void sistema_apps_de_fora_remover(const app_t* app);

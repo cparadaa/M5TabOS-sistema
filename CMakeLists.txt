@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16.0)
 
 # A VERSAO DO SISTEMA mora em version.txt (uma linha, SemVer) e so muda pelo
-# ferramentas/lancar.sh - as regras estao em VERSIONAMENTO.md.
+# ferramentas/lancar.sh - as regras estao em docs/VERSIONAMENTO.md.
 #
 # O numero que vai para o binario (esp_app_get_description()->version, o que
 # aparece em Ajustes, no console e no log de boot) diz tambem DE ONDE o build
@@ -62,10 +62,49 @@ if(NOT M5_CHIP MATCHES "^v[13]$")
   message(FATAL_ERROR "M5_CHIP deve ser v1 ou v3, e '${M5_CHIP}'")
 endif()
 set(SDKCONFIG_DEFAULTS "${CMAKE_SOURCE_DIR}/sdkconfig.defaults;${CMAKE_SOURCE_DIR}/sdkconfig.defaults.chip_${M5_CHIP}")
-if(NOT M5_CHIP STREQUAL "v1")
-  set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig")
-endif()
 message(STATUS "M5tabOS para ESP32-P4 ${M5_CHIP}.x")
 
+# A VARIANTE (ver docs/VARIANTES.md). O NUCLEO E UM SO: as variantes mudam apenas
+# QUAIS apps entram e se o Berry entra - nunca o codigo do sistema. Uma
+# correcao feita uma vez vale para todas.
+#     idf.py build                                      -> build/,       completa
+#     idf.py -B build_berry -DM5_VARIANTE=berry build   -> build_berry/, berry
+set(M5_VARIANTE "completa" CACHE STRING "Variante do sistema: completa ou berry (variantes/*.cmake)")
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/variantes/${M5_VARIANTE}.cmake")
+  message(FATAL_ERROR "M5_VARIANTE '${M5_VARIANTE}' nao existe em variantes/")
+endif()
+include("${CMAKE_SOURCE_DIR}/variantes/${M5_VARIANTE}.cmake")
+# Cache (FORCE): os componentes (main/) leem daqui - e a variante que manda.
+set(M5_BERRY ${M5_BERRY} CACHE BOOL "Berry dentro do binario (definido pela variante)" FORCE)
+set(M5_SEM_APPS_VARIANTE "${M5_SEM_APPS_VARIANTE}" CACHE STRING "Apps fora por causa da variante" FORCE)
+set(M5_SO_SISTEMA ${M5_SO_SISTEMA} CACHE BOOL "So os apps do sistema (definido pela variante)" FORCE)
+if(NOT M5_BERRY)
+  set(EXCLUDE_COMPONENTS berry)   # o interpretador nem e compilado
+endif()
+if(M5_VARIANTE_ROTULO)
+  set(PROJECT_VER "${PROJECT_VER}-${M5_VARIANTE_ROTULO}")   # Ajustes/console/log dizem qual e
+endif()
+message(STATUS "M5tabOS variante ${M5_VARIANTE} (Berry: ${M5_BERRY})")
+
+# Fora do padrao (outra revisao do chip ou outra variante), o sdkconfig mora
+# DENTRO da pasta de build - um sdkconfig e de UMA configuracao.
+if(NOT M5_CHIP STREQUAL "v1" OR NOT M5_VARIANTE STREQUAL "completa")
+  set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# AVISO E AVISO, EM QUALQUER ESP-IDF. O ESP-IDF oficial (o da imagem do CI,
+# espressif/idf) compila com -Wall -Werror -Wextra e troca o -Werror por
+# -Werror=all: todo aviso vira erro. O que vem com o PlatformIO (o da maquina
+# de desenvolvimento) traz essas tres opcoes COMENTADAS em tools/cmake/
+# build.cmake - o mesmo codigo compilava aqui e quebrava no CI, com avisos de
+# snprintf que "pode cortar" (format-truncation) em arquivos antigos. Tirando
+# o -Werror da lista ANTES do project(), a troca nao acontece: os avisos
+# continuam aparecendo (-Wall/-Wextra ficam), so nao param o build - e os dois
+# ESP-IDF compilam igual. No do PlatformIO isto nao muda nada.
+idf_build_get_property(m5_opcoes COMPILE_OPTIONS)
+list(REMOVE_ITEM m5_opcoes "-Werror" "-Werror=all")
+idf_build_set_property(COMPILE_OPTIONS "${m5_opcoes}")
+
 project(M5tabOS)

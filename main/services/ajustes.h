@@ -32,20 +32,30 @@
 // Carrega da NVS (e inicializa a NVS, se preciso). Chamar antes das tarefas.
 void ajustes_iniciar(void);
 
+// Toda mudanca de ajuste vai para a NVS 1 s depois da ultima (na tarefa do
+// esp_timer). Antes de cortar a energia, isto antecipa a gravacao pendente.
+void ajustes_gravar_agora(void);
+
 uint8_t ajustes_brilho(void);
 
 // Aplica na tela AGORA e grava. Valor fora da faixa e limitado, nao recusado.
 void ajustes_definir_brilho(uint8_t brilho);
 
+// O BRILHO NA ESCALA DO OLHO. O valor do PWM e linear na luz, mas o olho nao;
+// a "posicao" anda de 0 a AJUSTES_BRILHO_POS_MAX e o PWM sai dela pela curva
+// gama 2,2 (a barra de Ajustes anda nela). A porcentagem (0-100, para quem fala
+// assim: os scripts Berry) e a mesma posicao em passos de 10. 0 nao apaga a
+// tela - vale o AJUSTES_BRILHO_MIN.
+#define AJUSTES_BRILHO_POS_MAX 1000
+int ajustes_brilho_para_pos(int brilho);   // PWM -> posicao
+int ajustes_pos_para_brilho(int pos);      // posicao -> PWM
+uint8_t ajustes_brilho_pct(void);
+void    ajustes_definir_brilho_pct(uint8_t pct);
+
 // Se o usuario quer o WiFi ligado. Quem age sobre isso e o servico de WiFi;
 // aqui so mora a vontade.
 bool ajustes_wifi(void);
 void ajustes_definir_wifi(bool ligado);
-
-// Se o usuario quer o teclado do ExtPort1 ativo. Desligado, o sistema nao
-// procura o teclado nem gasta transacao I2C com ele.
-bool ajustes_teclado(void);
-void ajustes_definir_teclado(bool ligado);
 
 // Manter o 5V do Grove SEMPRE ligado.
 //
@@ -56,6 +66,13 @@ void ajustes_definir_teclado(bool ligado);
 // Custo: o trilho consome mesmo sem ninguem plugado, por isso nasce desligado.
 bool ajustes_grove(void);
 void ajustes_definir_grove(bool ligado);
+
+// A PORTA USB-A ligada: 5V no conector e o pendrive montado sozinho em /usb
+// (services/tab5_usb). Nasce LIGADA - espetar um pendrive e tocar musica
+// nao pode depender de achar um ajuste. Sem nada plugado custa quase nada
+// (a chave de 5V parada); com um aparelho plugado o sono leve fica suspenso.
+bool ajustes_usb_a(void);
+void ajustes_definir_usb_a(bool ligado);
 
 // Tempo sem toque ate a tela apagar, em SEGUNDOS.
 //
@@ -139,7 +156,7 @@ void ajustes_definir_casa(float lat, float lon);
 // ligar. Fica dentro do proprio app Trilha por enquanto (nao em Ajustes) -
 // se um dia mais fontes pedirem o mesmo controle, cada uma ganha o par
 // analogo (ajustes_beep_mesh() etc.), em vez de um mecanismo generico sem
-// um segundo caso real para validar o formato (ver ARQUITETURA.md, 1.1).
+// um segundo caso real para validar o formato (ver docs/ARQUITETURA.md, 1.1).
 bool ajustes_beep_trilha(void);
 void ajustes_definir_beep_trilha(bool tocar);
 
@@ -149,12 +166,70 @@ void ajustes_definir_beep_trilha(bool tocar);
 bool ajustes_beep_mesh(void);
 void ajustes_definir_beep_mesh(bool tocar);
 
+// TEMA DE COR DO ESPECTRO do app Musica (0 = arco-iris, o padrao). O app
+// sabe quantos temas existem; aqui so se guarda o numero.
+uint8_t ajustes_tema_espectro(void);
+void    ajustes_definir_tema_espectro(uint8_t tema);
+
+// COR DE DESTAQUE DO TOCADOR do sistema (services/tab5_musica), RGB565.
+// 0 = a do sistema (lilas). Quem define e a interface do tocador (o app
+// Musica pelo tema, um app Berry pela dele); o servico so publica.
+uint16_t ajustes_cor_tocador(void);
+void     ajustes_definir_cor_tocador(uint16_t cor565);
+
+// MODO DO TOCADOR (services/tab5_musica): bit 0 = aleatorio, bits 1-2 =
+// repetir (0 nao, 1 a fila toda, 2 a mesma musica). Vale ao ligar de novo.
+uint8_t ajustes_modo_tocador(void);
+void    ajustes_definir_modo_tocador(uint8_t modo);
+
 // CANAL DO ESP-NOW. 0 = o do roteador; 1..13 = canal fixo (o WiFi
 // solta o roteador). Era so RAM: todo reinicio voltava para o roteador e o
 // Cardputer no canal 1 sumia ate alguem reabrir o app e escolher de novo.
 // Quem aplica e o servico ESP-NOW (tab5_espnow) - aqui so mora a escolha.
 uint8_t ajustes_espnow_canal(void);
 void    ajustes_definir_espnow_canal(uint8_t canal);
+
+// TAMANHO DA LETRA DA CONVERSA DO ESP-NOW: 0 = o padrao, 1..3 = maior (o
+// botao "Aa" da barra do app passa de um para o outro). Guardado para nao
+// voltar ao pequeno a cada reinicio.
+#define AJUSTES_ESPNOW_LETRA_MAX 3
+uint8_t ajustes_espnow_letra(void);
+void    ajustes_definir_espnow_letra(uint8_t nivel);
+
+// A ULTIMA CARGA CONHECIDA DA BATERIA (0..100; AJUSTES_SOC_NENHUM = nunca
+// gravada). Guardada pela guarda da bateria (services/tab5_bateria) a cada 2
+// pontos e ao desligar por bateria vazia: um boot COM O CABO nao pode partir
+// da tensao, que carregando le muito acima da carga real.
+#define AJUSTES_SOC_NENHUM 255
+
+// ECONOMIA MAXIMA EM REPOUSO (services/tab5_wifi_cochilo): com a tela apagada
+// e nada precisando da rede, o Wi-Fi desliga e volta ao acender a tela ou por
+// 1 min a cada 15. DESLIGADA de fabrica: o padrao e ficar conectado em modo
+// economico (P4 dormindo com batida, C6 em modem sleep maximo) - ao acender a
+// tela a rede ja esta la.
+bool    ajustes_wifi_cochilo(void);
+// SONO LEVE DO P4 EM REPOUSO (contrato de economia, kernel/app.h). Ligado de
+// fabrica; 'energia sono off' no console desliga (rede de seguranca).
+bool    ajustes_sono_leve(void);
+void    ajustes_definir_sono_leve(bool ligado);
+void    ajustes_definir_wifi_cochilo(bool ligado);
+// CAPA DA MUSICA PELA INTERNET (services/tab5_musica): sem capa no arquivo nem
+// na pasta, o titulo e o artista da musica que toca vao a busca do iTunes.
+// Ligada de fabrica; desligada, nada da biblioteca sai do aparelho.
+// O C6 DORMINDO ASSOCIADO NO REPOUSO (hal/tab5_c6_sono): com a tela apagada o
+// enlace SDIO desmonta e o C6 entra em light sleep, e o ESP-NOW so ouve com a
+// tela acesa. Desligado de fabrica enquanto o consumo na bateria nao for medido.
+bool    ajustes_c6_sono(void);
+void    ajustes_definir_c6_sono(bool ligado);
+bool    ajustes_capa_internet(void);
+// Os ajustes de antes do ensaio de energia (services/tab5_ensaio), enquanto
+// ele roda: wifi, bluetooth, grove, mesh_internet, mesh_via. nullptr apaga.
+#define AJUSTES_ENSAIO_N 5
+bool    ajustes_ensaio_originais(uint8_t out[AJUSTES_ENSAIO_N]);
+void    ajustes_definir_ensaio_originais(const uint8_t* originais);
+void    ajustes_definir_capa_internet(bool ligado);
+uint8_t ajustes_bateria_soc(void);
+void    ajustes_definir_bateria_soc(uint8_t pct);
 
 // POR ONDE O TAB5 FALA COM A MALHA MESHTASTIC. Serial = o cabo Grove
 // (PROTO/UART); Bluetooth = BLE pelo C6 interno, sem fio; Internet = MQTT
@@ -175,11 +250,6 @@ uint8_t  ajustes_mesh_via(void);
 // Ligado de fabrica.
 bool     ajustes_mesh_internet(void);
 void     ajustes_definir_mesh_internet(bool ligado);
-// A REDE AMERICANA (mqtt.meshtastic.org, LongFast dos EUA) em paralelo, com o
-// Wi-Fi conectado - nos e conversa separados. Desligada de fabrica: e trafego
-// de internet que ninguem pediu. Liga/desliga na pagina de nos do app Mesh.
-bool     ajustes_mesh_eua(void);
-void     ajustes_definir_mesh_eua(bool ligado);
 void     ajustes_definir_mesh_via(uint8_t via);
 uint32_t ajustes_mesh_pin(void);
 void     ajustes_definir_mesh_pin(uint32_t pin);
@@ -218,6 +288,12 @@ void ajustes_definir_bloqueio(bool ligado);
 bool ajustes_pendrive(void);
 void ajustes_definir_pendrive(bool ligado);
 
+// LIXEIRA: apagar sozinho os itens com mais de N dias (30 = 30 dias). 0 = nunca
+// (padrao: o que vai para a lixeira fica ate esvaziar). Quem aplica e o
+// tab5_arq_lixeira_manter (services/tab5_arquivos).
+uint8_t ajustes_lixeira_dias(void);
+void    ajustes_definir_lixeira_dias(uint8_t dias);
+
 // ESCALA DO GIROSCOPIO, por eixo do BMI270 (0 = x, 1 = y, 2 = z). O chip sai
 // de fabrica com erro de sensibilidade de alguns por cento, e o rumo do Radar
 // herda esse erro a cada volta. Medida no proprio Radar (voltas inteiras contra
@@ -233,6 +309,11 @@ void  ajustes_definir_giro_escala(int eixo, float escala);
 void ajustes_ordem_apps(char* out, size_t n);
 void ajustes_definir_ordem_apps(const char* nomes);   // "" ou nullptr = padrao
 
+// IDIOMA DA INTERFACE (o codigo do .po escolhido). Quem interpreta e
+// services/idioma.h - a interface usa idioma_*, nao estes.
+const char* ajustes_idioma(void);                 // "pt", "en", "fr"...
+void        ajustes_definir_idioma(const char* codigo);
+
 // PAPEL DE PAREDE DO INICIO (home): linhas abstratas finas sobre preto, os
 // mesmos desenhos do fundo da tela de bloqueio. SORTEIO (o de fabrica) tira
 // um desenho a cada boot e o mantem ate o proximo; 1..5 fixa um; NENHUM e o
@@ -243,3 +324,46 @@ void ajustes_definir_ordem_apps(const char* nomes);   // "" ou nullptr = padrao
 
 uint8_t ajustes_parede(void);
 void    ajustes_definir_parede(uint8_t opcao);
+
+// ---------------------------------------------------------------------------
+// PRIMEIRO USO, FUSO E SERVIDOR DA MALHA PELA INTERNET
+// ---------------------------------------------------------------------------
+
+// A CONFIGURACAO INICIAL JA FOI FEITA? false so num aparelho que nunca rodou o
+// sistema (NVS vazia - inclusive depois de gravar pelo M5Burner, que apaga
+// os ajustes): o boot abre o assistente de boas-vindas (kernel/boas_vindas).
+// Quem ja tinha QUALQUER ajuste gravado conta como configurado - atualizar o
+// firmware nao traz o assistente de volta.
+bool ajustes_config_inicial(void);
+void ajustes_definir_config_inicial(bool feita);
+
+// FUSO HORARIO, em minutos a partir do UTC (-180 = UTC-3, o padrao). So a
+// EXIBICAO usa (tab5_hora_local): o RTC, os logs e os carimbos seguem em UTC.
+// Fixo, sem horario de verao - quem tem verao ajusta duas vezes por ano.
+#define AJUSTES_FUSO_MIN_MIN  (-12 * 60)
+#define AJUSTES_FUSO_MAX_MIN  ( 14 * 60)
+int16_t ajustes_fuso_min(void);
+void    ajustes_definir_fuso_min(int16_t minutos);
+
+// SERVIDORES MQTT DO MODO INTERNET do Mesh (sem no: o Tab5 fala com a malha
+// pelo Wi-Fi). E UMA LISTA DA PESSOA, nao uma fixa no codigo: ate
+// AJUSTES_MQTT_MAX servidores, cada um com nome, endereco, usuario, senha
+// (guardada cifrada, como as do Wi-Fi - chave derivada do chip) e raiz dos
+// topicos. Tamanhos: os do MQTT do Meshtastic.
+//
+// A ESCOLHA: 0 = AUTOMATICO, o comportamento de sempre (o servidor que o no
+// ensinou, ou o da comunidade brasileira); 1..n = o item n-1 da lista, que
+// vale por cima de tudo. Apagar um item acerta a escolha junto.
+//
+// De fabrica a lista traz o Mesh Brasil e o publico do Meshtastic na raiz do
+// Brasil. Os MODELOS para adicionar e o sentido de cada campo moram em
+// services/tab5_mesh_mqtt (a interface usa os mesh_mqtt_*, nao estes).
+#define AJUSTES_MQTT_AUTOMATICO  0
+#define AJUSTES_MQTT_MAX         8
+typedef struct { char nome[24], srv[64], usr[32], pwd[32], raiz[48]; } ajustes_mqtt_srv_t;
+uint8_t ajustes_mqtt_servidor(void);
+void    ajustes_definir_mqtt_servidor(uint8_t escolha);
+int     ajustes_mqtt_n(void);
+bool    ajustes_mqtt_ler(int i, ajustes_mqtt_srv_t* out);          // i = 0..n-1
+int     ajustes_mqtt_gravar(int i, const ajustes_mqtt_srv_t* s);   // i = -1: novo. Devolve o indice; -1 = cheia
+void    ajustes_mqtt_apagar(int i);

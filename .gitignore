@@ -1,18 +1,13 @@
 # Saidas de build (ESP-IDF)
 build/
-build_v3/
-build_m5burner*/
+build_*/
 c6/build/
-cardputer_teste/build/
 managed_components/
 c6/managed_components/
-cardputer_teste/managed_components/
 sdkconfig
 sdkconfig.old
 c6/sdkconfig
 c6/sdkconfig.old
-cardputer_teste/sdkconfig
-cardputer_teste/sdkconfig.old
 
 # O lock do C6 aponta o esp_hosted para a copia local (override_path), com
 # caminho absoluto da maquina: e regenerado no primeiro build.
@@ -43,3 +38,6 @@ ferramentas/privado.local.txt
 
 # Firmware gerado para o M5Burner (ferramentas/m5burner.sh)
 M5tabOS-*.bin
+
+# Tabelas geradas pelo coc do Berry (components/berry/CMakeLists.txt)
+components/berry/berry/generate/

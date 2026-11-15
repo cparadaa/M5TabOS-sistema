@@ -1,0 +1,20 @@
+O COMPONENTE fatfs DO ESP-IDF, COM O exFAT LIGADO.
+
+origem: framework-espidf 5.5.5 (o IDF que o M5tabOS usa), components/fatfs -
+copiado sem os testes (host_test, test_apps, test_fatfsgen) nem as
+ferramentas de gerar imagem em Python (o project_include.cmake ainda aponta
+para elas no proprio IDF). Licencas: o FatFs (src/) e do ChaN, licenca
+BSD de uma clausula; o resto e Apache-2.0 da Espressif.
+
+POR QUE AQUI: um componente em components/ com o mesmo nome de um do IDF
+SUBSTITUI o do IDF no build inteiro. O FF_FS_EXFAT e fixo em 0 no ffconf.h
+do IDF (nao ha opcao no menuconfig), entao a unica forma de ligar e esta.
+Vale para o pendrive (USB-A) e para o cartao SD.
+
+A UNICA MUDANCA: src/ffconf.h, FF_FS_EXFAT 0 -> 1 (marcada "M5tabOS").
+O vfs/vfs_fat.c do IDF ja trata exFAT (#if FF_FS_EXFAT).
+
+AO ATUALIZAR O IDF: copiar de novo components/fatfs da versao nova (mesmos
+diretorios), reaplicar a linha do ffconf.h, e build LIMPO de todas as
+variantes (idf.py fullclean): objeto velho do fatfs do IDF misturado com
+este da erro estranho em tempo de execucao.

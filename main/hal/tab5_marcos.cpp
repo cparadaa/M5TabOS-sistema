@@ -6,6 +6,9 @@
 #include "soc/rtc.h"
 #include "esp_cache.h"
 #include "sdmmc_cmd.h"
+#include <atomic>
+
+extern "C" void tab5_heap_psram_checar(const char* onde, size_t tam);
 
 #define MARCOS_N 64
 
@@ -21,7 +24,7 @@ void IRAM_ATTR tab5_marco(const char* o_que, int32_t valor)
   m.us    = agora;
   m.o_que = o_que;
   m.valor = valor;
-  s_prox  = s_prox + 1;
+  ++s_prox;
   portEXIT_CRITICAL_SAFE(&s_mux);
 }
 
@@ -91,5 +94,9 @@ extern "C" esp_err_t __real_esp_cache_msync(void* addr, size_t size, int flags);
 extern "C" esp_err_t IRAM_ATTR __wrap_esp_cache_msync(void* addr, size_t size, int flags)
 {
   if (size >= 16384) { tab5_marco("cache: msync KB", (int32_t)(size / 1024)); }
-  return __real_esp_cache_msync(addr, size, flags);
+  const esp_err_t r = __real_esp_cache_msync(addr, size, flags);
+  // O cabecalho do heap da PSRAM inteiro depois de uma sincronia grande (o
+  // esp_lcd faz uma de 1,8 MB por quadro - ver tab5_heap_psram.cpp).
+  if (size >= (1u << 20)) { tab5_heap_psram_checar("depois do msync", size); }
+  return r;
 }

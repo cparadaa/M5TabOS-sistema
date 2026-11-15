@@ -70,6 +70,22 @@ static uint32_t     s_girou_ms  = 0;
 static int          s_cand      = -1;          // a rotacao que esta pedindo passagem
 static int          s_seguidas  = 0;
 
+// TECLADO FISICO ENCAIXADO = TUDO DEITADO: a home e todo app, qualquer que
+// seja a orientacao declarada - menos ORI_FIXO_EM_PE. Ele encaixa no ExtPort1, que a rotacao 3 poe
+// embaixo, junto de quem digita; em pe ficaria pendurado na lateral. Tirar o
+// teclado volta cada um ao que declarou (o IMU segue decidindo quem o segue).
+static bool         s_teclado   = false;       // o estado do teclado ja aplicado na tela
+
+// A rotacao de quem esta na tela sem teclado: a home e ORI_EM_PE; quem segue
+// o IMU fica como esta ate a vigia decidir.
+static uint8_t rotacao_sem_teclado(void)
+{
+  // (ORI_FIXO_EM_PE cai no em pe do fim.)
+  if (s_modo == ORI_DEITADO) { return ROT_DEITADO; }
+  if (s_modo == ORI_SEGUE_IMU) { return M5.Display.getRotation(); }
+  return ROT_EM_PE;
+}
+
 // A rotacao que a postura de AGORA pede, ou -1 (zona morta, IMU sem leitura).
 static int rotacao_pedida(tab5_imu_dados_t* m)
 {
@@ -134,7 +150,10 @@ void orientacao_ao_abrir(const app_t* app)
   uint8_t rot = ROT_EM_PE;
   tab5_imu_dados_t m = { };
   int p = -1;
-  if (s_modo == ORI_DEITADO) {
+  s_teclado = tab5_teclado_presente();
+  if (s_teclado && s_modo != ORI_FIXO_EM_PE) {
+    rot = ROT_DEITADO;
+  } else if (s_modo == ORI_DEITADO) {
     rot = ROT_DEITADO;
   } else if (s_modo == ORI_SEGUE_IMU) {
     // A postura de agora, medida agora (ver ler_postura_fresca). Sem decisao
@@ -153,17 +172,21 @@ void orientacao_ao_abrir(const app_t* app)
              (double)m.ax, (double)m.ay, (double)m.az,
              tab5_teclado_presente() ? "  (teclado encaixado)" : p < 0 ? "  (sem decisao: a posicao da tela)" : "");
   } else {
-    ESP_LOGI(TAG, "'%s' abre %s (%dx%d)", app->nome, rot == ROT_EM_PE ? "em pe" : "deitado",
-             M5.Display.width(), M5.Display.height());
+    ESP_LOGI(TAG, "'%s' abre %s (%dx%d)%s", app->nome, rot == ROT_EM_PE ? "em pe" : "deitado",
+             M5.Display.width(), M5.Display.height(),
+             s_modo == ORI_FIXO_EM_PE ? "  (fixo)" : s_teclado ? "  (teclado encaixado)" : "");
   }
 }
 
 void orientacao_ao_fechar(void)
 {
   s_modo = ORI_EM_PE;
-  if (M5.Display.getRotation() != ROT_EM_PE) {
-    aplicar(ROT_EM_PE);
-    ESP_LOGI(TAG, "tela de volta em pe (%dx%d)", M5.Display.width(), M5.Display.height());
+  s_teclado = tab5_teclado_presente();
+  const uint8_t rot = s_teclado ? ROT_DEITADO : ROT_EM_PE;
+  if (M5.Display.getRotation() != rot) {
+    aplicar(rot);
+    ESP_LOGI(TAG, "tela de volta %s (%dx%d)", rot == ROT_EM_PE ? "em pe" : "deitada (teclado encaixado)",
+             M5.Display.width(), M5.Display.height());
   }
 }
 
@@ -176,6 +199,22 @@ uint32_t orientacao_prazo_ms(uint32_t agora)
 
 bool orientacao_vigiar(uint32_t agora, bool pode_girar)
 {
+  // O teclado entrou ou saiu: gira ja (sem amostras nem carencia - nao e um
+  // balanco da mao), assim que der (sem dedo na tela, nada na frente).
+  const bool teclado = tab5_teclado_presente();
+  if (teclado != s_teclado && pode_girar) {
+    s_teclado = teclado;
+    s_cand = -1;
+    s_seguidas = 0;
+    s_girou_ms = agora;
+    const uint8_t rot = (teclado && s_modo != ORI_FIXO_EM_PE) ? ROT_DEITADO : rotacao_sem_teclado();
+    if (rot != M5.Display.getRotation()) {
+      aplicar(rot);
+      ESP_LOGI(TAG, "teclado %s: tela %s (%dx%d)", teclado ? "encaixado" : "retirado",
+               rot == ROT_EM_PE ? "em pe" : "deitada", M5.Display.width(), M5.Display.height());
+      return true;
+    }
+  }
   if (s_modo != ORI_SEGUE_IMU) { return false; }
   if ((agora - s_ultima_ms) < AMOSTRA_MS) { return false; }
   s_ultima_ms = agora;

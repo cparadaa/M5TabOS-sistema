@@ -31,8 +31,16 @@
 # DEPOIS das outras, nvs e phy_init nao se mexem, os ajustes continuam. Sobram
 # ~5,9 MB livres no fim da flash.
 #
+# COREDUMP (1 MB, depois da reserva): o retrato do travamento (panic,
+# watchdog) que o proprio sistema grava na hora - o boot seguinte anota no log
+# do cartao a tarefa, o PC e o RA (services/tab5_log), e o 'idf.py
+# coredump-info' le o resto pela serial. Nasceu de um travamento com a musica
+# tocando que aconteceu "na mao", longe do computador, sem log nenhum.
+# Mesma regra: entra no fim, nada se mexe.
+#
 # Name,     Type, SubType, Offset,   Size,     Flags
 nvs,        data, nvs,     0x9000,   24K,
 phy_init,   data, phy,     0xf000,   4K,
 factory,    app,  factory, 0x10000,  0x800000,
 reserva,    data, 0x99,    0x810000, 0x200000,
+coredump,   data, coredump, 0xA10000, 0x100000,

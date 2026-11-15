@@ -7,6 +7,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include <atomic>
 
 static const char *TAG = "trabalho";
 
@@ -19,7 +20,7 @@ typedef struct {
 
 static QueueHandle_t     s_fila    = nullptr;
 static SemaphoreHandle_t s_rodando = nullptr;   // preso enquanto um trabalho executa
-static volatile uint32_t s_geracao = 1;         // sobe a cada app fechado
+static std::atomic<uint32_t> s_geracao = 1;         // sobe a cada app fechado
 static volatile uint32_t s_geracao_rodando = 0; // a do trabalho (nao solto) em execucao
 
 static void vTaskTrabalho(void*)
@@ -78,7 +79,7 @@ void trabalho_encerrar_do_app(void)
   // Primeiro invalida: o que estiver na queue (ou chegar agora) e descartado
   // quando o worker o tirar de la (geracao velha). A queue NAO e zerada:
   // um trabalho SOLTO la dentro e dono de memoria que so ele libera.
-  s_geracao = s_geracao + 1;   // escritor unico: a tarefa de interface
+  ++s_geracao;   // escritor unico: a tarefa de interface
   // Depois espera o que ja estava executando terminar - e o que torna o
   // ao_fechar() seguro para liberar memoria.
   xSemaphoreTake(s_rodando, portMAX_DELAY);

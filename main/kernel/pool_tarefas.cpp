@@ -11,8 +11,11 @@
 static const char* TAG = "pool";
 
 // CLASSES DE VAGA. O consumo real medido (menor pilha livre em uso de verdade)
-// manda aqui: servicos de serial e apps cabem em 4 KB; o Mesh pede 6 KB.
-// O total e ~26 KB e substitui o que esses mesmos usos pediam ao heap,
+// manda aqui: servicos de serial e apps cabem em 4 KB; o Mesh pede 6 KB, e
+// com o C6L no Grove fica com a vaga 0 o tempo todo. Por isso a ULTIMA vaga
+// tambem e de 6 KB: o comando do Terminal (os do console) roda nela. Medido
+// em 27/10: das cinco de 4 KB, so uma era usada de verdade.
+// O total e ~28 KB e substitui o que esses mesmos usos pediam ao heap,
 // no pior caso, como blocos separados.
 #define VAGA_G  6144
 #define VAGA_M  4096
@@ -23,7 +26,7 @@ PILHA_ESTATICA(s_pilha1, VAGA_M);
 PILHA_ESTATICA(s_pilha2, VAGA_M);
 PILHA_ESTATICA(s_pilha3, VAGA_M);
 PILHA_ESTATICA(s_pilha4, VAGA_M);
-PILHA_ESTATICA(s_pilha5, VAGA_M);
+PILHA_ESTATICA(s_pilha5, VAGA_G);
 
 #define POOL_N 6
 
@@ -115,7 +118,7 @@ void pool_iniciar(void)
 {
   if (s_pronto) { return; }
   StackType_t* pilhas[POOL_N] = { s_pilha0, s_pilha1, s_pilha2, s_pilha3, s_pilha4, s_pilha5 };
-  const uint32_t tam[POOL_N]  = { VAGA_G, VAGA_M, VAGA_M, VAGA_M, VAGA_M, VAGA_M };
+  const uint32_t tam[POOL_N]  = { VAGA_G, VAGA_M, VAGA_M, VAGA_M, VAGA_M, VAGA_G };
   uint32_t fixos = 0;
   for (int i = 0; i < POOL_N; ++i) {
     vaga_t* v = &s_v[i];
@@ -153,7 +156,8 @@ bool pool_criar(pool_id_t* id, pool_corpo_t fn, void* arg, const char* nome,
   if (!s_pronto) { pool_iniciar(); }
 
   // A menor vaga livre que serve: o Mesh nao toma a de 6 KB quando cabe em 4.
-  // As de 4 KB sao as de indice 1..N-1; a de 6 KB e a 0 e fica por ultimo.
+  // A ordem e 1..N-1 e depois a 0: as de 4 KB primeiro, e as de 6 KB (a
+  // ultima e a 0) so quando as menores acabaram ou nao servem.
   vaga_t* esc = nullptr;
   for (int k = 1; k <= POOL_N && !esc; ++k) {
     vaga_t* v = &s_v[k % POOL_N];
@@ -175,7 +179,11 @@ bool pool_criar(pool_id_t* id, pool_corpo_t fn, void* arg, const char* nome,
   }
 
   s_dinamicas.fetch_add(1);
-  ESP_LOGW(TAG, "sem vaga para '%s' (%lu B) - tarefa comum", nome ? nome : "?", (unsigned long)pilha);
+  // Pedido maior que a maior vaga (ex. o Terminal, 8 KB) e escolha de quem
+  // pediu, nao falta de vaga: so aviso quando as vagas que serviriam acabaram.
+  if (pilha <= VAGA_G) {
+    ESP_LOGW(TAG, "sem vaga para '%s' (%lu B) - tarefa comum", nome ? nome : "?", (unsigned long)pilha);
+  }
   dinamica_t* d = (dinamica_t*)malloc(sizeof(dinamica_t));
   if (!d) { return false; }
   d->fn = fn; d->arg = arg;

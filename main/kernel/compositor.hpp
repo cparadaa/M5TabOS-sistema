@@ -1,4 +1,4 @@
-// COMPOSITOR - a base de tela do sistema (COMPOSITOR.md).
+// COMPOSITOR - a base de tela do sistema (docs/COMPOSITOR.md).
 //
 // MODO DIRETO (o "direct mode" da LVGL com duas paginas). Todo desenho cai
 // DIRETO na pagina de tras do painel - nao existe mais uma terceira imagem

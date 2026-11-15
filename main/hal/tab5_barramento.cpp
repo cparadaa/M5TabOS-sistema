@@ -20,6 +20,21 @@ void tab5_barramento_priorizar_tela(bool ligar)
 {
   const uint32_t p = ligar ? PRIO_TELA : PRIO_PADRAO;
 
+  // JA ESTA ASSIM: nao reescreve. O acordar do repouso reafirma a prioridade
+  // a cada vez - e com musica tocando o barramento esta ocupado (cartao por
+  // DMA, alto-falante, decodificador na PSRAM). Mexer na arbitragem no meio
+  // desse trafego sem necessidade nao e de graca; so quando algo de fato
+  // mudou (o padrao de fabrica voltou) ela e escrita.
+  if (AXI_ICM.mst_arb_priority_reg0.reg_gdma_mst1_priority == p
+      && AXI_ICM.mst_arb_priority_reg0.reg_gdma_mst2_priority == p
+      && AXI_ICM.mst_arqos_reg0.reg_gdma_mst1_arqos == p
+      && AXI_ICM.mst_arqos_reg0.reg_gdma_mst2_arqos == p
+      && AXI_ICM.mst_awqos_reg0.reg_gdma_mst1_awqos == 0
+      && AXI_ICM.mst_awqos_reg0.reg_gdma_mst2_awqos == 0) {
+    s_ligado = ligar;
+    return;
+  }
+
   // Prioridade de ARBITRAGEM: quem ganha o barramento quando dois pedem junto.
   // E este o campo que decide a disputa.
   AXI_ICM.mst_arb_priority_reg0.reg_gdma_mst1_priority = p;

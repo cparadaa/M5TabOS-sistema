@@ -1,0 +1,11 @@
+libvterm 0.3.3 - https://www.leonerd.org.uk/code/libvterm/ (libvterm-0.3.3.tar.gz,
+sha256 09156f43dd2128bd347cbeebe50d9a571d32c64e0cf18d211197946aff7226e0).
+Licenca MIT: libvterm/LICENSE. E o emulador de terminal do Neovim.
+
+Copiado sem mudanca: src/ (com as tabelas ja geradas: encoding/*.inc e
+fullwidth.inc) e include/. O CMakeLists.txt e nosso. O pacote original fica
+em ../../../terceiros/libvterm (fora do repositorio).
+
+Quem usa: services/tab5_ssh (a tela da sessao interativa, para o app
+Terminal desenhar nano/top/vim). A memoria vai para a PSRAM pelo alocador
+proprio (vterm_build com o allocator do servico).

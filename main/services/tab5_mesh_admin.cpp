@@ -60,6 +60,8 @@ static const campo_def_t CAMPOS[MESH_CFG_N] = {
   /* MQTT_PROXY  */ { true,  1,  9 },   // ModuleConfig.MQTTConfig.proxy_to_client_enabled
   /* POS_INTELIG */ { false, 2,  2 },   // PositionConfig.position_broadcast_smart_enabled
   /* GPS_MODO    */ { false, 2, 13 },   // PositionConfig.gps_mode
+  /* TELA_S      */ { false, 5,  1 },   // DisplayConfig.screen_on_secs
+  /* OK_MQTT     */ { false, 6, 105 },  // LoRaConfig.config_ok_to_mqtt
 };
 
 // Secoes que NUNCA sao reenviadas (ver o .hpp): power 3, network 4,
@@ -81,7 +83,6 @@ static uint32_t s_aviso_ms = 0;
 static bool     s_dump_ok = false;
 static bool     s_gravando = false;
 static uint32_t s_gravando_ms = 0;
-static uint32_t s_versao = 0;   // lido sem trava: so "mudou?", como as outras versoes do servico
 static char     s_motivo[72];   // por que o ultimo mesh_cfg_gravar nao mandou nada (para a tela)
 
 #define GRAVANDO_PRAZO_MS 90000   // o no reinicia em ~5 s; 90 s cobre um boot lento
@@ -102,7 +103,6 @@ static void guardar(bruto_t* d, const uint8_t* b, size_t n)
   taskENTER_CRITICAL(&s_mux);
   memcpy(d->b, b, n); d->n = (uint16_t)n; d->tem = true;
   taskEXIT_CRITICAL(&s_mux);
-  ++s_versao;
 }
 
 void mesh_admin_guardar_secao(bool modulo, int secao, const uint8_t* b, size_t n)
@@ -110,6 +110,35 @@ void mesh_admin_guardar_secao(bool modulo, int secao, const uint8_t* b, size_t n
   if (modulo) { if (secao >= 1 && secao < MOD_SECOES) { guardar(&s_mod[secao], b, n); } }
   else        { if (secao >= 1 && secao < CFG_SECOES) { guardar(&s_cfg[secao], b, n); } }
 }
+static void despejar_um(const char* nome, int secao, const bruto_t& b)
+{
+  if (!b.tem) { printf("  %s %d: (nao veio)\n", nome, secao); return; }
+  printf("  %s %d (%u bytes):", nome, secao, (unsigned)b.n);
+  pb_leitor_t l = pb_leitor(b.b, b.n);
+  pb_campo_t c;
+  while (pb_campo(&l, &c)) {
+    if (c.tipo == 0)      { printf(" %d=%llu", c.num, (unsigned long long)c.v); }
+    else if (c.tipo == 2) { printf(" %d=[%u]", c.num, (unsigned)c.n_val); }
+    else                  { printf(" %d=0x%08lx", c.num, (unsigned long)c.v); }
+  }
+  printf("\n");
+}
+
+void mesh_admin_despejar(void)
+{
+  // Copia antes de imprimir: printf com o spinlock tomado seria longo demais.
+  // Na PSRAM: ~7,5 KB que so este comando de console usa.
+  EXT_RAM_BSS_ATTR static bruto_t cfg[CFG_SECOES], mod[MOD_SECOES], c0;
+  taskENTER_CRITICAL(&s_mux);
+  memcpy(cfg, s_cfg, sizeof(cfg)); memcpy(mod, s_mod, sizeof(mod)); c0 = s_canal0;
+  taskEXIT_CRITICAL(&s_mux);
+  printf("Config (1 device, 2 position, 4 network, 6 lora, 7 bluetooth):\n");
+  for (int i = 1; i < CFG_SECOES; ++i) { if (i != 8 && i != 9) { despejar_um("config", i, cfg[i]); } }
+  printf("ModuleConfig (1 mqtt, 2 serial, 6 telemetry):\n");
+  for (int i = 1; i < MOD_SECOES; ++i) { if (mod[i].tem) { despejar_um("modulo", i, mod[i]); } }
+  despejar_um("canal", 0, c0);
+}
+
 void mesh_admin_guardar_user(const uint8_t* b, size_t n)     { guardar(&s_user, b, n); }
 void mesh_admin_guardar_metadata(const uint8_t* b, size_t n) { guardar(&s_meta, b, n); }
 void mesh_admin_guardar_my_info(const uint8_t* b, size_t n)  { guardar(&s_myinfo, b, n); }
@@ -124,18 +153,16 @@ void mesh_admin_guardar_aviso(const uint8_t* b, size_t n)
   memcpy(s_aviso, msg, sizeof(s_aviso));
   s_aviso_ms = tab5_agora_ms() | 1u;
   taskEXIT_CRITICAL(&s_mux);
-  ++s_versao;
   sistema_avisar(AVISO_MESH_NOS);
 }
 
-void mesh_admin_inicio_dump(void) { s_dump_ok = false; ++s_versao; }
+void mesh_admin_inicio_dump(void) { s_dump_ok = false; }
 
 void mesh_admin_fim_dump(void)
 {
   s_dump_ok = true;
   if (s_gravando) { ESP_LOGI(TAG, "no se reapresentou - valores novos confirmados"); }
   s_gravando = false;
-  ++s_versao;
   sistema_avisar(AVISO_MESH_NOS);
 }
 
@@ -153,7 +180,6 @@ void mesh_admin_tique(uint32_t t)
   if (t - s_gravando_ms > GRAVANDO_PRAZO_MS) {
     ESP_LOGW(TAG, "o no nao se reapresentou em %d s depois de gravar", GRAVANDO_PRAZO_MS / 1000);
     s_gravando = false;
-    ++s_versao;
     return;
   }
   if (t - s_gravando_ms < 35000) { return; }
@@ -181,6 +207,17 @@ static int32_t precisao_de(const bruto_t& c)
   return pb_achar_varint(mod.val, mod.n_val, 1, &v) ? (int32_t)v : 0;
 }
 
+// UPLINK DO CANAL: Channel{ 2: settings{ 5: uplink_enabled } }. Desligado, o
+// no nao leva ao MQTT o que recebe pelo radio nesse canal. Com trava tomada.
+static int8_t uplink_de(const bruto_t& c)
+{
+  if (!c.tem) { return -1; }
+  pb_campo_t st;
+  if (!pb_achar(c.b, c.n, 2, PB_LEN, &st)) { return 0; }
+  uint64_t v;
+  return pb_achar_varint(st.val, st.n_val, 5, &v) && v ? 1 : 0;
+}
+
 static mesh_cfg_estado_t estado(void)
 {
   if (s_gravando && (tab5_agora_ms() - s_gravando_ms) > GRAVANDO_PRAZO_MS) {
@@ -191,7 +228,29 @@ static mesh_cfg_estado_t estado(void)
   return (s_dump_ok && tab5_mesh_interno_pode_admin()) ? MESH_CFG_PRONTO : MESH_CFG_SEM_NO;
 }
 
-uint32_t mesh_cfg_versao(void) { return s_versao; }
+// O valor do campo como a pessoa o ve: o pendente, se mexeu; senao o do no.
+static int32_t valor_pendente(const mesh_cfg_mudanca_t* m, const mesh_cfg_t* c, int campo)
+{
+  return m->muda[campo] ? m->v[campo] : c->v[campo];
+}
+
+void mesh_cfg_mqtt_ligar(mesh_cfg_mudanca_t* m, const mesh_cfg_t* c, bool ligar)
+{
+  if (!ligar && valor_pendente(m, c, MESH_CFG_MQTT_PROXY) && c->conhecido[MESH_CFG_MQTT_PROXY]) {
+    m->v[MESH_CFG_MQTT_PROXY] = 0;
+    m->muda[MESH_CFG_MQTT_PROXY] = (c->v[MESH_CFG_MQTT_PROXY] != 0);
+  }
+  if (ligar && m->muda[MESH_CFG_MQTT_PROXY] && c->v[MESH_CFG_MQTT_PROXY]) { m->muda[MESH_CFG_MQTT_PROXY] = false; }
+}
+
+void mesh_cfg_proxy_ligar(mesh_cfg_mudanca_t* m, const mesh_cfg_t* c, bool ligar)
+{
+  if (ligar && !valor_pendente(m, c, MESH_CFG_MQTT) && c->conhecido[MESH_CFG_MQTT]) {
+    m->v[MESH_CFG_MQTT] = 1;
+    m->muda[MESH_CFG_MQTT] = (c->v[MESH_CFG_MQTT] != 1);
+  }
+  if (!ligar && m->muda[MESH_CFG_MQTT] && !c->v[MESH_CFG_MQTT]) { m->muda[MESH_CFG_MQTT] = false; }
+}
 
 void mesh_cfg_ler(mesh_cfg_t* o)
 {
@@ -209,6 +268,7 @@ void mesh_cfg_ler(mesh_cfg_t* o)
   }
   if (s_cfg[2].tem && pb_achar_varint(s_cfg[2].b, s_cfg[2].n, 3, &v)) { o->pos_fixa = (v != 0); }
   o->precisao = precisao_de(s_canal0);
+  o->uplink   = uplink_de(s_canal0);
   if (s_cfg[6].tem) {
     o->regiao     = pb_achar_varint(s_cfg[6].b, s_cfg[6].n, 7, &v) ? (int32_t)v : 0;
     o->preset     = pb_achar_varint(s_cfg[6].b, s_cfg[6].n, 2, &v) ? (int32_t)v : 0;
@@ -294,12 +354,12 @@ static const char* comecar_do_bruto(pb_escritor_t* w, const bruto_t& b)
   return nullptr;
 }
 
-// O CANAL PRIMARIO com outra precisao: o Channel guardado campo a campo, cru,
-// menos settings.module_settings.position_precision, que vai com o valor
-// novo. Aqui nao da para so acrescentar no fim, como nas secoes: module_settings
-// e SUBMENSAGEM, e duas ocorrencias dela nao garantem a ultima vencendo campo
-// a campo - entao a submensagem e remontada (o is_muted dela segue igual).
-static bool montar_canal(pb_escritor_t* w, int32_t precisao)
+// O CANAL PRIMARIO com outra precisao e/ou outro uplink (-1 = mantem): o
+// Channel guardado campo a campo, cru, menos o que muda. A precisao mora em
+// settings.module_settings, SUBMENSAGEM - duas ocorrencias dela nao garantem a
+// ultima vencendo campo a campo, entao ela e remontada (o is_muted segue
+// igual). O uplink (settings.uplink_enabled) e escalar: sai o velho, entra o novo.
+static bool montar_canal(pb_escritor_t* w, int32_t precisao, int uplink)
 {
   EXT_RAM_BSS_ATTR static bruto_t c;   // so a interface grava
   taskENTER_CRITICAL(&s_mux);
@@ -318,17 +378,20 @@ static bool montar_canal(pb_escritor_t* w, int32_t precisao)
     pb_campo_t g;
     uint8_t mb[16];
     pb_escritor_t wm = pb_escritor(mb, sizeof(mb));
-    pb_w_num(&wm, 1, (uint64_t)precisao);                       // position_precision
+    if (precisao >= 0) { pb_w_num(&wm, 1, (uint64_t)precisao); }   // position_precision
     while (pb_campo(&ls, &g)) {
-      if (g.num == 7 && g.tipo == PB_LEN) {                     // module_settings: o resto dela
+      if (precisao >= 0 && g.num == 7 && g.tipo == PB_LEN) {    // module_settings: o resto dela
         pb_leitor_t lm = pb_leitor(g.val, g.n_val);
         pb_campo_t h;
         while (pb_campo(&lm, &h)) { if (h.num != 1) { pb_w_cru(&wm, h.ini, h.n_total); } }
+      } else if (uplink >= 0 && g.num == 5) {
+        continue;                                               // uplink_enabled: vai o novo
       } else {
         pb_w_cru(&ws, g.ini, g.n_total);
       }
     }
-    pb_w_sub(&ws, 7, &wm);
+    if (uplink >= 0)   { pb_w_num(&ws, 5, (uint64_t)uplink); }
+    if (precisao >= 0) { pb_w_sub(&ws, 7, &wm); }
     if (!ws.ok || !wm.ok) { return false; }
     pb_w_sub(w, 2, &ws);
   }
@@ -414,11 +477,11 @@ bool mesh_cfg_gravar(const mesh_cfg_mudanca_t* m)
     ++n_msgs;
   }
 
-  // LOCALIZACAO NA MALHA: set_channel do primario com a precisao nova.
-  if (m->precisao_muda) {
+  // O CANAL PRIMARIO: set_channel com a precisao e/ou o uplink novos.
+  if (m->precisao_muda || m->uplink_muda) {
     EXT_RAM_BSS_ATTR static uint8_t corpo[ADM_MAX];
     pb_escritor_t wc = pb_escritor(corpo, sizeof(corpo));
-    if (!montar_canal(&wc, m->precisao)) {
+    if (!montar_canal(&wc, m->precisao_muda ? m->precisao : -1, m->uplink_muda ? (m->uplink ? 1 : 0) : -1)) {
       ESP_LOGW(TAG, "canal primario: nao veio no dump ou nao cabe - nada enviado");
       snprintf(s_motivo, sizeof(s_motivo), "o canal principal do nó ainda não chegou");
       return false;
@@ -472,7 +535,6 @@ bool mesh_cfg_gravar(const mesh_cfg_mudanca_t* m)
     ESP_LOGI(TAG, "secao MQTT enviada sem transacao (Bluetooth) - o no grava, desliga o BLE e reinicia");
     s_gravando = true;
     s_gravando_ms = tab5_agora_ms();
-    ++s_versao;
     tab5_mesh_interno_reapresentar_em(15000, true);
     return true;
   }
@@ -491,7 +553,6 @@ bool mesh_cfg_gravar(const mesh_cfg_mudanca_t* m)
   ESP_LOGI(TAG, "transacao enviada (%d mensagem(ns)) - o no grava e reinicia", n_msgs);
   s_gravando = true;
   s_gravando_ms = tab5_agora_ms();
-  ++s_versao;
   // Pela serial o no reiniciado nao fala sozinho: pedir a configuracao depois
   // do boot (o BLE reconecta e pede sozinho; pedir de novo nao faz mal).
   tab5_mesh_interno_reapresentar_em(15000, true);
@@ -542,7 +603,6 @@ bool mesh_cfg_reiniciar(void)
   if (ok) {
     s_gravando = true;   // mesma espera: o no some e volta
     s_gravando_ms = tab5_agora_ms();
-    ++s_versao;
     tab5_mesh_interno_reapresentar_em(15000, true);
   }
   return ok;

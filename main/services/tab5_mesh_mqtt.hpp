@@ -19,7 +19,9 @@
 // A CONFIGURACAO VEM DO NO. Canais (nome e chave), regiao e servidor MQTT sao
 // aprendidos do dump do C6L quando ele esta conectado (mesh_mqtt_aprender_*)
 // e guardados na NVS: o modo internet usa exatamente o que o no usa. Sem
-// nada aprendido: servidor do Mesh Brasil (raiz meshdev), canal LongFast com a chave padrao.
+// nada aprendido: servidor do Mesh Brasil (raiz meshdev), canal LongFast com a
+// chave padrao. Um servidor ESCOLHIDO pela pessoa (a lista abaixo) vale por
+// cima do que o no ensinou.
 //
 // LIMITES (ver tab5_mesh.hpp): so mensagens de CANAL - a mensagem direta
 // cifrada com chave publica (PKI) nao e decifrada aqui; no servidor publico o
@@ -31,6 +33,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "ajustes.h"   // ajustes_mqtt_srv_t
 
 // Conecta ao servidor (o Wi-Fi ja tem que estar conectado). Assincrono.
 bool mesh_mqtt_iniciar(void);
@@ -49,6 +52,56 @@ const char* mesh_mqtt_descricao(void);
 // Quem somos na malha: o numero do nosso no (o do C6L, se ja conhecido - a
 // mesma identidade pelos dois caminhos) e os nomes que vao no NodeInfo.
 void mesh_mqtt_definir_no(uint32_t num, const char* curto, const char* longo);
+
+// OS SERVIDORES QUE A PESSOA PODE ESCOLHER para o modo internet (Ajustes >
+// Meshtastic, a pagina "No" do app Mesh e o assistente de boas-vindas). E a
+// LISTA DELA, guardada nos ajustes: adiciona, edita e apaga - nada de lista
+// fixa no codigo. O indice e o mesmo de ajustes_mqtt_servidor(): 0 =
+// automatico (o do no, ou o brasileiro), 1..n-1 = os salvos. Escolher um
+// diferente de 0 vale por cima do que o no ensinou. Trocar:
+// ajustes_definir_mqtt_servidor() e reiniciar o servico (o cliente pega o
+// novo ao reconectar).
+//
+//   nome  "Meshtastic Europa"       srv   "mqtt.meshtastic.org" ou "host:porta"
+//   usr / pwd (podem ser vazios)    raiz  "msh/EU_868" (vazia = "msh")
+typedef ajustes_mqtt_srv_t mesh_mqtt_servidor_t;
+int         mesh_mqtt_n_servidores(void);                    // inclui o 0 (automatico)
+bool        mesh_mqtt_servidor(int i, mesh_mqtt_servidor_t* out);   // 0: so o nome "Automático"
+const char* mesh_mqtt_servidor_nome(uint8_t escolha);
+bool        mesh_mqtt_pode_adicionar(void);                  // a lista ainda tem vaga
+// Grava o servidor i (1..n-1) ou, com i = 0, um NOVO. Endereco vazio e
+// recusado; nome vazio vira o endereco. Devolve o indice dele (1..), 0 = nao
+// gravou (sem endereco, ou lista cheia).
+int         mesh_mqtt_salvar_servidor(int i, const mesh_mqtt_servidor_t* s);
+// Apaga o i (1..n-1). Se era o escolhido, a escolha volta ao automatico.
+void        mesh_mqtt_apagar_servidor(int i);
+
+// AS OPERACOES DA PESSOA SOBRE O SERVIDOR (os apps - Ajustes e a pagina "No"
+// do Mesh - so desenham e chamam estas; a regra e uma so).
+// Escolher o servidor (0 = automatico, 1..n-1) e reiniciar o servico do Mesh:
+// o cliente MQTT reconecta no novo.
+void        mesh_mqtt_usar_servidor(uint8_t escolha);
+// Grava (ver mesh_mqtt_salvar_servidor) e, se gravou, passa a usar e
+// reconecta. Devolve o indice dele; 0 = nao gravou e nada mudou.
+int         mesh_mqtt_salvar_e_usar(int i, const mesh_mqtt_servidor_t* s);
+// Apaga o i (1..n-1). Se era o em uso, volta ao automatico e reconecta
+// (devolve true); senao nada reconecta (false).
+bool        mesh_mqtt_apagar_e_reconectar(int i);
+// Abre o editor: i = 0 comeca um servidor NOVO pelo primeiro modelo; 1..n-1
+// carrega o salvo. false = o indice nao existe.
+bool        mesh_mqtt_para_editar(int i, mesh_mqtt_servidor_t* p);
+// Num servidor novo, troca para o modelo seguinte e preenche os campos.
+// Recebe o modelo atual e devolve o novo.
+int         mesh_mqtt_proximo_modelo(int atual, mesh_mqtt_servidor_t* p);
+// Os cinco campos do formulario, na ordem da tela: 0 nome, 1 endereco,
+// 2 usuario, 3 senha, 4 raiz. Devolve o texto e o tamanho do buffer.
+char*       mesh_mqtt_campo(mesh_mqtt_servidor_t* p, int k, size_t* tam);
+
+// MODELOS para preencher um servidor novo (os servidores conhecidos e suas
+// raizes por regiao; o ultimo e "em branco"). So preenchem os campos - a
+// pessoa ajusta e salva.
+int                         mesh_mqtt_n_modelos(void);
+const mesh_mqtt_servidor_t* mesh_mqtt_modelo(int i);
 
 // Aprendidos do dump do no (chamados pelo servico). So gravam quando mudam.
 void mesh_mqtt_aprender_canal(int idx, int papel, const char* nome, const uint8_t* psk, size_t n_psk);
@@ -85,6 +138,12 @@ void mesh_mqtt_aprender_servidor(const char* endereco, const char* usuario,
 void mesh_mqtt_aprender_no_mqtt(bool ligado, bool proxy, bool tls);
 void mesh_mqtt_aprender_downlink(int idx, bool downlink);
 bool mesh_mqtt_no_tem_proxy(void);   // o no veio com mqtt e proxy ligados
+// ChannelSettings.uplink_enabled (5): so para o diagnostico (console 'mesh').
+void mesh_mqtt_aprender_uplink(int idx, bool uplink);
+// O MQTT DO NO em texto, para o console: ligado, proxy, servidor e raiz, e o
+// sobe/desce de cada canal ativo. Envio que chega ao servidor e resposta que
+// nao volta e, quase sempre, o canal com uplink e sem downlink.
+void mesh_mqtt_no_resumo(char* out, size_t tam);
 
 bool mesh_mqtt_iniciar_proxy(void);  // o Wi-Fi ja tem que estar conectado
 bool mesh_mqtt_em_proxy(void);       // o cliente de pe esta no papel de proxy
@@ -95,21 +154,3 @@ bool   mesh_mqtt_proxy_publicar(const char* topico, const uint8_t* d, size_t n, 
 // 0 = nada na fila. Chamada da tarefa do servico, sem espera.
 size_t mesh_mqtt_proxy_receber(uint8_t* buf, size_t max);
 void   mesh_mqtt_proxy_contadores(uint32_t* subiu, uint32_t* desceu, uint32_t* perdeu);
-
-// ---------------------------------------------------------------------------
-// REDE AMERICANA - um segundo cliente, ao mesmo tempo que o de cima
-// ---------------------------------------------------------------------------
-// mqtt.meshtastic.org, raiz msh/US, so o LongFast de fabrica. Funciona no modo
-// internet e tambem com o no conectado (no proxy inclusive): o no fala com a
-// malha daqui, e este cliente e do Tab5 sozinho - ele decifra e cifra, como o
-// modo internet. O servico marca tudo o que sai desta fila como da rede EUA
-// (nos separados, conversa "LongFast EUA"). Mesmos limites: so canal, sem PKI.
-bool     mesh_mqtt_eua_iniciar(void);   // o Wi-Fi ja tem que estar conectado
-void     mesh_mqtt_eua_parar(void);
-bool     mesh_mqtt_eua_ativo(void);
-bool     mesh_mqtt_eua_conectado(void);
-uint32_t mesh_mqtt_eua_recebidos(void); // pacotes entregues ao servico desde o boot
-// FromRadio pronto (0 = nada), sem espera. Chamada da tarefa do servico.
-size_t   mesh_mqtt_eua_receber(uint8_t* buf, size_t max);
-// ToRadio{ packet } de canal -> publicado em msh/US/2/e/LongFast/!<no>.
-bool     mesh_mqtt_eua_enviar(const uint8_t* toradio, size_t n);

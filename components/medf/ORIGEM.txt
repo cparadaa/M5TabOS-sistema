@@ -1,0 +1,2 @@
+Origem: Tab5-Media-Player (https://github.com/staffordlumsden/Tab5-Media-Player), esp-devkit/libs/media_framework, commit d3e133b.
+Licenca MIT (LICENSE). Mudancas do M5tabOS marcadas com 'M5tabOS:' no codigo.

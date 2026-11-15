@@ -1,3 +1,4 @@
+#include "recursos.h"
 #include "tab5_csi.hpp"
 #include "tab5_ouvinte.hpp"
 #include "tab5_farejo.hpp"     // tab5_farejo_caps_c6: o que o C6 gravado sabe fazer
@@ -15,6 +16,7 @@
 #include "freertos/task.h"
 #include <cmath>
 #include <cstring>
+#include <atomic>
 
 static const char* TAG = "csi";
 
@@ -64,7 +66,7 @@ static int      s_aprendidos = 0;
 static volatile float   s_razao = 1.0f;
 static volatile uint8_t s_nivel = TAB5_CSI_PARADO;
 static volatile int8_t  s_rssi = 0;
-static volatile uint32_t s_cont = 0;
+static std::atomic<uint32_t> s_cont = 0;
 static volatile uint16_t s_por_s = 0;
 static int64_t  s_t_seg = 0;
 static uint32_t s_cont_seg = 0;
@@ -82,7 +84,7 @@ static volatile uint32_t s_quem = 0;
 // saindo ESPERA ela confirmar (no semaforo) e so entao cria a nova. Os dois
 // passam pela mesma trava.
 static parada_t          s_parada = { };
-static SemaphoreHandle_t s_trava_cmd = nullptr;
+static Trava s_trava_cmd;
 static volatile tab5_csi_fase_t s_fase = TAB5_CSI_DESLIGADO;
 static pool_id_t         s_id = POOL_ID_VAZIO;
 static bool              s_registrado = false;
@@ -161,7 +163,7 @@ static void ao_peer_data(uint32_t msg_id, const uint8_t* d, size_t n, void*)
   uint16_t len = (uint16_t)(n - sizeof(c));
   if (len > c.len) { len = c.len; }
 
-  s_cont = s_cont + 1;
+  ++s_cont;
   s_rssi = c.rssi;
   const int64_t agora = esp_timer_get_time();
   ++s_cont_seg;
@@ -211,7 +213,7 @@ static void vTarefa(void*)
   esp_ping_handle_t ping = nullptr;
   uint32_t gw_ping = 0;
   bool pediu_c6 = false;
-  tab5_wifi_manter_acordado(TAB5_ACORDADO_CSI, true);   // em modem sleep o C6 perde quadros
+  sistema_recurso(RECURSO_RADIO_ESCUTA, "CSI", true);   // em modem sleep o C6 perde quadros
 
   while (!parada_pedida(&s_parada)) {
     // Ha de onde medir? Firmware nosso com CSI, e WiFi conectado ao roteador.
@@ -252,12 +254,13 @@ static void vTarefa(void*)
       s_zerar = true;
     }
 
-    for (int i = 0; i < RENOVA_MS / 100 && !parada_pedida(&s_parada); ++i) { vTaskDelay(pdMS_TO_TICKS(100)); }
+    // Dorme ate a proxima volta; o parar acorda ja (parada_pedir).
+    parada_dormir(&s_parada, RENOVA_MS);
   }
 
   ping_parar(&ping);
   if (pediu_c6) { c6_csi_cfg_t off = { }; mandar(off); }
-  tab5_wifi_manter_acordado(TAB5_ACORDADO_CSI, false);
+  sistema_recurso(RECURSO_RADIO_ESCUTA, "CSI", false);
   s_fase = TAB5_CSI_DESLIGADO;
   ESP_LOGI(TAG, "CSI desligado");
   parada_confirmar(&s_parada);   // a ULTIMA coisa: daqui em diante um ligar pode criar outra
@@ -280,16 +283,16 @@ static void preparar(void)
 void tab5_csi_ligar(uint32_t quem)
 {
   preparar();
-  tab5_mutex_travar(&s_trava_cmd);
+  s_trava_cmd.travar();
   if (parada_rodando(&s_parada)) {
     if (!parada_pedida(&s_parada)) {     // de pe e ficando: so soma quem quer
       s_quem = s_quem | quem;
-      tab5_mutex_destravar(&s_trava_cmd);
+      s_trava_cmd.destravar();
       return;
     }
     // Saindo (o ultimo desligou ha pouco): espera a saida, depois sobe outra.
     if (!parada_pedir(&s_parada, 1500)) {
-      tab5_mutex_destravar(&s_trava_cmd);
+      s_trava_cmd.destravar();
       ESP_LOGE(TAG, "a tarefa anterior do CSI ainda nao saiu - nao liguei");
       return;
     }
@@ -308,25 +311,23 @@ void tab5_csi_ligar(uint32_t quem)
     parada_desistir(&s_parada);
     s_quem = 0;
     s_fase = TAB5_CSI_DESLIGADO;
-    tab5_mutex_destravar(&s_trava_cmd);
+    s_trava_cmd.destravar();
     ESP_LOGE(TAG, "sem vaga para a tarefa do CSI");
     return;
   }
-  tab5_mutex_destravar(&s_trava_cmd);
+  s_trava_cmd.destravar();
   ESP_LOGI(TAG, "CSI ligado");
 }
 
 void tab5_csi_desligar(uint32_t quem)
 {
-  tab5_mutex_travar(&s_trava_cmd);
+  s_trava_cmd.travar();
   s_quem = s_quem & ~quem;
   // O ultimo saiu: PEDE a saida (nao espera - quem desliga e a tela). A
   // tarefa ve o pedido na volta seguinte; o acordar tira ela do vTaskDelay.
-  if (!s_quem && parada_rodando(&s_parada)) { s_parada.pedido = true; pool_acordar(&s_id); }
-  tab5_mutex_destravar(&s_trava_cmd);
+  if (!s_quem && parada_rodando(&s_parada)) { s_parada.pedido = true; parada_cutucar(&s_parada); }
+  s_trava_cmd.destravar();
 }
-
-bool tab5_csi_ativo(void) { return s_quem != 0; }
 
 void tab5_csi_aparelho_mexendo(bool sim) { s_mexendo = sim; }
 

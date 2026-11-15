@@ -1,4 +1,4 @@
-// HAL DE FRAME - a camada mais baixa da nova base de tela (COMPOSITOR.md,
+// HAL DE FRAME - a camada mais baixa da nova base de tela (docs/COMPOSITOR.md,
 // etapa 1). Duas pecas de hardware que a base antiga nunca usou.
 //
 // (A prioridade da tela no barramento AXI NAO mora aqui: e do
@@ -74,6 +74,14 @@ int64_t tab5_quadro_ultimo_fim_us(void);
 // Devolve um contador que sobe a cada atraso registrado.
 uint32_t tab5_quadro_atraso_quem(int* nucleo_isr, char* t0, char* t1);
 int64_t  tab5_quadro_atraso_quando(void);   // uptime (us) do ultimo atraso
+// Onde o core estava (mepc) quando a ISR atrasada entrou - ver o .cpp.
+uint32_t tab5_quadro_atraso_pc(void);
+// Lista no console todas as interrupcoes alocadas (core, nivel, fonte).
+void     tab5_quadro_listar_irqs(void);
+// PROVA (console 'tela atrasar'): segura o core 'nucleo' por 'ms' (1-100),
+// 'vezes' vezes com 1 s entre elas; critica = portENTER_CRITICAL, senao
+// interrupcoes desligadas. Bloqueia ate terminar. false = argumento invalido.
+bool     tab5_quadro_prova_atraso(int ms, bool critica, int nucleo, int vezes);
 
 // JANELA SEGURA PARA SECAO CRITICA LONGA. Entre dois frames o
 // DMA do painel tem ~0,5 ms para ser religado pela ISR - e uma secao critica

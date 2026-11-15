@@ -19,6 +19,9 @@
 #include <cstdio>
 #include <ctime>
 
+#include "ajustes.h"
+#include "app.h"   // sistema_mesh_reiniciar
+
 static const char* TAG = "mesh_mqtt";
 
 // ---------------------------------------------------------------------------
@@ -41,7 +44,7 @@ typedef struct {
 
 static cfg_t             s_cfg;
 static bool              s_cfg_lido = false;
-static SemaphoreHandle_t s_trava_cfg = nullptr;
+static Trava s_trava_cfg;
 
 #define NVS_ESPACO "mesh"
 #define NVS_CHAVE  "mqtt_cfg"
@@ -53,6 +56,117 @@ static SemaphoreHandle_t s_trava_cfg = nullptr;
 #define USR_PADRAO "meshdev"
 #define PWD_PADRAO "large4cats"
 
+// OS MODELOS (ver mesh_mqtt_modelo). O servidor publico do Meshtastic separa a
+// malha por regiao na raiz do topico ("msh/EU_868"); as credenciais sao as
+// publicas que cada projeto divulga.
+static const mesh_mqtt_servidor_t MODELOS[] = {
+  { "Mesh Brasil",             "platform.meshbrasil.com", "meshdev", "large4cats", "meshdev" },
+  { "Meshtastic Brasil",       "mqtt.meshtastic.org",     "meshdev", "large4cats", "msh/BR" },
+  { "Meshtastic Europa",       "mqtt.meshtastic.org",     "meshdev", "large4cats", "msh/EU_868" },
+  { "Meshtastic Austrália", "mqtt.meshtastic.org",     "meshdev", "large4cats", "msh/ANZ" },
+  { "Em branco",               "",                        "",        "",           "msh" },
+};
+#define N_MODELOS ((int)(sizeof(MODELOS) / sizeof(MODELOS[0])))
+int mesh_mqtt_n_modelos(void) { return N_MODELOS; }
+const mesh_mqtt_servidor_t* mesh_mqtt_modelo(int i) { return (i >= 0 && i < N_MODELOS) ? &MODELOS[i] : nullptr; }
+
+int mesh_mqtt_n_servidores(void) { return 1 + ajustes_mqtt_n(); }
+
+bool mesh_mqtt_servidor(int i, mesh_mqtt_servidor_t* out)
+{
+  if (!out) { return false; }
+  if (i == AJUSTES_MQTT_AUTOMATICO) {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->nome, sizeof(out->nome), "Automático");
+    return true;
+  }
+  return ajustes_mqtt_ler(i - 1, out);
+}
+
+const char* mesh_mqtt_servidor_nome(uint8_t escolha)
+{
+  static char nome[sizeof(((mesh_mqtt_servidor_t*)nullptr)->nome)];
+  mesh_mqtt_servidor_t s;
+  if (!mesh_mqtt_servidor(escolha, &s)) { mesh_mqtt_servidor(AJUSTES_MQTT_AUTOMATICO, &s); }
+  snprintf(nome, sizeof(nome), "%s", s.nome);
+  memset(&s, 0, sizeof(s));   // levava a senha
+  return nome;
+}
+
+bool mesh_mqtt_pode_adicionar(void) { return ajustes_mqtt_n() < AJUSTES_MQTT_MAX; }
+
+int mesh_mqtt_salvar_servidor(int i, const mesh_mqtt_servidor_t* s)
+{
+  if (!s || !s->srv[0]) { return 0; }
+  mesh_mqtt_servidor_t c = *s;
+  if (!c.nome[0]) { snprintf(c.nome, sizeof(c.nome), "%s", c.srv); }
+  if (!c.raiz[0]) { snprintf(c.raiz, sizeof(c.raiz), "msh"); }
+  const int k = ajustes_mqtt_gravar(i >= 1 ? i - 1 : -1, &c);
+  memset(&c, 0, sizeof(c));
+  return k < 0 ? 0 : k + 1;
+}
+
+void mesh_mqtt_apagar_servidor(int i) { if (i >= 1) { ajustes_mqtt_apagar(i - 1); } }
+
+void mesh_mqtt_usar_servidor(uint8_t escolha)
+{
+  ajustes_definir_mqtt_servidor(escolha);
+  sistema_mesh_reiniciar();   // o cliente MQTT sobe de novo, ja no servidor escolhido
+}
+
+int mesh_mqtt_salvar_e_usar(int i, const mesh_mqtt_servidor_t* s)
+{
+  const int k = mesh_mqtt_salvar_servidor(i, s);
+  if (k) { mesh_mqtt_usar_servidor((uint8_t)k); }
+  return k;
+}
+
+bool mesh_mqtt_apagar_e_reconectar(int i)
+{
+  const bool era_o_usado = ajustes_mqtt_servidor() == i;
+  mesh_mqtt_apagar_servidor(i);
+  if (era_o_usado) { mesh_mqtt_usar_servidor(AJUSTES_MQTT_AUTOMATICO); }
+  return era_o_usado;
+}
+
+bool mesh_mqtt_para_editar(int i, mesh_mqtt_servidor_t* p)
+{
+  memset(p, 0, sizeof(*p));
+  if (i == 0) { *p = *mesh_mqtt_modelo(0); return true; }   // novo: comeca pelo primeiro modelo
+  return mesh_mqtt_servidor(i, p);
+}
+
+int mesh_mqtt_proximo_modelo(int atual, mesh_mqtt_servidor_t* p)
+{
+  const int novo = (atual + 1) % mesh_mqtt_n_modelos();
+  *p = *mesh_mqtt_modelo(novo);
+  return novo;
+}
+
+char* mesh_mqtt_campo(mesh_mqtt_servidor_t* p, int k, size_t* tam)
+{
+  switch (k) {
+    case 0:  *tam = sizeof(p->nome); return p->nome;
+    case 1:  *tam = sizeof(p->srv);  return p->srv;
+    case 2:  *tam = sizeof(p->usr);  return p->usr;
+    case 3:  *tam = sizeof(p->pwd);  return p->pwd;
+    default: *tam = sizeof(p->raiz); return p->raiz;
+  }
+}
+
+// A escolha da pessoa, se houver (diferente de automatico): preenche e true.
+static bool servidor_escolhido(char* srv, size_t ts, char* usr, size_t tu,
+                               char* pwd, size_t tp, char* raiz, size_t tr)
+{
+  const uint8_t e = ajustes_mqtt_servidor();
+  mesh_mqtt_servidor_t v;
+  if (e == AJUSTES_MQTT_AUTOMATICO || !mesh_mqtt_servidor(e, &v) || !v.srv[0]) { return false; }
+  snprintf(srv, ts, "%s", v.srv);  snprintf(usr, tu, "%s", v.usr);
+  snprintf(pwd, tp, "%s", v.pwd);  snprintf(raiz, tr, "%s", v.raiz[0] ? v.raiz : "msh");
+  memset(&v, 0, sizeof(v));
+  return true;
+}
+
 // Config.LoRaConfig.RegionCode, na ordem do protobuf (meshtastic/config.proto).
 static const char* const REGIOES[] = {
   "UNSET", "US", "EU_433", "EU_868", "CN", "JP", "ANZ", "KR", "TW", "RU", "IN",
@@ -62,9 +176,9 @@ static const char* const REGIOES[] = {
 
 static void travar_cfg(void)
 {
-  tab5_mutex_travar(&s_trava_cfg);
+  s_trava_cfg.travar();
 }
-static void destravar_cfg(void) { xSemaphoreGive(s_trava_cfg); }
+static void destravar_cfg(void) { s_trava_cfg.destravar(); }
 
 // Com a trava tomada.
 static void garantir_cfg(void)
@@ -150,6 +264,8 @@ void mesh_mqtt_aprender_servidor(const char* endereco, const char* usuario,
 // regiao e escolhida; se o no mandou uma raiz, vale ela.
 static void raiz_efetiva(char* out, size_t tam)
 {
+  // A escolha da pessoa vence tudo (ver servidor_escolhido).
+  { char sv[64], us[32], pw[32]; if (servidor_escolhido(sv, sizeof sv, us, sizeof us, pw, sizeof pw, out, tam)) { return; } }
   // Sem servidor aprendido do no vale o padrao, com a raiz dele.
   if (!s_cfg.srv[0]) { snprintf(out, tam, "%s", RAIZ_PADRAO); return; }
   if (s_cfg.raiz[0]) { snprintf(out, tam, "%s", s_cfg.raiz); return; }
@@ -228,7 +344,7 @@ static char            s_descr[96] = "internet: parado";
 // publica - e a fonte mais certa, porque e literalmente o que ele usa.
 static volatile bool s_proxy = false;   // o cliente de pe e o do proxy
 static bool     s_no_mqtt = false, s_no_proxy = false, s_no_tls = false;
-static bool     s_downlink[MAX_CANAIS];
+static bool     s_downlink[MAX_CANAIS], s_uplink[MAX_CANAIS];
 static char     s_px_raiz[48] = "";       // a assinada agora ("" = nenhuma)
 static char     s_px_raiz_no[48] = "";    // a aprendida do topico publicado pelo no
 static uint32_t s_px_subiu = 0, s_px_desceu = 0, s_px_perdeu = 0;
@@ -242,27 +358,23 @@ static int s_prox_pend = 0;
 // Duas tarefas entregam (a do cliente MQTT e a do servico, respondendo ao
 // want_config): o quadro de montagem e unico e estatico (600 bytes na stack
 // do servico pesariam), entao passa por uma trava.
-static SemaphoreHandle_t s_trava_ent = nullptr;
-static SemaphoreHandle_t s_trava_env = nullptr;   // ver mesh_mqtt_enviar
-// FILA CHEIA: um aviso a cada 10 s, com o total e QUAL fila - um por pacote
-// inundava o log numa rajada, e "queue cheia" sozinho nao dizia de que rede.
-static QueueHandle_t s_eua_fila_ref = nullptr;   // ver s_eua_fila, mais abaixo
-static uint32_t s_perdidos[2] = { 0, 0 };        // 0 = Brasil (internet/proxy), 1 = EUA
-static void perdeu(QueueHandle_t fila)
+static Trava s_trava_ent;
+static Trava s_trava_env;   // ver mesh_mqtt_enviar
+// FILA CHEIA: um aviso a cada 10 s, com o total - um por pacote inundava o
+// log numa rajada.
+static uint32_t s_perdidos = 0;
+static void perdeu(QueueHandle_t)
 {
-  const int k = (fila && fila == s_eua_fila_ref) ? 1 : 0;
-  ++s_perdidos[k];
-  static int64_t ultimo_us[2] = { 0, 0 };
+  ++s_perdidos;
+  static int64_t ultimo_us = 0;
   const int64_t agora = esp_timer_get_time();
-  if (agora - ultimo_us[k] >= 10000000) {
-    ultimo_us[k] = agora;
-    ESP_LOGW(TAG, "fila %s cheia - %lu pacote(s) descartado(s) desde o boot",
-             k ? "EUA" : "Brasil", (unsigned long)s_perdidos[k]);
+  if (agora - ultimo_us >= 10000000) {
+    ultimo_us = agora;
+    ESP_LOGW(TAG, "fila cheia - %lu pacote(s) descartado(s) desde o boot", (unsigned long)s_perdidos);
   }
 }
 
-// MONTAGEM SEM PILHA. As tarefas dos clientes MQTT tem pilha justa (3,5 KB
-// no dos EUA, pico medido de 2,6 KB) e as duas chegam aqui: o quadro e
+// MONTAGEM SEM PILHA. A tarefa do cliente MQTT tem pilha justa: o quadro e
 // montado DIRETO no quadro estatico que vai para a fila, sob s_trava_ent -
 // nenhum buffer de 600 bytes na pilha de ninguem.
 static quadro_t s_q;                     // o que vai para a fila (xQueueSend copia)
@@ -280,11 +392,11 @@ static bool enfileirar(QueueHandle_t fila, size_t n)
 
 static bool entregar_em(QueueHandle_t fila, const uint8_t* d, size_t n)
 {
-  if (!fila || !s_trava_ent || n > QUADRO_MAX) { return false; }
-  xSemaphoreTake(s_trava_ent, portMAX_DELAY);
+  if (!fila || n > QUADRO_MAX) { return false; }
+  s_trava_ent.travar();
   memcpy(s_q.d, d, n);
   const bool ok = enfileirar(fila, n);
-  xSemaphoreGive(s_trava_ent);
+  s_trava_ent.destravar();
   return ok;
 }
 static bool entregar(const uint8_t* d, size_t n) { return entregar_em(s_fila, d, n); }
@@ -292,12 +404,12 @@ static bool entregar(const uint8_t* d, size_t n) { return entregar_em(s_fila, d,
 // FromRadio{ campo: corpo } para o servico, como o radio entregaria.
 static bool entregar_from_radio(QueueHandle_t fila, int campo, const pb_escritor_t* corpo)
 {
-  if (!fila || !s_trava_ent) { return false; }
-  xSemaphoreTake(s_trava_ent, portMAX_DELAY);
+  if (!fila) { return false; }
+  s_trava_ent.travar();
   pb_escritor_t f = pb_escritor(s_q.d, sizeof(s_q.d));
   pb_w_sub(&f, campo, corpo);
   const bool ok = enfileirar(fila, pb_tamanho(&f));
-  xSemaphoreGive(s_trava_ent);
+  s_trava_ent.destravar();
   return ok;
 }
 
@@ -309,8 +421,8 @@ static bool entregar_from_radio(QueueHandle_t fila, int campo, const pb_escritor
 static bool entregar_pacote(QueueHandle_t fila, uint32_t de, uint32_t para,
                             const pb_escritor_t* data, bool da_internet)
 {
-  if (!fila || !s_trava_ent) { return false; }
-  xSemaphoreTake(s_trava_ent, portMAX_DELAY);
+  if (!fila) { return false; }
+  s_trava_ent.travar();
   pb_escritor_t w = pb_escritor(s_pacote, sizeof(s_pacote));
   pb_w_fixo32(&w, 1, de);
   pb_w_fixo32(&w, 2, para);
@@ -323,27 +435,9 @@ static bool entregar_pacote(QueueHandle_t fila, uint32_t de, uint32_t para,
   pb_escritor_t f = pb_escritor(s_q.d, sizeof(s_q.d));
   pb_w_sub(&f, 2, &w);
   const bool ok = enfileirar(fila, pb_tamanho(&f));
-  xSemaphoreGive(s_trava_ent);
+  s_trava_ent.destravar();
   return ok;
 }
-
-// ---------------------------------------------------------------------------
-// A REDE AMERICANA - um segundo cliente, em paralelo (ver o .hpp)
-// ---------------------------------------------------------------------------
-// O servidor publico do projeto, com a raiz da regiao US e o LongFast de
-// fabrica (chave padrao). O resto do enlace e o mesmo do modo internet: a
-// mesma decifragem, o mesmo envelope, a mesma confirmacao pelo PUBACK - so a
-// fila e outra, e o servico marca o que sai dela como "EUA".
-#define EUA_SRV  "mqtt.meshtastic.org"
-#define EUA_RAIZ "msh/US"
-static const canal_t CANAL_EUA = { 1, "LongFast", 1, { 1 } };
-
-static esp_mqtt_client_handle_t s_eua_cli = nullptr;
-static QueueHandle_t   s_eua_fila = nullptr;
-static volatile bool   s_eua_conectado = false;
-static pend_t          s_eua_pend[8];
-static int             s_eua_prox_pend = 0;
-static uint32_t        s_eua_recebidos = 0;
 
 static int canal_por_nome(const char* nome, size_t n)
 {
@@ -401,7 +495,7 @@ static void processar_mapa(const uint8_t* d, size_t n)
 
   // NodeInfo: Data{ 1: NODEINFO_APP, 2: User{ 1: id, 2: long_name,
   // 3: short_name, 5: hw_model, 7: role } }
-  static uint8_t user[128], dados[160];   // so o cliente do Brasil le mapa: estatico, fora da pilha
+  static uint8_t user[128], dados[160];   // so a tarefa do cliente le mapa: estatico, fora da pilha
   pb_escritor_t wu = pb_escritor(user, sizeof(user));
   pb_w_texto(&wu, 1, id, sizeof(id));
   if (n_longo) { pb_w_bytes(&wu, 2, longo, n_longo); }
@@ -427,31 +521,25 @@ static void processar_mapa(const uint8_t* d, size_t n)
 }
 
 // ServiceEnvelope{1: packet, 2: channel_id, 3: gateway_id} -> FromRadio.
-// Anel de (origem ^ id) ja vistos, um por cliente (cada um so e mexido pela
-// tarefa dele). O dos EUA e maior: ~40 pacotes novos por segundo la, e as
-// copias chegam ao longo de alguns segundos.
-#define VISTOS_BR  128
-#define VISTOS_EUA 512
-static uint32_t s_vistos_br[VISTOS_BR], s_vistos_eua[VISTOS_EUA];
-static int      s_prox_visto[2] = { 0, 0 };
+// Anel de (origem ^ id) ja vistos, mexido so pela tarefa do cliente.
+#define VISTOS 128
+static uint32_t s_vistos[VISTOS];
+static int      s_prox_visto = 0;
 
-static bool ja_visto(int k, uint32_t de, uint32_t id)
+static bool ja_visto(uint32_t de, uint32_t id)
 {
   if (id == 0) { return false; }
   const uint32_t ch = (de * 2654435761u) ^ id;
-  uint32_t* v = k ? s_vistos_eua : s_vistos_br;
-  const int n = k ? VISTOS_EUA : VISTOS_BR;
-  for (int i = 0; i < n; ++i) { if (v[i] == ch) { return true; } }
-  v[s_prox_visto[k]] = ch;
-  s_prox_visto[k] = (s_prox_visto[k] + 1) % n;
+  for (int i = 0; i < VISTOS; ++i) { if (s_vistos[i] == ch) { return true; } }
+  s_vistos[s_prox_visto] = ch;
+  s_prox_visto = (s_prox_visto + 1) % VISTOS;
   return false;
 }
 
-static void processar(const char* topico, int n_top, const uint8_t* d, size_t n,
-                      QueueHandle_t fila, bool eua)
+static void processar(const char* topico, int n_top, const uint8_t* d, size_t n, QueueHandle_t fila)
 {
   for (int i = 0; i + 7 <= n_top; ++i) {
-    if (memcmp(topico + i, "/2/map/", 7) == 0) { if (!eua) { processar_mapa(d, n); } return; }
+    if (memcmp(topico + i, "/2/map/", 7) == 0) { processar_mapa(d, n); return; }
   }
   // O canal pelo topico: <raiz>/2/e/<canal>/!<gateway>
   const char* e = nullptr;
@@ -460,26 +548,12 @@ static void processar(const char* topico, int n_top, const uint8_t* d, size_t n,
   const char* fim_nome = e;
   while (fim_nome < topico + n_top && *fim_nome != '/') { ++fim_nome; }
 
-  // UM PAR DE BUFFERS POR CLIENTE. As tarefas do cliente do Brasil e do
-  // dos EUA chegam aqui AO MESMO TEMPO (cada uma com o seu pacote); com um
-  // par so, uma decifrava por cima do pacote que a outra montava. Estatico,
-  // e nao pilha: a do cliente dos EUA tem 3,5 KB.
-  static uint8_t s_claro[2][QUADRO_MAX], s_pkt[2][QUADRO_MAX];
-  uint8_t* const claro = s_claro[eua ? 1 : 0];
-  uint8_t* const pkt   = s_pkt[eua ? 1 : 0];
-  int idx;
-  canal_t canal;
-  if (eua) {
-    // Nos EUA so o LongFast de fabrica: os canais aprendidos do no sao daqui.
-    const size_t nn = (size_t)(fim_nome - e);
-    idx = (nn == strlen(CANAL_EUA.nome) && memcmp(e, CANAL_EUA.nome, nn) == 0) ? 0 : -1;
-    canal = CANAL_EUA;
-  } else {
-    travar_cfg();
-    idx = canal_por_nome(e, (size_t)(fim_nome - e));
-    canal = idx >= 0 ? s_cfg.canais[idx] : canal_t{ };
-    destravar_cfg();
-  }
+  // Estatico, e nao pilha: so a tarefa do cliente chega aqui.
+  static uint8_t claro[QUADRO_MAX], pkt[QUADRO_MAX];
+  travar_cfg();
+  const int idx = canal_por_nome(e, (size_t)(fim_nome - e));
+  const canal_t canal = idx >= 0 ? s_cfg.canais[idx] : canal_t{ };
+  destravar_cfg();
   if (idx < 0) { return; }
 
   pb_leitor_t l = pb_leitor(d, n);
@@ -500,10 +574,10 @@ static void processar(const char* topico, int n_top, const uint8_t* d, size_t n,
   }
   if (de == s_num && s_num) { return; }   // o nosso proprio envio voltando pelo servidor
   // O MESMO PACOTE DE VARIOS GATEWAYS: cada no com MQTT que o ouviu publica a
-  // sua copia. No servidor dos EUA sao 3 de cada 4 mensagens (medido: 153/s,
+  // sua copia. Num servidor movimentado sao 3 de cada 4 mensagens (medido:
   // 75% repetidas) - e cada uma era decifrada, enfileirada e lida pelo
   // servico a toa. Corta aqui, antes do AES, pelo par (origem, id).
-  if (ja_visto(eua ? 1 : 0, de, id)) { return; }
+  if (ja_visto(de, id)) { return; }
   if (cif) {
     if (n_cif > QUADRO_MAX || !cifrar(canal, id, de, cif, n_cif, claro)) { return; }
     // Chave errada (ou mensagem direta com PKI) da lixo: um Data de verdade
@@ -512,11 +586,6 @@ static void processar(const char* topico, int n_top, const uint8_t* d, size_t n,
     dec = claro; n_dec = n_cif;
   }
   if (!dec) { return; }
-  // DOS EUA SO TEXTO (1) E APRESENTACAO (4, o nome de quem fala). O resto -
-  // posicao, telemetria, traceroute - e a maior parte do LongFast de la, nao
-  // aparece em lugar nenhum daqui e enchia a fila. Data comeca pelo portnum
-  // (0x08 <varint>), e as duas portas cabem num byte.
-  if (eua && n_dec >= 2 && dec[1] != 1 && dec[1] != 4) { return; }
 
   // MeshPacket de novo, como o radio entregaria: o resto dos campos cru, o
   // canal como INDICE, o Data decifrado, a hora de chegada e via_mqtt.
@@ -530,7 +599,7 @@ static void processar(const char* topico, int n_top, const uint8_t* d, size_t n,
   pb_w_bytes(&w, 4, dec, n_dec);
   if (const uint32_t agora = tab5_hora_epoch()) { pb_w_fixo32(&w, 7, agora); }
   pb_w_num(&w, 14, 1);                 // via_mqtt (o 13 e o obsoleto 'delayed')
-  if (entregar_from_radio(fila, 2, &w) && eua) { ++s_eua_recebidos; }   // FromRadio.packet
+  entregar_from_radio(fila, 2, &w);   // FromRadio.packet
 }
 
 // O PUBACK do nosso envio: um Routing com erro 0 para o id, como o radio
@@ -648,7 +717,7 @@ static void ao_evento(void*, esp_event_base_t, int32_t id_ev, void* dados)
       // Pacote em pedacos (maior que o buffer) nao e Meshtastic de verdade.
       if (ev->current_data_offset == 0 && ev->data_len == ev->total_data_len) {
         if (s_proxy) { proxy_descer(ev->topic, ev->topic_len, (const uint8_t*)ev->data, (size_t)ev->data_len, ev->retain); }
-        else         { processar(ev->topic, ev->topic_len, (const uint8_t*)ev->data, (size_t)ev->data_len, s_fila, false); }
+        else         { processar(ev->topic, ev->topic_len, (const uint8_t*)ev->data, (size_t)ev->data_len, s_fila); }
       } else if (s_proxy && ev->current_data_offset == 0) { ++s_px_perdeu; }
       break;
     case MQTT_EVENT_PUBLISHED:
@@ -679,9 +748,7 @@ static bool iniciar_cliente(bool proxy)
   // 16 quadros: a descida do proxy chega em rajada (um servidor publico
   // entrega o canal inteiro), e o enlace com o no esvazia a fila a cada volta.
   if (!s_fila) { s_fila = xQueueCreateWithCaps(32, sizeof(quadro_t), MALLOC_CAP_SPIRAM); }
-  tab5_mutex_criar(&s_trava_ent);
-  tab5_mutex_criar(&s_trava_env);
-  if (!s_fila || !s_trava_ent || !s_trava_env) { return false; }
+  if (!s_fila) { return false; }
   xQueueReset(s_fila);
 
   static char uri[96], usr[32], pwd[32], raiz[48], srv[64];
@@ -700,6 +767,12 @@ static bool iniciar_cliente(bool proxy)
   if (proxy) { destravar_cfg(); raiz_proxy(raiz, sizeof(raiz)); travar_cfg(); }
   else       { raiz_efetiva(raiz, sizeof(raiz)); }
   destravar_cfg();
+  // MODO INTERNET COM SERVIDOR ESCOLHIDO (Ajustes > Meshtastic): vale por cima
+  // do que o no ensinou e do padrao. O proxy nao muda: e sempre o do no.
+  if (!proxy && servidor_escolhido(srv, sizeof(srv), usr, sizeof(usr), pwd, sizeof(pwd), raiz, sizeof(raiz))) {
+    snprintf(uri, sizeof(uri), strchr(srv, ':') ? "mqtt://%s" : "mqtt://%s:1883", srv);
+    ESP_LOGI(TAG, "servidor escolhido: %s (%s, raiz %s)", mesh_mqtt_servidor_nome(ajustes_mqtt_servidor()), srv, raiz);
+  }
 
   // Identidade propria do proxy: dois clientes com o mesmo id no servidor
   // derrubariam um ao outro, e o modo internet pode ter ficado registrado.
@@ -833,8 +906,7 @@ static bool publicar_data(esp_mqtt_client_handle_t cli, pend_t* pend, int* prox,
                           const uint8_t* dec, size_t n_dec, uint32_t id, uint64_t saltos);
 
 // O QUE O SERVICO MANDA, lido de volta: ToRadio{ 1: packet MeshPacket{ 2: to,
-// 3: channel, 4: decoded, 6: id, 9: hop_limit }, 3: want_config_id }. As
-// duas saidas (Brasil e EUA) leem o mesmo envelope - um leitor so.
+// 3: channel, 4: decoded, 6: id, 9: hop_limit }, 3: want_config_id }.
 typedef struct {
   bool           quer_config;   // want_config_id: o servico pedindo o "dump"
   uint32_t       para, id;
@@ -870,10 +942,10 @@ bool mesh_mqtt_enviar(const uint8_t* toradio, size_t n)
   // NO PROXY O CLIENTE E DO NO: nada do Tab5 sai por ele como se fosse um
   // radio (cifrar com a chave do canal e publicar em nome do no daria a
   // mesma mensagem duas vezes, quando o no publicar a dele).
-  if (!s_trava_env || s_proxy) { return false; }
-  xSemaphoreTake(s_trava_env, portMAX_DELAY);
+  if (s_proxy) { return false; }
+  s_trava_env.travar();
   const bool ok = enviar_travado(toradio, n);
-  xSemaphoreGive(s_trava_env);
+  s_trava_env.destravar();
   return ok;
 }
 
@@ -974,6 +1046,35 @@ void mesh_mqtt_aprender_downlink(int idx, bool downlink)
   if (idx >= 0 && idx < MAX_CANAIS) { s_downlink[idx] = downlink; }
 }
 
+void mesh_mqtt_aprender_uplink(int idx, bool uplink)
+{
+  if (idx >= 0 && idx < MAX_CANAIS) { s_uplink[idx] = uplink; }
+}
+
+void mesh_mqtt_no_resumo(char* out, size_t tam)
+{
+  travar_cfg();
+  garantir_cfg();
+  size_t k = (size_t)snprintf(out, tam, "MQTT do no: %s, proxy %s, tls %s, servidor \"%s\" raiz \"%s\"\n",
+                              s_no_mqtt ? "LIGADO" : "desligado", s_no_proxy ? "ligado" : "desligado",
+                              s_no_tls ? "sim" : "nao", s_cfg.srv[0] ? s_cfg.srv : "(padrao do firmware)",
+                              s_cfg.raiz[0] ? s_cfg.raiz : "(padrao)");
+  for (int i = 0; i < MAX_CANAIS && k < tam; ++i) {
+    if (!s_cfg.canais[i].papel) { continue; }
+    // A CHAVE: so o tipo, nunca o valor. "padrao" = psk de 1 byte igual a 1, a
+    // que todo LongFast de fabrica usa - e a unica que a malha publica le.
+    const canal_t& c = s_cfg.canais[i];
+    char chave[24];
+    if (c.n_psk == 0)                        { snprintf(chave, sizeof(chave), "SEM cifra"); }
+    else if (c.n_psk == 1 && c.psk[0] == 1)  { snprintf(chave, sizeof(chave), "padrao"); }
+    else if (c.n_psk == 1)                   { snprintf(chave, sizeof(chave), "padrao+%u (DIFERENTE)", (unsigned)(c.psk[0] - 1)); }
+    else                                     { snprintf(chave, sizeof(chave), "propria de %u bytes", (unsigned)c.n_psk); }
+    k += (size_t)snprintf(out + k, tam - k, "  canal %d %-11s sobe %s  desce %s  chave %s\n", i,
+                          c.nome, s_uplink[i] ? "sim" : "NAO", s_downlink[i] ? "sim" : "NAO", chave);
+  }
+  destravar_cfg();
+}
+
 bool mesh_mqtt_no_tem_proxy(void) { return s_no_mqtt && s_no_proxy; }
 
 // "msh/BR/2/e/LongFast/!a1b2c3d4" -> "msh/BR": tudo antes do primeiro "/2/".
@@ -1021,118 +1122,4 @@ void mesh_mqtt_proxy_contadores(uint32_t* subiu, uint32_t* desceu, uint32_t* per
   if (subiu)  { *subiu  = s_px_subiu; }
   if (desceu) { *desceu = s_px_desceu; }
   if (perdeu) { *perdeu = s_px_perdeu; }
-}
-
-// ---------------------------------------------------------------------------
-// REDE AMERICANA - API
-// ---------------------------------------------------------------------------
-static void assinar_eua(void)
-{
-  // Os gateways dos EUA publicam por estado e cidade (msh/US/GA/2/e/...,
-  // msh/US/KS/Topeka/2/e/...): ate tres niveis abaixo da raiz. Sem os relatorios
-  // de mapa - la eles trariam o pais inteiro para a tabela de nos.
-  static const char* const NIVEL[] = { "", "/+", "/+/+", "/+/+/+" };
-  char topico[96];
-  for (size_t i = 0; i < sizeof(NIVEL) / sizeof(NIVEL[0]); ++i) {
-    snprintf(topico, sizeof(topico), "%s%s/2/e/%s/#", EUA_RAIZ, NIVEL[i], CANAL_EUA.nome);
-    esp_mqtt_client_subscribe(s_eua_cli, topico, 0);
-  }
-  ESP_LOGI(TAG, "EUA: assinando %s/.../2/e/%s", EUA_RAIZ, CANAL_EUA.nome);
-}
-
-static void ao_evento_eua(void*, esp_event_base_t, int32_t id_ev, void* dados)
-{
-  esp_mqtt_event_handle_t ev = (esp_mqtt_event_handle_t)dados;
-  switch ((esp_mqtt_event_id_t)id_ev) {
-    case MQTT_EVENT_CONNECTED:    s_eua_conectado = true; assinar_eua(); break;
-    case MQTT_EVENT_DISCONNECTED: s_eua_conectado = false; break;
-    case MQTT_EVENT_DATA:
-      if (ev->current_data_offset == 0 && ev->data_len == ev->total_data_len) {
-        processar(ev->topic, ev->topic_len, (const uint8_t*)ev->data, (size_t)ev->data_len, s_eua_fila, true);
-      }
-      break;
-    case MQTT_EVENT_PUBLISHED:
-      for (size_t i = 0; i < sizeof(s_eua_pend) / sizeof(s_eua_pend[0]); ++i) {
-        if (s_eua_pend[i].msg == ev->msg_id && s_eua_pend[i].id) { confirmar(s_eua_pend[i].id, s_eua_fila); s_eua_pend[i].id = 0; }
-      }
-      break;
-    default: break;
-  }
-}
-
-bool mesh_mqtt_eua_iniciar(void)
-{
-  if (s_eua_cli) { return true; }
-  if (!s_eua_fila) { s_eua_fila = xQueueCreateWithCaps(32, sizeof(quadro_t), MALLOC_CAP_SPIRAM); s_eua_fila_ref = s_eua_fila; }
-  tab5_mutex_criar(&s_trava_ent);
-  tab5_mutex_criar(&s_trava_env);
-  if (!s_eua_fila || !s_trava_ent || !s_trava_env) { return false; }
-  xQueueReset(s_eua_fila);
-  static char cliente[24];
-  snprintf(cliente, sizeof(cliente), "tab5us-%08lx", (unsigned long)(s_num ? s_num : esp_random()));
-  esp_mqtt_client_config_t c = { };
-  c.broker.address.uri = "mqtt://" EUA_SRV ":1883";
-  c.credentials.username = USR_PADRAO;
-  c.credentials.authentication.password = PWD_PADRAO;
-  c.credentials.client_id = cliente;
-  // NO TAMANHO DO QUE PASSA: o envelope maior e ~400 bytes com o topico (o
-  // MeshPacket tem teto de 256), e o que sai e so texto nosso. Tudo isto e
-  // RAM interna (alocacoes < 4 KB nao vao para a PSRAM, e a pilha da tarefa da
-  // biblioteca e sempre interna). Maior que o buffer chega em pedacos e e
-  // descartado em ao_evento_eua - nao e Meshtastic.
-  c.buffer.size = 768;
-  c.buffer.out_size = 512;
-  c.task.stack_size = 3584;   // pico medido de ~2,6 KB no cliente igual a este
-  c.network.reconnect_timeout_ms = 15000;
-  s_eua_cli = esp_mqtt_client_init(&c);
-  if (!s_eua_cli) { return false; }
-  esp_mqtt_client_register_event(s_eua_cli, MQTT_EVENT_ANY, ao_evento_eua, nullptr);
-  if (esp_mqtt_client_start(s_eua_cli) != ESP_OK) {
-    esp_mqtt_client_destroy(s_eua_cli);
-    s_eua_cli = nullptr;
-    return false;
-  }
-  tab5_mem_marco("MQTT EUA (cliente + tarefa)");
-  ESP_LOGI(TAG, "EUA: conectando a %s, raiz %s", EUA_SRV, EUA_RAIZ);
-  return true;
-}
-
-void mesh_mqtt_eua_parar(void)
-{
-  if (!s_eua_cli) { return; }
-  esp_mqtt_client_stop(s_eua_cli);
-  esp_mqtt_client_destroy(s_eua_cli);
-  s_eua_cli = nullptr;
-  s_eua_conectado = false;
-  if (s_eua_fila) { xQueueReset(s_eua_fila); }
-  ESP_LOGI(TAG, "EUA: desconectado");
-}
-
-bool mesh_mqtt_eua_ativo(void)     { return s_eua_cli != nullptr; }
-bool mesh_mqtt_eua_conectado(void) { return s_eua_cli && s_eua_conectado; }
-uint32_t mesh_mqtt_eua_recebidos(void) { return s_eua_recebidos; }
-
-size_t mesh_mqtt_eua_receber(uint8_t* buf, size_t max)
-{
-  if (!s_eua_fila) { return 0; }
-  static quadro_t q;   // so a tarefa do servico recebe
-  if (xQueueReceive(s_eua_fila, &q, 0) != pdTRUE) { return 0; }
-  const size_t n = q.n < max ? q.n : max;
-  memcpy(buf, q.d, n);
-  return n;
-}
-
-bool mesh_mqtt_eua_enviar(const uint8_t* toradio, size_t n)
-{
-  if (!s_trava_env || !mesh_mqtt_eua_conectado() || s_num == 0) { return false; }
-  to_radio_t t;
-  ler_to_radio(toradio, n, &t);
-  // So canal: a direta precisaria de PKI (ver mesh_mqtt_enviar).
-  if (!t.data || t.para != MESH_PB_DIFUSAO) { return false; }
-  xSemaphoreTake(s_trava_env, portMAX_DELAY);
-  const bool ok = publicar_data(s_eua_cli, s_eua_pend, &s_eua_prox_pend,
-                                (int)(sizeof(s_eua_pend) / sizeof(s_eua_pend[0])),
-                                CANAL_EUA, EUA_RAIZ, t.para, t.data, t.n_data, t.id, t.saltos);
-  xSemaphoreGive(s_trava_env);
-  return ok;
 }

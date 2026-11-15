@@ -1,3 +1,4 @@
+#include "tab5_tema.hpp"
 #include "rolagem.hpp"
 #include "tab5_tela.hpp"
 
@@ -122,5 +123,5 @@ void rolagem_barra(lgfx::LovyanGFX& d, const rolagem_t* r, const area_t& janela,
   const int by  = janela.y + ((janela.altura - alt) * pos) / r->max;
 
   d.fillRect(bx, janela.y, 4, janela.altura, cor_trilha);
-  d.fillRoundRect(bx, by, 4, alt, 2, TFT_DARKGREY);
+  d.fillRoundRect(bx, by, 4, alt, 2, TEMA_LINHA);   // a cor de divisoria do tema
 }

@@ -14,10 +14,13 @@
 // sem virar uma parede de codigo nao testada em hardware nenhum.
 
 #include "app.h"
+#include "idioma.h"
 #include "tab5_camera.hpp"
 #include "tab5_sd.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
 #include "tab5_bmp.hpp"
+#include "pintura.hpp"
 #include "trabalho.hpp"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -25,7 +28,8 @@
 #include "freertos/task.h"
 #include <cstdio>
 #include <cstring>
-#include <dirent.h>
+#include "tab5_arquivos.hpp"   // listar pasta e do sistema
+#include "tab5_camera_web.hpp"
 
 static const char *TAG = "app.camera";
 
@@ -46,6 +50,13 @@ static estado_botao_t s_estado = ESTADO_NORMAL;
 static bool     s_flash_sucesso = false;
 static uint32_t s_flash_ate_ms = 0;   // pisca a borda do botao por um instante apos o resultado
 
+// PINTURA POR DIFERENCA: o botao so e repintado quando o texto dele muda (ou
+// numa passada completa). Antes ele era desenhado inteiro - texto grande, a
+// cada quadro da camera, ~30 vezes por segundo - sem mudar nada.
+static pintura_t s_p;
+static int       s_botao_pintado = -1;
+static bool      s_tem_quadro = false;   // algum quadro ja chegou desde que a camera (re)ligou
+
 // Botao CAPTURAR: faixa inferior fixa, independente do tamanho da area (varia
 // pouco entre paisagem/retrato, mas o calculo por fracao evita numero magico).
 #define BOTAO_A 96
@@ -60,20 +71,7 @@ static uint32_t maior_foto_existente(void)
 {
   char pasta[128];
   if (!tab5_sd_pasta("Camera", pasta, sizeof(pasta))) { return 0; }
-
-  DIR* d = opendir(pasta);
-  if (!d) { return 0; }   // pasta ainda nao existe - primeira foto de todas
-
-  uint32_t maior = 0;
-  struct dirent* e;
-  while ((e = readdir(d)) != NULL) {
-    unsigned long n;
-    if (sscanf(e->d_name, "foto_%04lu.bmp", &n) == 1 && (uint32_t)n > maior) {
-      maior = (uint32_t)n;
-    }
-  }
-  closedir(d);
-  return maior;
+  return tab5_arq_maior_numero(pasta, "foto_%04lu.bmp");   // 0 = primeira foto de todas
 }
 
 // A CONTAGEM E DO WORKER: o readdir da pasta Camera rodava
@@ -102,15 +100,15 @@ static area_t retangulo_preview(void)
 // avisa o compositor (sistema_superficie_mudou). Nenhuma copia pela CPU.
 static bool ligar_camera(void)
 {
-  if (!tab5_camera_iniciar(s_largura, s_altura)) { return false; }
+  if (!tab5_camera_iniciar("Camera")) { return false; }
   superficie_t sup;
   if (!sistema_superficie(retangulo_preview(), &sup)) {
     ESP_LOGE(TAG, "sem superficie de DMA para o preview");
-    tab5_camera_parar();
+    tab5_camera_parar("Camera");
     return false;
   }
   const tab5_cam_destino_t d = { sup.buf, sup.bytes, sup.pic_l, sup.pic_a, sup.x, sup.y,
-                                 sistema_pedir_redesenho };
+                                 s_largura, s_altura, sistema_pedir_redesenho };
   tab5_camera_definir_destino(&d);
   return true;
 }
@@ -130,39 +128,24 @@ static bool ao_abrir(void)
   if (!sistema_trabalho(trabalho_contar, nullptr)) { s_fotos = 0; s_fotos_ok = true; }
   s_estado = ESTADO_NORMAL;
   s_flash_ate_ms = 0;
+  s_botao_pintado = -1;
+  s_tem_quadro = false;
   ESP_LOGI(TAG, "aberto (preview %dx%d)", s_largura, s_altura);
   return true;
 }
 
 static void ao_fechar(void)
 {
-  tab5_camera_parar();   // espera a tarefa da camera: nenhum PPA escrevendo (tela, s_foto) depois daqui
+  tab5_camera_parar("Camera");   // espera a tarefa da camera: nenhum PPA escrevendo (tela, s_foto) depois daqui
   // So existe se a captura nao chegou a virar trabalho; a que virou e do trabalho.
   if (s_foto) { heap_caps_free(s_foto); s_foto = nullptr; }
   ESP_LOGI(TAG, "fechado");
 }
 
-// ao_repouso()/ao_retomar() - crash (camera+repouso), ver o
-// aviso grande em kernel/app.h. Solucao: os MESMOS tab5_camera_parar()/
-// iniciar() que ao_fechar()/ao_abrir() ja usam - a captura solta o
-// DW_GDMA dela por completo (sensor, PPA, tarefa de fundo, CAM_RST) e volta
-// do zero depois, sem inventar um terceiro estado "pausado" so para isto.
-// s_foto NAO e tocado aqui - o app continua "aberto" o tempo todo, so a
-// captura para e volta.
-static void ao_repouso(void)
-{
-  tab5_camera_parar();
-}
-
-static void ao_retomar(void)
-{
-  // Um pedido de foto em voo morreu com a captura (o driver voltou do zero):
-  // sem isto o botao ficaria em "CAPTURANDO..." para sempre.
-  if (s_estado == ESTADO_CAPTURANDO) { s_estado = ESTADO_NORMAL; }
-  if (!ligar_camera()) {
-    ESP_LOGE(TAG, "falha ao religar a camera apos o repouso");
-  }
-}
+// REPOUSO: sem gancho. Com a tela apagada o SISTEMA pausa a camera deste app
+// e a religa ao acordar, com o mesmo destino (kernel/core.cpp,
+// tab5_camera_pausar). Uma foto que estava sendo capturada volta como falha
+// (quadro_pronto com ok = false) e o botao sai de "CAPTURANDO..." sozinho.
 
 // O PEDIDO DE GRAVACAO leva tudo o que precisa: o trabalho e solto e pode
 // rodar com o app ja fechado (ou reaberto, com outro s_foto_nome).
@@ -209,24 +192,26 @@ static void ao_aviso(uint32_t av)
 
 static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 {
+  pintura_iniciar(&s_p);
   // O frame ja esta na tela virtual (o PPA da camera o escreveu la); so
   // falta o compositor saber que a area mudou.
   if (tab5_camera_quadro_escrito()) {
+    s_tem_quadro = true;
     sistema_superficie_mudou(retangulo_preview());
   } else if (sistema_area_foi_limpa()) {
     // Ainda sem nenhum frame (sensor acabou de subir) - avisa em vez de
     // deixar a area preta parecendo travado.
     tab5_texto(d, 2);
     d.setTextDatum(middle_center);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    d.drawString("iniciando a câmera...", a.x + s_largura / 2, a.y + s_altura / 2);
+    d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+    d.drawString(tr("iniciando a câmera..."), a.x + s_largura / 2, a.y + s_altura / 2);
     d.setTextDatum(top_left);
   }
 
   // A FOTO CHEGOU AO BUFFER: a gravacao vai para o worker do sistema.
   if (s_estado == ESTADO_CAPTURANDO) {
     bool ok = false;
-    if (tab5_camera_foto_pronta(&ok)) {
+    if (tab5_camera_quadro_pronto(s_foto, &ok)) {
       if (ok && gravar_foto()) {
         s_estado = ESTADO_GRAVANDO;
       } else {
@@ -240,20 +225,37 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   }
 
   // ---- barra inferior: botao CAPTURAR + contador -----------------------
+  // So quando o que ele diz mudou: o quadro novo da camera nao mexe nele.
+  const int visual = (s_estado == ESTADO_FLASH) ? (s_flash_sucesso ? 10 : 11) : (int)s_estado;
+  if (!pintura_mudou_i(&s_p, &s_botao_pintado, visual)) { return; }
   const int by = a.y + s_altura + 12;
-  const char* texto = "CAPTURAR";
-  uint16_t    cor    = TFT_ORANGE;
-  if (s_estado == ESTADO_CAPTURANDO)                    { texto = "CAPTURANDO...";      cor = TFT_DARKCYAN; }
-  else if (s_estado == ESTADO_GRAVANDO)                 { texto = "SALVANDO...";        cor = TFT_DARKCYAN; }
-  else if (s_estado == ESTADO_FLASH && s_flash_sucesso) { texto = "CAPTURADO!";         cor = TFT_GREEN;    }
-  else if (s_estado == ESTADO_FLASH)                    { texto = "FALHOU";             cor = TFT_RED;      }
+  const char* texto = tr("CAPTURAR");
+  // Botao principal em destaque; ocupado em cinza neutro; resultado em verde/vermelho.
+  // A tinta escura no verde, porque o branco nele fica fraco para ler.
+  uint16_t    cor    = TEMA_DESTAQUE;
+  uint16_t    tinta  = TEMA_SOBRE_DESTAQUE;
+  if (s_estado == ESTADO_CAPTURANDO)                    { texto = tr("CAPTURANDO...");      cor = TEMA_SUPERFICIE_ALTA; tinta = TEMA_TEXTO; }
+  else if (s_estado == ESTADO_GRAVANDO)                 { texto = tr("SALVANDO...");        cor = TEMA_SUPERFICIE_ALTA; tinta = TEMA_TEXTO; }
+  else if (s_estado == ESTADO_FLASH && s_flash_sucesso) { texto = tr("CAPTURADO!");         cor = TEMA_SUCESSO;         tinta = TEMA_FUNDO; }
+  else if (s_estado == ESTADO_FLASH)                    { texto = tr("FALHOU");             cor = TEMA_PERIGO;          tinta = TEMA_SOBRE_DESTAQUE; }
 
   tab5_botao(d, a.x + 16, by, a.largura - 32, BOTAO_A - 12,
-             texto, cor, TFT_BLACK, TAB5_BOTAO_TEXTO_GRANDE);
+             texto, cor, tinta, TAB5_BOTAO_TEXTO_GRANDE);
 
   // ENQUANTO HOUVER PEDIDO PENDENTE, o app precisa continuar conferindo -
-  // periodo_ms sozinho ja cobre isto (redesenha a cada 100ms de qualquer
-  // jeito), nao precisa de pedido extra aqui.
+  // periodo() abaixo liga o relogio de 100 ms so nessa hora.
+}
+
+// O RITMO E O DA CAMERA. Cada quadro escrito ja pede um redesenho
+// (tab5_cam_destino_t.avisar): um relogio de 100 ms POR CIMA disso so metia
+// passadas sem quadro novo no meio das que tem - a interface ocupada na hora
+// em que o quadro chega, e o preview andando aos solavancos. O app Camera em
+// Berry, que so redesenha no quadro, ficava mais liso que este. O relogio
+// fica para o que nao vem da camera: a foto em curso, o "CAPTURADO!" que
+// some sozinho, e o primeiro quadro que ainda nao chegou.
+static uint32_t periodo(void)
+{
+  return (s_estado != ESTADO_NORMAL || !s_tem_quadro) ? 100 : 0;
 }
 
 static void ao_tocar(int x, int y)
@@ -271,9 +273,9 @@ static void ao_tocar(int x, int y)
   if (!s_fotos_ok) { return; }   // a numeracao ainda esta sendo lida do cartao (instantes)
 
   // Um buffer por foto: o anterior foi com o trabalho de gravacao.
-  if (!s_foto) { s_foto = tab5_camera_foto_alocar(); }
+  if (!s_foto) { s_foto = tab5_camera_quadro_alocar(TAB5_CAM_FOTO_L, TAB5_CAM_FOTO_A); }
   if (!s_foto) { ESP_LOGE(TAG, "sem PSRAM para a foto"); return; }
-  if (!tab5_camera_pedir_foto(s_foto)) { return; }
+  if (!tab5_camera_pedir_quadro(s_foto, TAB5_CAM_FOTO_L, TAB5_CAM_FOTO_A)) { return; }
   snprintf(s_foto_nome, sizeof(s_foto_nome), "foto_%04lu", (unsigned long)(s_fotos + 1));
   ++s_fotos;
   s_estado = ESTADO_CAPTURANDO;
@@ -329,18 +331,22 @@ extern const app_t APP_CAMERA = {
   .perfil = { .alto_falante = true },
   .usa_sd = true,
   .exige_sd = true,         // sem cartao nao ha o que fazer (ver app.h)
-  .piso_repouso_mhz = 0,
+  .orientacao = ORI_FIXO_EM_PE,   // o preview e DMA na tela em rotacao 0: nem o teclado deita
   .ao_abrir   = ao_abrir,
   .ao_fechar  = ao_fechar,
-  .ao_repouso = ao_repouso,
-  .ao_retomar = ao_retomar,
   .desenhar  = desenhar,
   .ao_tocar  = ao_tocar,
   // O PREVIEW NAO DEPENDE DO RELOGIO: cada frame escrito pela
   // camera pede um redesenho na hora (tab5_cam_destino_t.avisar). O periodo
   // so conduz o botao (CAPTURANDO/SALVANDO/flash) quando nao ha frame.
   .periodo_ms = 100,
+  .periodo_agora = periodo,           // 0 com o preview andando (o quadro e o relogio)
   .avisos    = AVISO_TRABALHO,   // a gravacao da foto terminou
   .ao_aviso  = ao_aviso,
   .icone = icone_camera,
+  .ao_girar = nullptr,
+  .comandos = nullptr,
+  .fora_da_home = false,
+  .no_pc = tab5_camera_web_ligar,   // a camera ao vivo no navegador (/camera/)
+  .fundo_tema = true,               // o sistema limpa a area com o fundo do tema
 };

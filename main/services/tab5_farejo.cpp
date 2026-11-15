@@ -1,3 +1,4 @@
+#include "recursos.h"
 #include "tab5_farejo.hpp"
 #include "tab5_ouvinte.hpp"
 #include "tab5_wifi.hpp"
@@ -13,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <cstring>
+#include <atomic>
 
 static const char* TAG = "farejo";
 
@@ -34,12 +36,12 @@ static volatile bool   s_quer = false; // o P4 quer farejar
 // (parada_t) e ligar com uma execucao saindo espera ela confirmar antes de
 // alocar a tabela e criar a nova.
 static parada_t          s_parada = { };
-static SemaphoreHandle_t s_trava_cmd = nullptr;
+static Trava s_trava_cmd;
 static pool_id_t       s_id = POOL_ID_VAZIO;
 
 static farejo_item_t* s_tab = nullptr; // PSRAM, so com o farejo ligado
 static int            s_n = 0;
-static volatile uint32_t s_lotes = 0, s_perdidos = 0;
+static std::atomic<uint32_t> s_lotes = 0, s_perdidos = 0;
 
 static volatile uint8_t s_proto = 0, s_caps = 0;   // 0 = ainda nao sabemos
 static c6_info_t s_info;
@@ -122,7 +124,7 @@ static void juntar_lote(const uint8_t* d, size_t n)
     s_perdidos += cab.perdidos;
   }
   xSemaphoreGive(s_mtx);
-  s_lotes = s_lotes + 1;   // volatile: nao usar ++ (deprecado em C++)
+  ++s_lotes;
 }
 
 static void ao_peer_data(uint32_t msg_id, const uint8_t* dados, size_t n, void*)
@@ -160,10 +162,8 @@ static void vTarefaRenova(void*)
     cfg.liga = 1;
     eh_host_peer_data_send(C6_MSG_HOST_FAREJO, (const uint8_t*)&cfg, sizeof(cfg));
 
-    // Troca em pedacos para responder rapido a um desligar.
-    for (int i = 0; i < RENOVA_MS / 100 && !parada_pedida(&s_parada); ++i) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
+    // Dorme ate a proxima renovacao; um desligar (ou config nova) acorda ja.
+    parada_dormir(&s_parada, RENOVA_MS);
   }
 
   // Desliga no C6 e solta a tabela.
@@ -175,7 +175,7 @@ static void vTarefaRenova(void*)
   s_n = 0;
   xSemaphoreGive(s_mtx);
 
-  tab5_wifi_manter_acordado(TAB5_ACORDADO_FAREJO, false);
+  sistema_recurso(RECURSO_RADIO_ESCUTA, "farejo", false);
   ESP_LOGI(TAG, "farejo desligado");
   parada_confirmar(&s_parada);   // a ULTIMA coisa: daqui em diante um ligar pode criar outra
 }
@@ -207,11 +207,11 @@ bool tab5_farejo_ligar(const c6_farejo_cfg_t* cfg)
   if (!tab5_wifi_c6_nosso() || !tab5_wifi_c6_enlace()) { return false; }
   registrar();
 
-  tab5_mutex_travar(&s_trava_cmd);
+  s_trava_cmd.travar();
   const bool vivo = parada_rodando(&s_parada);
   if (vivo && parada_pedida(&s_parada) && !parada_pedir(&s_parada, 1500)) {
     // Saindo e nao saiu: ligar agora dividiria a tabela com quem a libera.
-    tab5_mutex_destravar(&s_trava_cmd);
+    s_trava_cmd.destravar();
     ESP_LOGE(TAG, "a tarefa anterior do farejo ainda nao saiu - nao liguei");
     return false;
   }
@@ -227,10 +227,10 @@ bool tab5_farejo_ligar(const c6_farejo_cfg_t* cfg)
   }
   const bool sem_tab = (s_tab == nullptr);
   xSemaphoreGive(s_mtx);
-  if (sem_tab) { tab5_mutex_destravar(&s_trava_cmd); ESP_LOGE(TAG, "sem PSRAM para a tabela"); return false; }
+  if (sem_tab) { s_trava_cmd.destravar(); ESP_LOGE(TAG, "sem PSRAM para a tabela"); return false; }
 
   // Receptor sempre ligado: o promiscuo perde o que chega durante o cochilo.
-  tab5_wifi_manter_acordado(TAB5_ACORDADO_FAREJO, true);
+  sistema_recurso(RECURSO_RADIO_ESCUTA, "farejo", true);
 
   s_quer = true;
   if (!de_pe) {
@@ -239,16 +239,18 @@ bool tab5_farejo_ligar(const c6_farejo_cfg_t* cfg)
                     DONO_SERVICO, "Farejo")) {
       parada_desistir(&s_parada);
       s_quer = false;
-      tab5_wifi_manter_acordado(TAB5_ACORDADO_FAREJO, false);
-      tab5_mutex_destravar(&s_trava_cmd);
+      sistema_recurso(RECURSO_RADIO_ESCUTA, "farejo", false);
+      s_trava_cmd.destravar();
       ESP_LOGE(TAG, "sem vaga para a tarefa do farejo");
       return false;
     }
   } else {
-    // Ja rodando: o proximo ciclo de renovacao manda a config nova.
-    pool_acordar(&s_id);
+    // Ja rodando: acorda o cochilo e a volta seguinte manda a config nova.
+    // (Antes era pool_acordar = xTaskAbortDelay, que tambem arranca a tarefa
+    // de um xSemaphoreTake(s_mtx) - o risco descrito em kernel/parada.hpp.)
+    parada_cutucar(&s_parada);
   }
-  tab5_mutex_destravar(&s_trava_cmd);
+  s_trava_cmd.destravar();
   ESP_LOGI(TAG, "farejo ligado: mascara 0x%04x, lote %u ms",
            (unsigned)cfg->canais, (unsigned)cfg->lote_ms);
   return true;
@@ -256,12 +258,12 @@ bool tab5_farejo_ligar(const c6_farejo_cfg_t* cfg)
 
 void tab5_farejo_desligar(void)
 {
-  tab5_mutex_travar(&s_trava_cmd);
+  s_trava_cmd.travar();
   s_quer = false;
   // Pede a saida e nao espera (quem desliga e a tela): a tarefa sai na volta
   // seguinte, solta a tabela e confirma.
-  if (parada_rodando(&s_parada)) { s_parada.pedido = true; pool_acordar(&s_id); }
-  tab5_mutex_destravar(&s_trava_cmd);
+  if (parada_rodando(&s_parada)) { s_parada.pedido = true; parada_cutucar(&s_parada); }
+  s_trava_cmd.destravar();
 }
 
 bool tab5_farejo_ativo(void) { return s_quer; }
@@ -281,16 +283,6 @@ bool tab5_farejo_item(int i, farejo_item_t* out)
   bool ok = false;
   xSemaphoreTake(s_mtx, portMAX_DELAY);
   if (s_tab && i >= 0 && i < s_n) { *out = s_tab[i]; ok = true; }
-  xSemaphoreGive(s_mtx);
-  return ok;
-}
-
-bool tab5_farejo_achar(const uint8_t mac[6], farejo_item_t* out)
-{
-  if (!s_mtx || !out) { return false; }
-  bool ok = false;
-  xSemaphoreTake(s_mtx, portMAX_DELAY);
-  if (s_tab) { int j = achar_mac(mac); if (j >= 0) { *out = s_tab[j]; ok = true; } }
   xSemaphoreGive(s_mtx);
   return ok;
 }

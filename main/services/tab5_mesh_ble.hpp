@@ -41,8 +41,6 @@ bool mesh_ble_conectou_agora(void);
 
 bool        mesh_ble_conectado(void);
 const char* mesh_ble_descricao(void);
-// O nome e o endereco do no conectado ("" sem conexao).
-void        mesh_ble_no(char nome[24], char endereco[18]);
 
 // PIN NA HORA: o no pediu o PIN e o enlace esta esperando alguem digitar (o
 // no com PIN aleatorio mostra um novo a cada pareamento). Ajustes > Meshtastic

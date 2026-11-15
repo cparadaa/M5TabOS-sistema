@@ -1,7 +1,7 @@
 // APP: Exemplo - um cartao para cada API do sistema.
 //
 // E o mostruario e o molde: cada linha da tabela usa UMA API do sistema
-// (API.md) do jeito certo, com o minimo de codigo. Para escrever um app
+// (docs/API.md) do jeito certo, com o minimo de codigo. Para escrever um app
 // novo, copie esta pasta para main/app_<nome>/, renomeie APP_EXEMPLO para
 // APP_<NOME> e apague os cartoes que nao interessam.
 //
@@ -13,14 +13,20 @@
 //   - a lista rolavel do sistema (kernel/lista): cada cartao so e repintado
 //     quando o valor dele muda;
 //   - comandos de console do app: 'app exemplo contar 5'.
+//   - o TEMA: toda cor de interface vem de TEMA_* (tab5_tema.hpp), pelo PAPEL
+//     (fundo, texto, destaque...) e nao pelo numero; e o app liga
+//     '.fundo_tema = true' para o sistema limpar a area com TEMA_FUNDO. Assim
+//     trocar a paleta do sistema nao exige tocar em nenhum app.
 
 #include "app.h"
+#include "idioma.h"
 #include "lista.hpp"
 #include "tarefa_app.h"
 #include "trabalho.hpp"
 #include "fundo.h"
 #include "notificacao.h"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"   // as cores por papel: use TEMA_*, nunca 0x.... nem TFT_*
 #include "tab5_sd.hpp"
 #include "tab5_hora.hpp"
 #include "tab5_imu.hpp"
@@ -32,7 +38,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include <atomic>
-#include <dirent.h>
+#include "tab5_arquivos.hpp"   // listar pasta e do sistema
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,14 +100,14 @@ typedef struct {
 static void v_tela(char* o, size_t n)
 {
   const area_t a = sistema_area();
-  snprintf(o, n, "area do app: %d x %d", a.largura, a.altura);
+  snprintf(o, n, tr("area do app: %d x %d"), a.largura, a.altura);
 }
 
 // ---- TOQUE ------------------------------------------------------------------
 static void v_toque(char* o, size_t n)
 {
-  if (s_toques == 0) { snprintf(o, n, "toque em qualquer cartao"); return; }
-  snprintf(o, n, "%d toque(s), ultimo em %d,%d", s_toques, s_toque_x, s_toque_y);
+  if (s_toques == 0) { snprintf(o, n, tr("toque em qualquer cartao")); return; }
+  snprintf(o, n, tr("%d toque(s), ultimo em %d,%d"), s_toques, s_toque_x, s_toque_y);
 }
 
 // ---- TAREFA -----------------------------------------------------------------
@@ -121,32 +127,32 @@ static void v_tarefa(char* o, size_t n)
 {
   uint32_t v;
   if (s_fila && xQueueReceive(s_fila, &v, 0) == pdTRUE) { s_tarefa_n = v; }
-  snprintf(o, n, "a tarefa contou %lu", (unsigned long)s_tarefa_n);
+  snprintf(o, n, tr("a tarefa contou %lu"), (unsigned long)s_tarefa_n);
 }
 
 // ---- TRABALHO (worker do sistema) -------------------------------------------
 // Roda na tarefa do worker, nunca na interface: pode ler o cartao a vontade.
 // Termina e o app recebe AVISO_TRABALHO (declarado em .avisos).
+// Listar pasta e do sistema (services/tab5_arquivos): o app nao abre
+// diretorio sozinho - so diz o que fazer com cada item.
+static bool visita_contar(const tab5_arq_item_t*, void*) { return !sistema_trabalho_cancelado(); }
+
 static void trab_contar(void*)
 {
   int n = 0;
   char pasta[96];
   if (tab5_sd_montado() && tab5_sd_pasta("Exemplo", pasta, sizeof(pasta))) {
-    DIR* d = opendir(pasta);
-    if (d) {
-      while (readdir(d) && !sistema_trabalho_cancelado()) { ++n; }
-      closedir(d);
-    }
+    n = tab5_arq_percorrer(pasta, visita_contar, nullptr);
   }
-  s_trab_arquivos = n;
+  s_trab_arquivos = n < 0 ? 0 : n;
 }
 
 static void v_trabalho(char* o, size_t n)
 {
   const int a = s_trab_arquivos;
-  if (s_trab_rodando) { snprintf(o, n, "contando..."); }
-  else if (a < 0)     { snprintf(o, n, "conta os arquivos da pasta do app"); }
-  else                { snprintf(o, n, "%d arquivo(s) em apps/Exemplo", a); }
+  if (s_trab_rodando) { snprintf(o, n, tr("contando...")); }
+  else if (a < 0)     { snprintf(o, n, tr("conta os arquivos da pasta do app")); }
+  else                { snprintf(o, n, tr("%d arquivo(s) em apps/Exemplo"), a); }
 }
 
 static void b_trabalho(void)
@@ -159,8 +165,8 @@ static void b_trabalho(void)
 // cartao estiver emprestado ao computador.
 static void v_cartao(char* o, size_t n)
 {
-  snprintf(o, n, s_linhas_gravadas ? "%d linha(s) em apps/Exemplo/diario.csv"
-                                   : "grava uma linha no CSV do app", s_linhas_gravadas);
+  snprintf(o, n, s_linhas_gravadas ? tr("%d linha(s) em apps/Exemplo/diario.csv")
+                                   : tr("grava uma linha no CSV do app"), s_linhas_gravadas);
 }
 
 static void b_cartao(void)
@@ -174,7 +180,7 @@ static void b_cartao(void)
 static void v_hora(char* o, size_t n)
 {
   const uint32_t e = tab5_hora_epoch();
-  if (!e) { snprintf(o, n, "relogio ainda sem acerto"); return; }
+  if (!e) { snprintf(o, n, tr("relogio ainda sem acerto")); return; }
   struct tm t;
   tab5_hora_local(e, &t);
   snprintf(o, n, "%02d/%02d/%04d %02d:%02d:%02d (%s)", t.tm_mday, t.tm_mon + 1,
@@ -195,16 +201,16 @@ static void v_energia(char* o, size_t n)
 static void v_imu(char* o, size_t n)
 {
   tab5_imu_dados_t d;
-  if (!tab5_imu_ultima(&d) || !d.valida) { snprintf(o, n, "IMU sem leitura"); return; }
+  if (!tab5_imu_ultima(&d) || !d.valida) { snprintf(o, n, tr("IMU sem leitura")); return; }
   snprintf(o, n, "x %+.2f g  y %+.2f g  z %+.2f g", (double)d.ax, (double)d.ay, (double)d.az);
 }
 
 // ---- GPS --------------------------------------------------------------------
 static void v_gps(char* o, size_t n)
 {
-  if (!tab5_gps_no_ar()) { snprintf(o, n, "sem GPS no Grove"); return; }
+  if (!tab5_gps_no_ar()) { snprintf(o, n, tr("sem GPS no Grove")); return; }
   const nmea_posicao_t p = tab5_gps_posicao();
-  if (p.qualidade == 0) { snprintf(o, n, "GPS sem fix (%u sat)", (unsigned)p.sats_usados); return; }
+  if (p.qualidade == 0) { snprintf(o, n, tr("GPS sem fix (%u sat)"), (unsigned)p.sats_usados); return; }
   snprintf(o, n, "%.5f, %.5f  (%u sat)", p.lat, p.lon, (unsigned)p.sats_usados);
 }
 
@@ -213,17 +219,17 @@ static void v_wifi(char* o, size_t n)
 {
   const char* ip = tab5_wifi_ip();
   if (ip && ip[0]) { snprintf(o, n, "%s  %s  %d dBm", tab5_wifi_ssid(), ip, (int)tab5_wifi_rssi()); }
-  else             { snprintf(o, n, "%s", tab5_wifi_descricao()); }
+  else             { snprintf(o, n, "%s", tr(tab5_wifi_descricao())); }
 }
 
 // ---- ESP-NOW ----------------------------------------------------------------
 static void v_espnow(char* o, size_t n)
 {
-  if (!tab5_espnow_pronto()) { snprintf(o, n, "fora do ar (radio C6 de fabrica ou Wi-Fi desligado)"); return; }
+  if (!tab5_espnow_pronto()) { snprintf(o, n, tr("fora do ar (radio C6 de fabrica ou Wi-Fi desligado)")); return; }
   const int k = tab5_espnow_n();
   espnow_msg_t m;
-  if (k > 0 && tab5_espnow_msg(k - 1, &m)) { snprintf(o, n, "canal %u, ultima: %.28s", tab5_espnow_canal(), m.texto); }
-  else                                     { snprintf(o, n, "canal %u, nada recebido", tab5_espnow_canal()); }
+  if (k > 0 && tab5_espnow_msg(k - 1, &m)) { snprintf(o, n, tr("canal %u, ultima: %.28s"), tab5_espnow_canal(), m.texto); }
+  else                                     { snprintf(o, n, tr("canal %u, nada recebido"), tab5_espnow_canal()); }
 }
 
 static void b_espnow(void) { tab5_espnow_enviar("ola do Exemplo"); }
@@ -233,8 +239,8 @@ static void b_espnow(void) { tab5_espnow_enviar("ola do Exemplo"); }
 // enviar: tab5_mesh_enviar(0xFFFFFFFF, canal, texto) ou para um no.
 static void v_mesh(char* o, size_t n)
 {
-  if (!tab5_mesh_servico_ativo()) { snprintf(o, n, "servico desligado (Ajustes > Mesh)"); return; }
-  snprintf(o, n, "%s, %d no(s), %d nao lida(s)", tab5_mesh_no_ar() ? "no ar" : "mudo",
+  if (!tab5_mesh_servico_ativo()) { snprintf(o, n, tr("servico desligado (Ajustes > Mesh)")); return; }
+  snprintf(o, n, tr("%s, %d no(s), %d nao lida(s)"), tab5_mesh_no_ar() ? tr("no ar") : tr("mudo"),
            tab5_mesh_num_nos(), tab5_mesh_nao_lidas());
 }
 
@@ -242,13 +248,13 @@ static void v_mesh(char* o, size_t n)
 // Estado, nao evento: publicar de novo SUBSTITUI. Quantidade 0 apaga.
 static void v_notif(char* o, size_t n)
 {
-  snprintf(o, n, s_notif_ativa ? "aviso na barra - toque para tirar" : "poe um aviso na barra de status");
+  snprintf(o, n, s_notif_ativa ? tr("aviso na barra - toque para tirar") : tr("poe um aviso na barra de status"));
 }
 
 static void b_notif(void)
 {
   s_notif_ativa = !s_notif_ativa;
-  if (s_notif_ativa) { notif_publicar(s_notif, 1, NOTIF_ATENCAO, "aviso do Exemplo"); }
+  if (s_notif_ativa) { notif_publicar(s_notif, 1, NOTIF_ATENCAO, tr("aviso do Exemplo")); }
   else               { notif_limpar(s_notif); }
 }
 
@@ -261,15 +267,15 @@ static void b_som(void) { sistema_beep(880.0f, 120); }
 // ---- TECLADO ----------------------------------------------------------------
 static void v_teclado(char* o, size_t n)
 {
-  if (!tab5_teclado_presente()) { snprintf(o, n, "encaixe o teclado no ExtPort1"); return; }
-  snprintf(o, n, s_tecla[0] ? "ultima tecla: %s" : "digite algo", s_tecla);
+  if (!tab5_teclado_presente()) { snprintf(o, n, tr("encaixe o teclado no ExtPort1")); return; }
+  snprintf(o, n, s_tecla[0] ? tr("ultima tecla: %s") : tr("digite algo"), s_tecla);
 }
 
 // ---- ACORDADO ---------------------------------------------------------------
 static void v_acordado(char* o, size_t n)
 {
-  snprintf(o, n, s_acordado ? "tela nao apaga enquanto o app estiver aberto"
-                            : "a tela apaga sozinha (padrao)");
+  snprintf(o, n, s_acordado ? tr("tela nao apaga enquanto o app estiver aberto")
+                            : tr("a tela apaga sozinha (padrao)"));
 }
 
 static void b_acordado(void)
@@ -300,7 +306,6 @@ static const fundo_def_t EXEMPLO_FUNDO = {
   .corpo = laco_fundo,
   .pilha = 3072,
   .perfil = { },
-  .piso_repouso_mhz = 0,
   .ao_iniciar = nullptr,
   .ao_parar   = nullptr,
   .com_som    = fundo_sem_som,
@@ -309,9 +314,9 @@ static const fundo_def_t EXEMPLO_FUNDO = {
 static void v_fundo(char* o, size_t n)
 {
   if (sistema_fundo_ativo(&EXEMPLO_FUNDO)) {
-    snprintf(o, n, "cronometro: %lu s (feche o app e veja a barra)", (unsigned long)s_fundo_s.load());
+    snprintf(o, n, tr("cronometro: %lu s (feche o app e veja a barra)"), (unsigned long)s_fundo_s.load());
   } else {
-    snprintf(o, n, "um cronometro que sobrevive ao app fechado");
+    snprintf(o, n, tr("um cronometro que sobrevive ao app fechado"));
   }
 }
 
@@ -324,7 +329,7 @@ static void b_fundo(void)
 // ---- CONSOLE ----------------------------------------------------------------
 static void v_console(char* o, size_t n)
 {
-  snprintf(o, n, "'app exemplo contar 5' na serial: soma = %d", s_console_soma.load());
+  snprintf(o, n, tr("'app exemplo contar 5' na serial: soma = %d"), s_console_soma.load());
 }
 
 static const cartao_t CARTOES[] = {
@@ -373,17 +378,19 @@ static void cartao_desenhar(lgfx::LovyanGFX& d, int i, int x, int y, int largura
   const cartao_t& c = CARTOES[i];
   const lgfx::TextStyle estilo = d.getTextStyle();   // copia: devolvemos no fim
   // (o fundo do cartao a lista ja pintou - nao limpar de novo)
-  d.drawFastHLine(x + MARGEM, y + CARTAO_A - 1, largura - 2 * MARGEM, SIS_LINHA);
+  d.drawFastHLine(x + MARGEM, y + CARTAO_A - 1, largura - 2 * MARGEM, TEMA_LINHA);   // divisoria: o papel "linha"
 
   d.setTextDatum(top_left);
   tab5_fonte_corpo_negrito(d);
   tab5_texto(d, 3.0f);
-  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  // Texto: sempre cor + a cor do FUNDO onde ele pousa (a lista pinta TEMA_FUNDO),
+  // senao o texto novo deixa uma caixa de outra cor em volta.
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
   d.drawString(c.titulo, x + MARGEM, y + 14);
 
   tab5_fonte_corpo(d);
   tab5_texto(d, 2.2f);
-  d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  d.setTextColor(TEMA_TEXTO_3, TEMA_FUNDO);   // dica: o nivel mais apagado
   d.drawString(c.api, x + MARGEM, y + 52);
 
   // O valor: cortado com "..." se nao couber antes do botao.
@@ -392,11 +399,11 @@ static void cartao_desenhar(lgfx::LovyanGFX& d, int i, int x, int y, int largura
   tab5_texto(d, 2.6f);
   const int lim = (c.botao ? botao_x(largura) : largura - MARGEM) - MARGEM - 8;
   tab5_cortar_com_reticencias(d, v, sizeof(v), lim);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);   // valor de apoio: secundario
   d.drawString(v, x + MARGEM, y + 84);
 
   if (c.botao) {
-    tab5_botao(d, x + botao_x(largura), y + botao_y(), BOTAO_L, BOTAO_A, c.botao, TFT_SKYBLUE);
+    tab5_botao(d, x + botao_x(largura), y + botao_y(), BOTAO_L, BOTAO_A, c.botao, TEMA_DESTAQUE, TEMA_SOBRE_DESTAQUE);   // botao principal: a unica cor forte
   }
   d.setTextStyle(estilo);
 }
@@ -418,7 +425,7 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 {
   const bool tudo = sistema_area_foi_limpa();
   atualizar_valores(tudo);
-  lista_desenhar(&s_lista, d, a, TFT_BLACK, tudo);
+  lista_desenhar(&s_lista, d, a, TEMA_FUNDO, tudo);   // o mesmo fundo que .fundo_tema limpa
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +453,7 @@ static void ao_tocar(int x, int y)
 static void ao_teclar(const char* texto, uint8_t codigo, uint8_t)
 {
   if (texto[0]) { snprintf(s_tecla, sizeof(s_tecla), "\"%s\"", texto); }
-  else          { snprintf(s_tecla, sizeof(s_tecla), "codigo %u", (unsigned)codigo); }
+  else          { snprintf(s_tecla, sizeof(s_tecla), tr("codigo %u"), (unsigned)codigo); }
 }
 
 // Os servicos avisam (AVISO_*) e o app redesenha na hora, sem perguntar a
@@ -505,8 +512,15 @@ static void cmd_zerar(int, char**)
   sistema_pedir_redesenho();
 }
 
+static void cmd_fundo(int, char**)
+{
+  b_fundo();
+  printf("cronometro em fundo: %s\n", sistema_fundo_ativo(&EXEMPLO_FUNDO) ? "ligado" : "desligado");
+}
+
 static const app_comando_t COMANDOS[] = {
   { "contar", "[n]\tsoma n (padrao 1) no cartao CONSOLE", cmd_contar, false },
+  { "fundo",  "\tliga/desliga o cronometro em fundo (o cartao FUNDO)", cmd_fundo, false },
   { "zerar",  "\tzera a soma (so com o app aberto)",      cmd_zerar,  true },
   { nullptr },
 };
@@ -540,7 +554,6 @@ extern const app_t APP_EXEMPLO = {
   .perfil = { .imu = true, .alto_falante = true },
   .usa_sd = true,               // monta o cartao antes do ao_abrir (TRABALHO le a pasta)
   .orientacao = ORI_EM_PE,
-  .piso_repouso_mhz = 0,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -552,4 +565,5 @@ extern const app_t APP_EXEMPLO = {
   .ao_aviso = ao_aviso,
   .icone = icone_exemplo,
   .comandos = COMANDOS,
+  .fundo_tema = true,           // o sistema limpa a area com TEMA_FUNDO (use TEMA_FUNDO nos textos)
 };

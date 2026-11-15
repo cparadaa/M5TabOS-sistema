@@ -1,6 +1,8 @@
 #include "tab5_sd.hpp"
+#include "idioma.h"
 #include "tab5_marcos.hpp"
 #include "tab5_reserva.hpp"
+#include "tab5_power.hpp"   // tab5_power_em_repouso (o ritmo da tarefa "cartao")
 #include <errno.h>
 
 #include "esp_vfs_fat.h"
@@ -64,6 +66,18 @@ static void destrava(void)
 {
   if (s_mutex) { xSemaphoreGive(s_mutex); }
 }
+
+// A TRAVA DO CONTROLADOR SDMMC (ver tab5_sd.hpp). Criada junto com a s_mutex,
+// em tab5_sd_iniciar, antes de qualquer tarefa (inclusive a subida do Wi-Fi).
+static SemaphoreHandle_t s_controlador = nullptr;
+void tab5_sd_controlador_travar(void)
+{
+  if (s_controlador) { xSemaphoreTake(s_controlador, portMAX_DELAY); }
+}
+void tab5_sd_controlador_soltar(void)
+{
+  if (s_controlador) { xSemaphoreGive(s_controlador); }
+}
 // ---------------------------------------------------------------------------
 // O ESTADO DO CARTAO SAO QUATRO COISAS, NAO DUAS
 // ---------------------------------------------------------------------------
@@ -94,7 +108,7 @@ static bool s_anunciou = false;   // a primeira montagem do boot ja foi para o l
 // e a trilha gravam em momentos proximos, e cada montagem liga o regulador e
 // reinicializa o cartao. Com a folga, gravacoes vizinhas dividem UMA montagem;
 // sem ninguem pedir de novo, desmonta e o regulador desliga. E o mesmo padrao
-// de "timeout de ociosidade" do alto-falante (ARQUITETURA.md, 1.1).
+// de "timeout de ociosidade" do alto-falante (docs/ARQUITETURA.md, 1.1).
 static const uint64_t   SD_OCIOSO_US = 10ULL * 1000 * 1000;
 static esp_timer_handle_t s_ocioso = nullptr;
 static void desmontar_de_verdade(void);
@@ -133,9 +147,17 @@ static volatile bool s_emprestado = false;
 static sdmmc_card_t* s_cru = nullptr;
 static tab5_sd_resumo_t s_resumo = { };   // o diario deste emprestimo (tab5_sd_resumo)
 
+// Trava PROPRIA do cartao cru: as portas de setor (tab5_sd_cru_*) e a devolucao
+// (que solta o s_cru) passam por ela, para nunca soltar o cartao com uma
+// operacao em curso. Criada em tab5_sd_iniciar, como a s_mutex.
+static SemaphoreHandle_t s_cru_mutex = nullptr;
+static volatile uint32_t s_cru_recuperacoes = 0, s_cru_falhas = 0, s_cru_max_ms = 0;
+
 void tab5_sd_iniciar(void)
 {
   if (!s_mutex) { s_mutex = xSemaphoreCreateMutex(); }
+  if (!s_controlador) { s_controlador = xSemaphoreCreateMutex(); }
+  if (!s_cru_mutex) { s_cru_mutex = xSemaphoreCreateMutex(); }
   // O diario ANTES do gravador: o que ficou de um pendrive interrompido por
   // um reinicio tem que estar visivel quando a primeira gravacao chegar.
   tab5_reserva_iniciar();
@@ -205,11 +227,11 @@ static void ler_rotulo(void)
 
 const char* tab5_sd_descricao(void)
 {
-  if (s_emprestado)         { snprintf(s_desc, sizeof(s_desc), "no computador (USB)"); }
+  if (s_emprestado)         { snprintf(s_desc, sizeof(s_desc), N_("no computador (USB)")); }
   else if (s_card)          { snprintf(s_desc, sizeof(s_desc), "%s", s_ident); }
-  else if (s_ultima_falhou) { snprintf(s_desc, sizeof(s_desc), "ausente ou ilegivel"); }
+  else if (s_ultima_falhou) { snprintf(s_desc, sizeof(s_desc), N_("ausente ou ilegivel")); }
   else if (s_ja_montou)     { snprintf(s_desc, sizeof(s_desc), "%s (livre)", s_ident); }
-  else                      { snprintf(s_desc, sizeof(s_desc), "nao verificado"); }
+  else                      { snprintf(s_desc, sizeof(s_desc), N_("nao verificado")); }
   return s_desc;
 }
 
@@ -278,7 +300,9 @@ static bool montar_de_verdade(void)
   mnt.allocation_unit_size   = 16 * 1024;
 
   tab5_marco("sd: montando", 0);
+  tab5_sd_controlador_travar();   // host/slot 0 subindo: o slot 1 (C6) nao pode mexer junto
   err = esp_vfs_fat_sdmmc_mount(TAB5_SD_RAIZ, &host, &slot, &mnt, &s_card);
+  tab5_sd_controlador_soltar();
   if (err != ESP_OK) {
     // So a PRIMEIRA falha de uma sequencia vai ao log; as repeticoes do
     // mesmo estado sao depuracao.
@@ -317,7 +341,8 @@ static bool montar_de_verdade(void)
   // desmontava a cada 15s para sempre, gravando que tinha gravado. So a
   // primeira montagem do boot fica visivel; o resto e depuracao.
   if (!s_anunciou) {
-    ESP_LOGI(TAG, "montado em %s: %s, nome '%s'", TAB5_SD_RAIZ, s_ident, s_rotulo);
+    ESP_LOGI(TAG, "montado em %s: %s, nome '%s' (%d kHz, %d bit(s), DDR %d)", TAB5_SD_RAIZ, s_ident, s_rotulo,
+             s_card->real_freq_khz, s_card->log_bus_width ? (1 << s_card->log_bus_width) : 1, s_card->is_ddr);
     s_anunciou = true;
     arrumar_sistema();
   }
@@ -414,7 +439,9 @@ bool tab5_sd_montar(void)
 static void desmontar_de_verdade(void)
 {
   tab5_marco("sd: desmontando", 0);
+  tab5_sd_controlador_travar();   // deinit do slot 0 (ou do host inteiro, se for o ultimo)
   esp_vfs_fat_sdcard_unmount(TAB5_SD_RAIZ, s_card);
+  tab5_sd_controlador_soltar();
   s_card = nullptr;
   if (s_ldo) { sd_pwr_ctrl_del_on_chip_ldo(s_ldo); s_ldo = nullptr; }
   // A identidade NAO e apagada: o cartao continua encaixado, so nao esta
@@ -529,8 +556,10 @@ static void cru_soltar(void)
   if (!s_cru) { return; }
   // O mesmo desfazer do esp_vfs_fat_sdcard_unmount: so o SLOT 0 (o slot 1 e
   // o SDIO do C6, e um deinit do host inteiro o derrubaria).
+  tab5_sd_controlador_travar();
   if (s_cru->host.flags & SDMMC_HOST_FLAG_DEINIT_ARG) { s_cru->host.deinit_p(s_cru->host.slot); }
   else                                                { s_cru->host.deinit(); }
+  tab5_sd_controlador_soltar();
   free(s_cru);
   s_cru = nullptr;
   if (s_ldo) { sd_pwr_ctrl_del_on_chip_ldo(s_ldo); s_ldo = nullptr; }
@@ -550,8 +579,10 @@ static bool cru_preparar(void)
 
   s_cru = (sdmmc_card_t*)calloc(1, sizeof(sdmmc_card_t));
   if (!s_cru) { sd_pwr_ctrl_del_on_chip_ldo(s_ldo); s_ldo = nullptr; return false; }
+  tab5_sd_controlador_travar();   // host, slot 0 e card_init: ver tab5_sd.hpp
   esp_err_t err = host.init();
   if (err != ESP_OK) {
+    tab5_sd_controlador_soltar();
     ESP_LOGE(TAG, "cartao para o pendrive: host %s", esp_err_to_name(err));
     free(s_cru); s_cru = nullptr;
     sd_pwr_ctrl_del_on_chip_ldo(s_ldo); s_ldo = nullptr;
@@ -559,12 +590,14 @@ static bool cru_preparar(void)
   }
   err = sdmmc_host_init_slot(host.slot, &slot);
   if (err == ESP_OK) { err = sdmmc_card_init(&host, s_cru); }
+  tab5_sd_controlador_soltar();   // antes do cru_soltar, que trava de novo (nao e recursiva)
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "cartao para o pendrive: %s", esp_err_to_name(err));
     s_cru->host = host;   // o host foi iniciado: o cru_soltar o desfaz
     cru_soltar();
     return false;
   }
+  s_cru_recuperacoes = 0; s_cru_falhas = 0; s_cru_max_ms = 0;
   return true;
 }
 
@@ -636,7 +669,122 @@ tab5_sd_emprestimo_t tab5_sd_emprestar(uint32_t espera_ms)
   return SD_EMPRESTADO;
 }
 
-sdmmc_card_t* tab5_sd_cru(void) { return s_emprestado ? s_cru : nullptr; }
+// ---------------------------------------------------------------------------
+// SETORES DO CARTAO EMPRESTADO, COM RECUPERACAO
+// ---------------------------------------------------------------------------
+// A funcao do IDF que reinicia o controlador SDMMC. E privada (so esta em
+// sdmmc_internal.h, que nao e publico), mas o simbolo e exportado.
+//
+// POR QUE USAR: quando um comando de dados estoura o prazo (cartao lento
+// demais), o driver do IDF so desiste de esperar - NAO aborta a transferencia
+// no controlador. Ele fica com o comando anterior preso (HLE, "hardware locked
+// error": "handle_idle_state_events unhandled: 00001000") e dai em diante todo
+// comando falha com 0x107, para sempre. Como o MESMO controlador serve o slot 1
+// (o SDIO do ESP32-C6, o Wi-Fi), o Wi-Fi cai junto. Ja aconteceu: o pendrive
+// gravando um arquivo grande derrubou cartao e Wi-Fi ate reiniciar.
+//
+// O QUE ELE ZERA: so os bits de reset do registrador CTRL - maquina de estados
+// do controlador, DMA interno e FIFO (e limpa o start_cmd preso). NAO mexe no
+// divisor de clock, nos pinos nem na configuracao dos slots: o proprio
+// sdmmc_host_init chama o reset DEPOIS de ajustar o divisor e ANTES de
+// configurar slot e pinos, e cada transferencia religa o DMA e reescreve o
+// tamanho/descritores (sdmmc_host_dma_prepare). Por isso e seguro para o slot 1.
+// Limite conhecido: ele nao toma a trava interna do driver, entao uma
+// transferencia do Wi-Fi exatamente no mesmo instante sofreria o reset (o
+// protocolo do SDIO repete o comando); so roda depois de uma falha, que e raro.
+extern "C" esp_err_t sdmmc_host_reset(void);
+
+// Quantas vezes uma operacao se recupera antes de desistir, e quanto espera o
+// cartao sair de "ocupado" (programando a escrita) depois do reset.
+#define CRU_RECUPERACOES   2
+#define CRU_OCUPADO_MAX_MS 10000
+#define CRU_OCUPADO_PASSO  20
+
+// Deixa o cartao pronto para a operacao ser repetida: controlador reiniciado,
+// cartao fora de ocupado e, se ele nem responde, inicializado de novo.
+// Com a trava do cru presa. SEM LOG: roda dentro dos retornos do USB.
+//
+// A TRAVA DO CONTROLADOR E POR OPERACAO, nao pelo laco todo: o controlador e
+// dividido com o SDIO do C6 (Wi-Fi/BLE, ver tab5_sd.hpp), e esperar o cartao
+// sair de ocupado leva ate CRU_OCUPADO_MAX_MS. Segurar a trava nesse tempo
+// travava o C6 por ate 10 s. Entre as voltas (no vTaskDelay) ela fica solta.
+static void cru_recuperar(void)
+{
+  // O reset e o card_init mexem no controlador inteiro (ver tab5_sd.hpp).
+  tab5_sd_controlador_travar();
+  sdmmc_host_reset();
+  tab5_sd_controlador_soltar();
+
+  const int64_t limite_us = esp_timer_get_time() + (int64_t)CRU_OCUPADO_MAX_MS * 1000;
+  for (;;) {
+    tab5_sd_controlador_travar();
+    const esp_err_t st = sdmmc_get_status(s_cru);
+    tab5_sd_controlador_soltar();
+    if (st == ESP_OK) { break; }
+
+    if (esp_timer_get_time() >= limite_us) {
+      // Nao respondeu: o cartao e reiniciado (mesmo host, ja iniciado).
+      const sdmmc_host_t host = s_cru->host;
+      tab5_sd_controlador_travar();
+      sdmmc_card_init(&host, s_cru);
+      tab5_sd_controlador_soltar();
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(CRU_OCUPADO_PASSO));
+  }
+}
+
+static esp_err_t cru_operar(bool gravar, uint32_t setor, void* buf, uint32_t n)
+{
+  if (!s_cru_mutex) { return ESP_ERR_INVALID_STATE; }
+  xSemaphoreTake(s_cru_mutex, portMAX_DELAY);
+  esp_err_t err = ESP_ERR_INVALID_STATE;
+  if (s_emprestado && s_cru) {
+    const int64_t t0 = esp_timer_get_time();
+    for (int tentativa = 0;; ++tentativa) {
+      err = gravar ? sdmmc_write_sectors(s_cru, buf, setor, n)
+                   : sdmmc_read_sectors(s_cru, buf, setor, n);
+      if (err == ESP_OK || tentativa >= CRU_RECUPERACOES) { break; }
+      ++s_cru_recuperacoes;
+      cru_recuperar();
+    }
+    if (err != ESP_OK) { ++s_cru_falhas; }
+    const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    if (ms > s_cru_max_ms) { s_cru_max_ms = ms; }
+  }
+  xSemaphoreGive(s_cru_mutex);
+  return err;
+}
+
+bool tab5_sd_cru_info(uint32_t* setores, uint32_t* tam_setor)
+{
+  if (!s_cru_mutex) { return false; }
+  xSemaphoreTake(s_cru_mutex, portMAX_DELAY);
+  const bool ok = s_emprestado && s_cru;
+  if (ok) {
+    if (setores)   { *setores = (uint32_t)s_cru->csd.capacity; }
+    if (tam_setor) { *tam_setor = (uint32_t)s_cru->csd.sector_size; }
+  }
+  xSemaphoreGive(s_cru_mutex);
+  return ok;
+}
+
+esp_err_t tab5_sd_cru_ler(uint32_t setor, void* buf, uint32_t n)
+{
+  return cru_operar(false, setor, buf, n);
+}
+
+esp_err_t tab5_sd_cru_gravar(uint32_t setor, const void* buf, uint32_t n)
+{
+  return cru_operar(true, setor, const_cast<void*>(buf), n);
+}
+
+void tab5_sd_cru_estat(tab5_sd_cru_estat_t* e)
+{
+  e->recuperacoes = s_cru_recuperacoes;
+  e->falhas = s_cru_falhas;
+  e->max_ms = s_cru_max_ms;
+}
 
 void tab5_sd_devolver(void)
 {
@@ -646,8 +794,11 @@ void tab5_sd_devolver(void)
   gravacao_travar(true);
   trava();
   if (!s_emprestado) { destrava(); gravacao_travar(false); return; }
+  // A trava do cru: nunca soltar o cartao com uma operacao de setor em curso.
+  xSemaphoreTake(s_cru_mutex, portMAX_DELAY);
   cru_soltar();
   s_emprestado = false;
+  xSemaphoreGive(s_cru_mutex);
   // A proxima montagem e normal: nada de espera de "sem cartao" herdada.
   s_ultima_falhou = false;
   s_espera_ms = 0;
@@ -675,9 +826,9 @@ static void nome_seguro(const char* origem, char* destino, size_t tam)
   if (j == 0) { snprintf(destino, tam, "app"); }
 }
 
-bool tab5_sd_pasta(const char* app, char* out, size_t out_tam)
+static bool pasta_de(const char* app, char* out, size_t out_tam, bool criar)
 {
-  if (!s_card || !app || !out) { return false; }
+  if (!app || !out) { return false; }
 
   // SUBPASTAS: "Sistema/logs" vira apps/Sistema/logs. Cada trecho
   // entre barras passa pelo nome_seguro e cada nivel e criado se faltar.
@@ -694,7 +845,9 @@ bool tab5_sd_pasta(const char* app, char* out, size_t out_tam)
       if (n >= out_tam) { return false; }
 
       struct stat st;
-      if (stat(out, &st) == 0) {
+      if (!criar) {
+        // so o caminho
+      } else if (stat(out, &st) == 0) {
         if (!S_ISDIR(st.st_mode)) { return false; }
       } else if (mkdir(out, 0777) != 0) {
         ESP_LOGE(TAG, "nao consegui criar %s", out);
@@ -705,6 +858,16 @@ bool tab5_sd_pasta(const char* app, char* out, size_t out_tam)
     p = fim + 1;
   }
   return true;
+}
+
+bool tab5_sd_pasta(const char* app, char* out, size_t out_tam)
+{
+  return s_card && pasta_de(app, out, out_tam, true);
+}
+
+bool tab5_sd_pasta_caminho(const char* app, char* out, size_t out_tam)
+{
+  return pasta_de(app, out, out_tam, false);
 }
 
 static FILE* abrir_cru(const char* app, const char* arquivo, const char* modo);
@@ -774,11 +937,20 @@ bool tab5_sd_espaco(uint64_t* total, uint64_t* livre)
   return esp_vfs_fat_info(TAB5_SD_RAIZ, total, livre) == ESP_OK;
 }
 
+long tab5_sd_tamanho(FILE* f)
+{
+  if (fseek(f, 0, SEEK_END) != 0) { return -1; }
+  const long n = ftell(f);
+  if (fseek(f, 0, SEEK_SET) != 0) { return -1; }
+  return n;
+}
+
 // ===========================================================================
 // O GRAVADOR (ver o .hpp)
 // ===========================================================================
 #include "freertos/task.h"
 #include "tab5_donos.hpp"
+#include <atomic>
 
 #define ANEXO_BUF      (16 * 1024)   // cada um dos dois buffers, na PSRAM
 #define ANEXO_PRAZO_MS 5000          // o que nao e urgente espera no maximo isto
@@ -802,7 +974,7 @@ static int64_t           s_desde_us = 0;      // quando chegou o mais antigo pen
 static SemaphoreHandle_t s_anexo    = nullptr; // o buffer ativo
 static SemaphoreHandle_t s_gravando = nullptr; // uma gravacao por vez
 static TaskHandle_t      s_tarefa   = nullptr;
-static volatile uint32_t s_gravadas = 0, s_perdidas = 0;
+static std::atomic<uint32_t> s_gravadas = 0, s_perdidas = 0;
 
 bool tab5_sd_anexar(const char* app, const char* arquivo, const char* texto,
                     const char* cabecalho, bool urgente)
@@ -811,7 +983,7 @@ bool tab5_sd_anexar(const char* app, const char* arquivo, const char* texto,
   const size_t nc = cabecalho ? strlen(cabecalho) : 0;
   const size_t nt = strlen(texto);
   const size_t tam = sizeof(anexo_t) + nc + nt;
-  if (tam > ANEXO_BUF / 2) { s_perdidas = s_perdidas + 1; return false; }
+  if (tam > ANEXO_BUF / 2) { ++s_perdidas; return false; }
 
   xSemaphoreTake(s_anexo, portMAX_DELAY);   // so memcpy aqui dentro
   const bool cabe = (s_usado + tam <= ANEXO_BUF);
@@ -829,7 +1001,7 @@ bool tab5_sd_anexar(const char* app, const char* arquivo, const char* texto,
   const bool metade = (s_usado > ANEXO_BUF / 2);
   xSemaphoreGive(s_anexo);
 
-  if (!cabe) { s_perdidas = s_perdidas + 1; }
+  if (!cabe) { ++s_perdidas; }
   if ((urgente || metade) && s_tarefa) { xTaskNotifyGive(s_tarefa); }
   return cabe;
 }
@@ -844,7 +1016,7 @@ bool tab5_sd_anexar(const char* app, const char* arquivo, const char* texto,
 // aconteceu antes e esta esperando.
 static bool para_o_diario(void) { return s_emprestado || tab5_reserva_pendente(); }
 
-static volatile uint32_t s_diario_perdidas = 0;   // nao couberam no diario
+static std::atomic<uint32_t> s_diario_perdidas = 0;   // nao couberam no diario
 
 static bool diario_acrescentar(const char* app, const char* arq,
                                const void* cab, size_t n_cab, const void* dados, size_t n)
@@ -855,7 +1027,7 @@ static bool diario_acrescentar(const char* app, const char* arq,
   r.cabecalho = cab; r.n_cabecalho = (uint16_t)n_cab;
   r.dados = dados; r.n_dados = (uint32_t)n;
   if (tab5_reserva_gravar(&r)) { return true; }
-  s_diario_perdidas = s_diario_perdidas + 1;
+  ++s_diario_perdidas;
   return false;
 }
 
@@ -889,15 +1061,15 @@ static void gravar_buffer(uint8_t* b, size_t n)
       anexo_t* a = (anexo_t*)(b + o);
       const uint8_t* p = (const uint8_t*)(a + 1);
       if (diario_acrescentar(a->app, a->arq, a->n_cab ? p : nullptr, a->n_cab, p + a->n_cab, a->n_txt)) {
-        s_gravadas = s_gravadas + 1;
+        ++s_gravadas;
       } else {
-        s_perdidas = s_perdidas + 1;
+        ++s_perdidas;
       }
     }
     return;
   }
   if (!tab5_sd_montar()) {
-    for (size_t o = 0; o < n; o += ((anexo_t*)(b + o))->tam) { s_perdidas = s_perdidas + 1; }
+    for (size_t o = 0; o < n; o += ((anexo_t*)(b + o))->tam) { ++s_perdidas; }
     return;
   }
   // Marca os ja gravados zerando o 'app' (o registro continua no lugar, so
@@ -920,9 +1092,9 @@ static void gravar_buffer(uint8_t* b, size_t n)
           if (r->n_cab && ftell(f) == 0) { fwrite(p, 1, r->n_cab, f); }
         }
         fwrite(p + r->n_cab, 1, r->n_txt, f);
-        s_gravadas = s_gravadas + 1;
+        ++s_gravadas;
       } else {
-        s_perdidas = s_perdidas + 1;
+        ++s_perdidas;
       }
       r->app[0] = 0;
     }
@@ -983,9 +1155,7 @@ static bool substituir_no_cartao(const char* caminho, const void* dados, size_t 
   if (flags & TAB5_SD_SIGILOSO) {
     FILE* velho = fopen(caminho, "r+");
     if (velho) {
-      fseek(velho, 0, SEEK_END);
-      long falta = ftell(velho);
-      fseek(velho, 0, SEEK_SET);
+      long falta = tab5_sd_tamanho(velho);
       static const char zeros[64] = { };
       while (falta > 0) {
         const size_t k = falta > (long)sizeof(zeros) ? sizeof(zeros) : (size_t)falta;
@@ -1128,7 +1298,7 @@ bool tab5_sd_substituir(const char* app, const char* arquivo, const void* dados,
     r.base_tamanho = f ? f->tam : 0;
     r.base_data    = f ? f->data : 0;
     ok = tab5_reserva_gravar(&r);
-    if (!ok) { s_diario_perdidas = s_diario_perdidas + 1; }
+    if (!ok) { ++s_diario_perdidas; }
   } else if (tab5_sd_montar()) {
     char pasta[96], caminho[160];
     ok = tab5_sd_pasta(app, pasta, sizeof(pasta))
@@ -1137,6 +1307,22 @@ bool tab5_sd_substituir(const char* app, const char* arquivo, const void* dados,
     tab5_sd_desmontar();
   } else {
     ok = false;
+  }
+  xSemaphoreGive(s_gravando);
+  return ok;
+}
+
+bool tab5_sd_apagar(const char* app, const char* arquivo)
+{
+  if (!s_gravando || !app || !arquivo) { return false; }
+  xSemaphoreTake(s_gravando, portMAX_DELAY);
+  esvaziar_buffer();
+  bool ok = false;
+  if (!para_o_diario() && tab5_sd_montar()) {
+    char caminho[160];
+    caminho_de(app, arquivo, caminho, sizeof(caminho));
+    ok = remove(caminho) == 0;
+    tab5_sd_desmontar();
   }
   xSemaphoreGive(s_gravando);
   return ok;
@@ -1177,7 +1363,13 @@ bool tab5_sd_carona(tab5_sd_carona_t fn)
 static void vTaskCartao(void*)
 {
   for (;;) {
-    const bool pedido = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) > 0;
+    // A VOLTA: 1 s acordado, 5 s em repouso. O urgente (mensagem de
+    // conversa) e o buffer passando da metade acordam na hora (notificacao);
+    // o resto ja esperava ate ANEXO_PRAZO_MS. No repouso cada volta tira o P4
+    // do sono leve, e as caronas (log a cada 60 s, Mesh, registro) nao
+    // precisam de mais que isto.
+    const uint32_t volta_ms = tab5_power_em_repouso() ? 5000 : 1000;
+    const bool pedido = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(volta_ms)) > 0;
     xSemaphoreTake(s_anexo, portMAX_DELAY);
     const bool ha = (s_usado > 0);
     const bool venceu = ha && (esp_timer_get_time() - s_desde_us) >= (int64_t)ANEXO_PRAZO_MS * 1000;

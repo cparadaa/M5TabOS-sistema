@@ -1,7 +1,7 @@
 // PONTE PRIVADA entre core.cpp e shell.cpp - NUNCA incluido por um app.
 //
 // -------------------------------------------------------------------------
-// POR QUE ISTO EXISTE (Etapa 1 do ARQUITETURA.md)
+// POR QUE ISTO EXISTE (Etapa 1 do docs/ARQUITETURA.md)
 // -------------------------------------------------------------------------
 // sistema.cpp tinha crescido de 1129 para 2457 linhas fazendo oito coisas
 // diferentes, compartilhando estaticas sem fronteira nenhuma - "o arquivo
@@ -24,6 +24,10 @@
 // sistema_area() e literalmente "return area_util();"). Trocar por isso
 // evita expor uma funcao inteira so para uma chamada, sem mudar nenhum
 // resultado.
+//
+// Depois da Etapa 1, core.cpp e shell.cpp foram partidos por assunto (so
+// mudou de arquivo): core_*.cpp e shell_*.cpp. Cada grupo tem o seu interno
+// (core_interno.hpp, shell_interno.hpp), que inclui este.
 //
 // app.h continua sendo o UNICO contrato que um app enxerga. Este header e
 // deliberadamente mais cru que ele - variaveis extern em vez de getters -
@@ -91,6 +95,8 @@ bool sistema_na_interface(void);
 // Troca o relogio do painel (destroi e recria as paginas) NA TAREFA DE
 // INTERFACE - de outra tarefa, deixa o pedido e espera ate 5 s.
 bool sistema_trocar_relogio_painel(int mhz);
+// O mesmo, para a velocidade do link DSI (so teste: nao grava).
+bool sistema_trocar_link_painel(int mbps);
 
 // PASSADA COMPLETA POR APP (abrir app, voltar a home), acumulado desde o
 // boot, para o 'tela' do console. As tres fases somam o total aproximado:
@@ -115,6 +121,7 @@ void desenhar_splash(void);
 #endif
 void tratar_toque(int tx, int ty);
 void desenhar_barra_status(lgfx::LovyanGFX& d, bool completo);
+bool recado_pendente(void);   // o recado da barra mudou (sistema_recado): repintar ja
 bool barra_mudou(void);
 void desenhar_barra_nav(lgfx::LovyanGFX& d);
 void desenhar_home(lgfx::LovyanGFX& d, const area_t& a);
@@ -127,7 +134,7 @@ void desenhar_home(lgfx::LovyanGFX& d, const area_t& a);
 // GESTOS: chamado na soltura do dedo com o deslocamento total (dx, dy) desde a
 // descida, ja descartados o dedo que acordou a tela e o clique comum. Na home
 // troca de pagina; com o bloqueio ligado, arrastar para cima desbloqueia.
-void tratar_gesto(int dx, int dy);
+void tratar_gesto(int dx, int dy, int y0);   // y0: onde o dedo desceu (cru)
 
 // MOVER ICONE NA HOME. home_segurar() e chamado a cada volta com o dedo na
 // tela (home aberta, sem bloqueio): depois de HOME_SEGURAR_MS parado sobre um
@@ -156,6 +163,7 @@ void desbloquear_tela(void);
 // fecha. painel_avisos_mudou() diz ao loop que a lista aberta envelheceu.
 void painel_avisos_abrir(bool abrir);
 bool painel_avisos_mudou(void);
+bool painel_avisos_dados_mudou(void);   // so o miniplayer (passada de dados)
 void desenhar_painel_avisos(lgfx::LovyanGFX& d, const area_t& a, bool completo);
 
 void atualizar_linha_servicos(void);   // testa e redesenha a faixa GROVE/CARTAO da home, se mudou

@@ -2,9 +2,12 @@
 //
 // NOVA FORMA, a de qualquer celular:
 //
-//   - no TOPO, o que se mexe sem pensar: BRILHO e VOLUME, direto na barra;
-//   - uma linha, e embaixo a LISTA das paginas - icone, nome, e uma linha de
-//     estado ("Conectado a ...", "Desligado") para saber sem entrar;
+//   - a tela inicial e UMA lista rolavel em GRUPOS (CONEXOES, TELA E SOM, SISTEMA), cada
+//     grupo num cartao arredondado, como na maquete aprovada (a tabela LINHAS);
+//   - as linhas de pagina mostram icone, nome e uma linha de estado
+//     ("Conectado a ...", "Desligado") para saber sem entrar;
+//   - BRILHO e VOLUME sao linhas da mesma lista, com o controle deslizante dentro
+//     (tocar no trilho ou arrastar; o dedo que desce nele nao rola a lista);
 //   - cada pagina tem VOLTAR e as opcoes dela. A lista rola (kernel/lista):
 //     opcao nova e UMA linha na tabela PAGINAS, nao um remendo de posicao.
 //
@@ -12,18 +15,34 @@
 // sistema rolava; cada secao nova empurrava as outras, e as alturas eram
 // numeros somados a mao (e erraram mais de uma vez).
 //
+// DEITADO (teclado fisico encaixado, kernel/orientacao) e o mesmo esquema com
+// mais uma coluna, mestre-detalhe como nos tablets: a lista a esquerda (LADO_L)
+// e, a direita, a pagina escolhida, que rola
+// sozinha (s_rol_pag) - rolar a pagina nao leva a lista embora. As paginas sao
+// as mesmas de em pe: desenham na area que recebem e tocam relativo a ela.
+//
 // O que mora aqui e do USUARIO, nao do aplicativo: cada app continua
 // declarando o hardware que precisa no perfil dele; este app controla o que
 // atravessa todos (ajustes.h).
 
-#include <math.h>
-#include "tab5_hora.hpp"   // tab5_agora_ms
+//
+// PARTIDO POR ASSUNTO (so mudou de arquivo, nada de logica). Este arquivo ficou
+// com as medidas, as paginas (a tabela PAGINAS), o estado da tela, os textos e
+// botoes, a linha de estado de cada pagina, o inicio (brilho, volume e a
+// lista), o despacho e o registro do app. O resto foi para app_config_*.cpp; o
+// que as partes compartilham esta em app_config_interno.hpp:
+//   app_config_icones.cpp   icones da lista e o icone do app na tela inicial
+//   app_config_rede.cpp     paginas Wi-Fi, Bluetooth, ESP-NOW, Meshtastic e MQTT
+//   app_config_paginas.cpp  paginas Data e hora, Acesso pelo PC, Idioma, Tela, Teclado, Grove, Sobre e USB
+
+#include "tab5_hora.hpp"
 #include "app.h"
-#include <cmath>
+#include "tab5_power.hpp"
 #include "ajustes.h"
+#include "idioma.h"
 #include "tab5_wifi.hpp"
+#include "tab5_mesh_mqtt.hpp"
 #include "tab5_ble.hpp"
-#include "tab5_sinal.hpp"
 #include "tab5_espnow.hpp"
 #include "tab5_mesh.hpp"
 #include "tab5_mesh_ble.hpp"
@@ -33,150 +52,223 @@
 #include "tab5_ui.hpp"
 #include "pintura.hpp"
 #include "lista.hpp"
-#include "conversa.hpp"          // conversa_quebrar_linhas (texto corrido)
-#include "teclado_virtual.hpp"   // o PIN do Meshtastic
-#include "trabalho.hpp"
-
+#include "conversa.hpp"
+#include "teclado_virtual.hpp"
 #include "tab5_pendrive.hpp"
-
-#include "esp_heap_caps.h"
-#include "esp_log.h"
+#include "tab5_web.hpp"
 #include <stdlib.h>
-#include "esp_idf_version.h"
 #include "esp_app_desc.h"
-#include "esp_timer.h"
 #include <stdio.h>
 #include <string.h>
+#include "app_config_interno.hpp"
 
 // ---------------------------------------------------------------------------
 // MEDIDAS
 // ---------------------------------------------------------------------------
-static const int MARGEM   = 24;
-static const int ROTULO_PX = 30;      // "Brilho", "Volume"
-static const int CTRL_A   = 64;       // altura da barra e dos botoes - e /+
 static const int PM_L     = 88;       // largura dos botoes - e +
-static const int RAPIDO_Y0 = 16;
-static const int RAPIDO_A  = 44 + CTRL_A + 24;   // rotulo + controle + respiro
-static const int DIVISOR_Y = RAPIDO_Y0 + 2 * RAPIDO_A + 4;
-static const int LISTA_Y0  = DIVISOR_Y + 12;
-static const int ITEM_A    = 104;
+static const int TRILHO_A  = 12;       // espessura do trilho
+static const int BOTAO_R   = 16;       // raio da bolinha do deslizante (32 px)
+static const int TOQUE_EXTRA = 16;     // folga de toque alem das pontas do trilho (na altura vale a linha toda)
+// Alturas das linhas da tela inicial (o toque e a lista usam as mesmas).
+static const int GRUPO_A   = 56;       // rotulo do grupo (CONEXOES...), alinhado embaixo
+static const int ITEM_A    = 92;       // linha de pagina
+static const int DESL_A    = 100;      // linha com deslizante: nome e % em cima, trilho embaixo
 static const int ICONE_L   = 64;
+
+// Deitado (mestre-detalhe, ver o topo do arquivo)
+static const int LADO_L      = 400;   // a lista, a esquerda
+static const int PAG_X       = LADO_L + 1;   // onde a pagina comeca (deitado)
 
 // Paginas
 static const int VOLTAR_L = 200, VOLTAR_A = 64;
-static const int CONTEUDO_Y = 112;     // abaixo do VOLTAR/titulo
-static const int BTN_A = 72;
-
-static const int PASSO_BRILHO = 50;   // em BRILHO_POS_MAX: 20 toques do minimo ao maximo
-static const int PASSO_VOLUME = 15;
-static const int PASSO_TELA_S = 5;
-static const int PASSO_RELOGIO = 5;
-
-static uint16_t cor_linha(lgfx::LovyanGFX& d) { return d.color565(48, 52, 62); }
-static uint16_t cor_sub(lgfx::LovyanGFX& d)   { return d.color565(150, 156, 168); }
 
 // ---------------------------------------------------------------------------
 // AS PAGINAS - a lista de baixo sai daqui
 // ---------------------------------------------------------------------------
 typedef enum {
   PAG_INICIO = -1,
-  PAG_WIFI = 0, PAG_BLUETOOTH, PAG_ESPNOW, PAG_MESH, PAG_TELA, PAG_TECLADO, PAG_GROVE, PAG_USB, PAG_SOBRE,
+  PAG_WIFI = 0, PAG_BLUETOOTH, PAG_ESPNOW, PAG_MESH, PAG_MQTT, PAG_TELA, PAG_ENERGIA, PAG_HORA, PAG_IDIOMA, PAG_TECLADO, PAG_GROVE, PAG_USB, PAG_PC, PAG_SOBRE,
   PAG_N
 } pagina_t;
 
 typedef void (*icone_fn)(lgfx::LovyanGFX& d, int x, int y, int l);
 typedef void (*estado_fn)(char* out, size_t tam);
-
-static void ic_wifi(lgfx::LovyanGFX&, int, int, int);
-static void ic_bt(lgfx::LovyanGFX&, int, int, int);
-static void ic_espnow(lgfx::LovyanGFX&, int, int, int);
-static void ic_mesh(lgfx::LovyanGFX&, int, int, int);
-static void ic_tela(lgfx::LovyanGFX&, int, int, int);
-static void ic_teclado(lgfx::LovyanGFX&, int, int, int);
-static void ic_grove(lgfx::LovyanGFX&, int, int, int);
-static void ic_usb(lgfx::LovyanGFX&, int, int, int);
-static void ic_sobre(lgfx::LovyanGFX&, int, int, int);
-static void est_wifi(char*, size_t);
-static void est_bt(char*, size_t);
-static void est_espnow(char*, size_t);
+static void est_energia(char*, size_t);
 static void est_mesh(char*, size_t);
 static void est_tela(char*, size_t);
-static void est_teclado(char*, size_t);
-static void est_grove(char*, size_t);
 static void est_usb(char*, size_t);
 static void est_sobre(char*, size_t);
+static void est_mqtt(char*, size_t);
+static void est_hora(char*, size_t);
+static void est_idioma(char*, size_t);
+static void est_pc(char*, size_t);
 
-typedef struct { const char* nome; icone_fn icone; estado_fn estado; } pagina_def_t;
-static const pagina_def_t PAGINAS[PAG_N] = {
-  { "Wi-Fi",        ic_wifi,    est_wifi    },
-  { "Bluetooth",    ic_bt,      est_bt      },
-  { "ESP-NOW",      ic_espnow,  est_espnow  },
-  { "Meshtastic",   ic_mesh,    est_mesh    },
-  { "Tela",         ic_tela,    est_tela    },
-  { "Teclado",      ic_teclado, est_teclado },
-  { "Grove 5V",     ic_grove,   est_grove   },
-  { "USB (pendrive)", ic_usb,   est_usb     },
-  { "Sobre",        ic_sobre,   est_sobre   },
+// O desenho e o toque de cada pagina (definidos mais abaixo).
+typedef void (*desenhar_fn)(lgfx::LovyanGFX& d, const area_t& a, bool tudo);
+typedef void (*tocar_fn)(int tx, int ty);
+
+// UMA LINHA POR PAGINA, com tudo dela: o item da lista (nome, icone, estado)
+// e a pagina aberta (desenho e toque). Eram tres tabelas paralelas, e quando
+// a Energia entrou so nesta, o desenho e o toque das seguintes andaram uma
+// casa: tocar em Data e hora abria o Idioma (04/11/2026). Sem desenho = a
+// linha abre outra coisa (abrir_pagina).
+typedef struct {
+  const char* nome;
+  icone_fn    icone;
+  estado_fn   estado;
+  desenhar_fn desenhar;
+  tocar_fn    tocar;      // nullptr = pagina so de leitura
+} pagina_def_t;
+static const pagina_def_t PAGINAS[] = {
+  { N_("Wi-Fi"),          ic_wifi,    est_wifi,    pag_wifi,    toque_wifi   },
+  { N_("Bluetooth"),      ic_bt,      est_bt,      pag_bt,      toque_bt     },
+  { N_("ESP-NOW"),        ic_espnow,  est_espnow,  pag_espnow,  toque_espnow },
+  { N_("Meshtastic"),     ic_mesh,    est_mesh,    pag_mesh,    toque_mesh   },
+  { N_("Malha pela internet"), ic_nuvem, est_mqtt, pag_mqtt,    toque_mqtt   },
+  { N_("Tela"),           ic_tela,    est_tela,    pag_tela,    toque_tela   },
+  { N_("Energia"),        ic_energia, est_energia, nullptr,     nullptr      },   // abre o app Energia (fora da home)
+  { N_("Data e hora"),    ic_hora,    est_hora,    pag_hora,    toque_hora   },
+  { N_("Idioma"),         ic_idioma,  est_idioma,  pag_idioma,  toque_idioma },
+  { N_("Teclado"),        ic_teclado, est_teclado, pag_teclado, nullptr      },
+  { N_("Grove 5V"),       ic_grove,   est_grove,   pag_grove,   toque_grove  },
+  { N_("USB (pendrive)"), ic_usb,     est_usb,     pag_usb,     toque_usb    },
+  { N_("Acesso pelo PC"), ic_pc,      est_pc,      pag_pc,      toque_pc     },
+  { N_("Sobre"),          ic_sobre,   est_sobre,   pag_sobre,   nullptr      },
 };
+static_assert(sizeof(PAGINAS) / sizeof(PAGINAS[0]) == PAG_N, "uma linha em PAGINAS para cada pagina_t, na mesma ordem");
+
+// ---------------------------------------------------------------------------
+// A TELA INICIAL - a ordem e os grupos saem daqui
+// ---------------------------------------------------------------------------
+// Tres tipos de linha: o rotulo de um GRUPO; uma PAGINA (valor = o pagina_t,
+// nome/icone/estado vem de PAGINAS); um DESLIZANTE (valor 0 = brilho, 1 = volume;
+// o nome e o rotulo). Cada sequencia de linhas entre dois grupos e UM cartao.
+// PAGINAS segue na ordem do enum (o resto do app depende dela); a ordem na
+// tela e so esta tabela.
+typedef enum { L_GRUPO, L_PAGINA, L_DESLIZANTE } linha_tipo_t;
+typedef struct { linha_tipo_t tipo; int valor; const char* rotulo; } linha_t;
+static constexpr linha_t LINHAS[] = {
+  { L_GRUPO,      0,             N_("CONEXÕES")   },
+  { L_PAGINA,     PAG_WIFI,      nullptr          },
+  { L_PAGINA,     PAG_BLUETOOTH, nullptr          },
+  { L_PAGINA,     PAG_ESPNOW,    nullptr          },
+  { L_PAGINA,     PAG_MESH,      nullptr          },
+  { L_PAGINA,     PAG_MQTT,      nullptr          },
+  { L_GRUPO,      0,             N_("TELA E SOM") },
+  { L_DESLIZANTE, 0,             N_("Brilho")     },
+  { L_DESLIZANTE, 1,             N_("Volume")     },
+  { L_PAGINA,     PAG_TELA,      nullptr          },
+  { L_GRUPO,      0,             N_("SISTEMA")    },
+  { L_PAGINA,     PAG_ENERGIA,   nullptr          },
+  { L_PAGINA,     PAG_HORA,      nullptr          },
+  { L_PAGINA,     PAG_IDIOMA,    nullptr          },
+  { L_PAGINA,     PAG_TECLADO,   nullptr          },
+  { L_PAGINA,     PAG_GROVE,     nullptr          },
+  { L_PAGINA,     PAG_USB,       nullptr          },
+  { L_PAGINA,     PAG_PC,        nullptr          },
+  { L_PAGINA,     PAG_SOBRE,     nullptr          },
+};
+static constexpr int LINHAS_N = sizeof(LINHAS) / sizeof(LINHAS[0]);
+
+// Toda pagina aparece uma vez (esquecer uma na tabela de cima nao compila).
+static constexpr int linhas_de_pagina(void)
+{
+  int n = 0;
+  for (int i = 0; i < LINHAS_N; ++i) { if (LINHAS[i].tipo == L_PAGINA) { ++n; } }
+  return n;
+}
+static_assert(linhas_de_pagina() == PAG_N, "toda pagina_t tem uma linha de pagina em LINHAS");
+
+// A linha da tela inicial que mostra a pagina p (-1 = nenhuma).
+static int linha_da_pagina(int p)
+{
+  for (int i = 0; i < LINHAS_N; ++i) { if (LINHAS[i].tipo == L_PAGINA && LINHAS[i].valor == p) { return i; } }
+  return -1;
+}
+// A linha do deslizante k (0 = brilho, 1 = volume).
+static int linha_do_deslizante(int k)
+{
+  for (int i = 0; i < LINHAS_N; ++i) { if (LINHAS[i].tipo == L_DESLIZANTE && LINHAS[i].valor == k) { return i; } }
+  return -1;
+}
+// A linha e a primeira / a ultima do cartao dela? (o cartao vai de um grupo ao proximo)
+static bool abre_cartao(int i)  { return i == 0 || LINHAS[i - 1].tipo == L_GRUPO; }
+static bool fecha_cartao(int i) { return i + 1 == LINHAS_N || LINHAS[i + 1].tipo == L_GRUPO; }
 
 // ---------------------------------------------------------------------------
 // ESTADO DA TELA
 // ---------------------------------------------------------------------------
-static pintura_t s_p;
+pintura_t s_cfg_p;
 static int       s_pag = PAG_INICIO;
 static lista_t   s_lista;
-static char      s_sub[PAG_N][48];     // a linha de estado de cada item, como desenhada
-static int       s_ub = -1, s_uv = -1; // brilho/volume desenhados
-static char      s_assin[512];         // "assinatura" da pagina aberta: mudou, redesenha
-static char      s_aviso[96];          // recado curto numa pagina ("escolhido para o Mesh")
+static char      s_sub[PAG_N][48];     // a linha de estado de cada PAGINA, como desenhada
+static int       s_ub = -1, s_uv = -1; // brilho/volume desenhados (para perceber mudanca vinda de fora)
+char      s_assin[512];         // "assinatura" da pagina aberta: mudou, redesenha
+char      s_aviso[96];          // recado curto numa pagina ("escolhido para o Mesh")
 
 // Bluetooth: a lista de aparelhos vistos
-static lista_t   s_l_bt;
-static uint32_t  s_bt_ver = 0;
-static int       s_bt_n = 0;
-static tab5_ble_visto_t s_bt[TAB5_BLE_VISTOS];
+lista_t   s_l_bt;
+uint32_t  s_bt_ver = 0;
 
 // Meshtastic: o editor de PIN
-static bool  s_pin_editando = false;
-static char  s_pin_txt[8];
+bool  s_pin_editando = false;
 // O teclado virtual do sistema - um so, para a senha do Wi-Fi e o PIN (nunca
 // abertos ao mesmo tempo: trocar de pagina fecha).
-static tecvirt_t s_kb;
+tecvirt_t s_cfg_kb;
 
 static void abrir_pagina(int p);
+
+// DEITADO: onde a pagina comeca (relativo a area do app; 0 em pe), a rolagem
+// dela e a altura do que ela desenha - medida pelos helpers (s_fim, o fundo
+// em coordenada de tela do ultimo elemento) na passada completa.
+int       s_dx_pag = 0;
+int       s_dy_pag = 0;         // deitado: onde a pagina comeca na vertical (hoje o topo da area, 0)
+rolagem_t s_rol_pag;
+static int       s_pag_h = 0;
+int       s_fim = 0;
+
+// A LISTA DENTRO DE UMA PAGINA (redes, aparelhos), comecando em 'y0'. Em pe a
+// pagina e fixa e a lista rola por dentro; deitado a PAGINA rola inteira (a
+// coluna e baixa demais para botoes e lista juntos), entao a lista entra com
+// a altura de todos os itens e conta no fim da pagina.
+area_t janela_da_lista(const area_t& a, int y0, int n, int item_a)
+{
+  if (!deitado(sistema_area())) { return { a.x, a.y + y0, a.largura, a.altura - y0 }; }
+  const int h = n > 0 ? n * item_a : item_a;
+  fim(a.y + y0 + h);
+  return { a.x, a.y + y0, a.largura, h };
+}
+
+// A area da pagina, em tela: a do app em pe; deitado, a coluna da direita.
+area_t area_pagina(void)
+{
+  area_t a = sistema_area();
+  if (deitado(a)) { a.x += PAG_X; a.largura -= PAG_X; }
+  return a;
+}
 
 // ---------------------------------------------------------------------------
 // TEXTO E BOTOES
 // ---------------------------------------------------------------------------
-static void texto(lgfx::LovyanGFX& d, int x, int y, int px, bool negrito, uint16_t cor,
-                  const char* s, uint8_t datum = top_left)
-{
-  d.setFont(tab5_fonte_suave(negrito, px));
-  d.setTextSize(1);
-  d.setTextDatum(datum);
-  d.setTextColor(cor, TFT_BLACK);
-  d.drawString(s, x, y);
-  d.setTextDatum(top_left);
-  tab5_fonte_corpo(d);
-}
 
 // Paragrafo quebrado na largura - o mesmo quebrador dos baloes de conversa.
-static int paragrafo(lgfx::LovyanGFX& d, int x, int y, int largura, const char* s)
+int paragrafo(lgfx::LovyanGFX& d, int x, int y, int largura, const char* s)
 {
   d.setFont(tab5_fonte_suave(false, 24));
   d.setTextSize(1);
   char linhas[6][CONVERSA_LINHA_BYTES];
   const int n = conversa_quebrar_linhas(d, s, largura, linhas, 6);
   d.setTextDatum(top_left);
-  d.setTextColor(cor_sub(d), TFT_BLACK);
+  d.setTextColor(cor_sub(d), TEMA_FUNDO);
   for (int k = 0; k < n; ++k) { d.drawString(linhas[k], x, y + k * 32); }
   tab5_fonte_corpo(d);
+  fim(y + n * 32);
   return y + n * 32;
 }
 
 
 // Chevron ">" desenhado (a fonte teria outro peso a cada tamanho).
-static void chevron(lgfx::LovyanGFX& d, int cx, int cy, uint16_t cor)
+void chevron(lgfx::LovyanGFX& d, int cx, int cy, uint16_t cor)
 {
   for (int k = 0; k < 3; ++k) {
     d.drawLine(cx - 6 + k, cy - 12, cx + 6 + k, cy, cor);
@@ -187,260 +279,180 @@ static void chevron(lgfx::LovyanGFX& d, int cx, int cy, uint16_t cor)
 // Cabecalho de pagina: VOLTAR e o titulo.
 static void cabecalho(lgfx::LovyanGFX& d, const area_t& a, const char* titulo)
 {
-  tab5_botao(d, a.x + 16, a.y + 16, VOLTAR_L, VOLTAR_A, "< VOLTAR", TFT_SKYBLUE);
-  tab5_titulo(d, 40);
+  // Deitado a lista esta sempre a esquerda: sem VOLTAR, so o titulo.
+  const bool voltar = !deitado(sistema_area());
+  if (voltar) { tab5_botao(d, a.x + 16, a.y + 16, VOLTAR_L, VOLTAR_A, tr("< VOLTAR"), TEMA_DESTAQUE); }
+  tab5_titulo(d, TEMA_LETRA_TITULO);
   d.setTextDatum(middle_left);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString(titulo, a.x + 16 + VOLTAR_L + 28, a.y + 16 + VOLTAR_A / 2);
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+  d.drawString(titulo, a.x + (voltar ? 16 + VOLTAR_L + 28 : MARGEM), a.y + 16 + VOLTAR_A / 2);
   d.setTextDatum(top_left);
   tab5_fonte_corpo(d);
   d.drawFastHLine(a.x, a.y + CONTEUDO_Y - 16, a.largura, cor_linha(d));
 }
 
 // Linha de informacao: rotulo pequeno em cima, valor embaixo. 76 px.
-static int info(lgfx::LovyanGFX& d, const area_t& a, int y, const char* rotulo,
-                const char* valor, uint16_t cor = TFT_WHITE)
+int info(lgfx::LovyanGFX& d, const area_t& a, int y, const char* rotulo,
+         const char* valor, uint16_t cor)
 {
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), rotulo);
-  texto(d, a.x + MARGEM, a.y + y + 28, 32, false, cor, valor);
+  tab5_escrever(d, rotulo, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), TEMA_FUNDO);
+  tab5_escrever(d, valor, a.x + MARGEM, a.y + y + 28, 32, false, cor, TEMA_FUNDO);
+  fim(a.y + y + 84);
   return y + 84;
 }
 
 // Botao da largura da pagina.
-static int botao_largo(lgfx::LovyanGFX& d, const area_t& a, int y, const char* txt, uint16_t cor)
+int botao_largo(lgfx::LovyanGFX& d, const area_t& a, int y, const char* txt, uint16_t cor)
 {
   tab5_botao(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM, BTN_A, txt, cor);
+  fim(a.y + y + BTN_A);
   return y + BTN_A + 20;
 }
 
 // Par - / valor / + (tempo de tela, relogio, canal).
 static const int PM_VALOR_L = 260;
-static void menos_mais(lgfx::LovyanGFX& d, const area_t& a, int y, const char* valor)
+void menos_mais(lgfx::LovyanGFX& d, const area_t& a, int y, const char* valor)
 {
   const int x = a.x + MARGEM;
-  tab5_botao(d, x, a.y + y, PM_L + 40, BTN_A, "-", TFT_ORANGE);
-  texto(d, x + PM_L + 40 + PM_VALOR_L / 2 + 20, a.y + y + BTN_A / 2, 34, true, TFT_WHITE, valor, middle_center);
-  tab5_botao(d, x + PM_L + 40 + PM_VALOR_L + 40, a.y + y, PM_L + 40, BTN_A, "+", TFT_GREENYELLOW);
+  tab5_botao(d, x, a.y + y, PM_L + 40, BTN_A, "-", TEMA_ALERTA);
+  tab5_escrever(d, valor, x + PM_L + 40 + PM_VALOR_L / 2 + 20, a.y + y + BTN_A / 2, 34, true, TEMA_TEXTO, TEMA_FUNDO, middle_center);
+  tab5_botao(d, x + PM_L + 40 + PM_VALOR_L + 40, a.y + y, PM_L + 40, BTN_A, "+", TEMA_SUCESSO);
+  fim(a.y + y + BTN_A);
 }
-static int menos_mais_toque(int tx, int ty, int y)
+int menos_mais_toque(int tx, int ty, int y)
 {
   if (tab5_dentro(tx, ty, MARGEM, y, PM_L + 40, BTN_A)) { return -1; }
   if (tab5_dentro(tx, ty, MARGEM + PM_L + 40 + PM_VALOR_L + 40, y, PM_L + 40, BTN_A)) { return +1; }
   return 0;
 }
 
-// ---------------------------------------------------------------------------
-// ICONES DA LISTA - quadrado colorido com um desenho simples, como qualquer
-// tela de ajustes de celular. Tudo em fracao do lado (l).
-// ---------------------------------------------------------------------------
-static void fundo_icone(lgfx::LovyanGFX& d, int x, int y, int l, uint16_t cor)
+static void est_mqtt(char* o, size_t t)
 {
-  d.fillRoundRect(x, y, l, l, l / 5, cor);
+  snprintf(o, t, "%s", mesh_mqtt_servidor_nome(ajustes_mqtt_servidor()));
 }
 
-static void ic_wifi(lgfx::LovyanGFX& d, int x, int y, int l)
+void fuso_texto(int16_t m, char* o, size_t t)
 {
-  fundo_icone(d, x, y, l, d.color565(30, 120, 230));
-  const int cx = x + l / 2, cy = y + l * 3 / 4;
-  for (int k = 0; k < 3; ++k) {
-    const int r = l * (18 + 12 * k) / 100;
-    d.fillArc(cx, cy, r, r - l / 14, 225, 315, TFT_WHITE);
-  }
-  d.fillCircle(cx, cy - 1, l / 14, TFT_WHITE);
+  snprintf(o, t, "UTC%c%d:%02d", m < 0 ? '-' : '+', abs(m) / 60, abs(m) % 60);
 }
 
-static void ic_bt(lgfx::LovyanGFX& d, int x, int y, int l)
+static void est_hora(char* o, size_t t)
 {
-  fundo_icone(d, x, y, l, d.color565(20, 80, 200));
-  const int cx = x + l / 2, t = y + l / 6, b = y + l * 5 / 6, m = y + l / 2;
-  const int dx = l / 5, q = (b - t) / 4;
-  for (int k = -1; k <= 1; ++k) {
-    d.drawLine(cx + k, t, cx + k, b, TFT_WHITE);
-    d.drawLine(cx + k, t, cx + dx + k, t + q, TFT_WHITE);
-    d.drawLine(cx + dx + k, t + q, cx - dx + k, m + q, TFT_WHITE);
-    d.drawLine(cx + k, b, cx + dx + k, b - q, TFT_WHITE);
-    d.drawLine(cx + dx + k, b - q, cx - dx + k, m - q, TFT_WHITE);
-  }
+  char f[16];
+  fuso_texto(ajustes_fuso_min(), f, sizeof(f));
+  const uint32_t e = tab5_hora_epoch();
+  if (!e) { snprintf(o, t, tr("Fuso %s  ·  relógio sem acerto"), f); return; }
+  struct tm tm_;
+  tab5_hora_local(e, &tm_);
+  snprintf(o, t, tr("%02d:%02d  ·  fuso %s"), tm_.tm_hour, tm_.tm_min, f);
 }
 
-static void ic_espnow(lgfx::LovyanGFX& d, int x, int y, int l)
+static void est_idioma(char* o, size_t t)
 {
-  fundo_icone(d, x, y, l, d.color565(0, 150, 110));
-  const int cy = y + l / 2;
-  d.fillCircle(x + l / 4, cy, l / 9, TFT_WHITE);
-  d.fillCircle(x + l * 3 / 4, cy, l / 9, TFT_WHITE);
-  for (int k = 0; k < 3; ++k) {
-    d.fillCircle(x + l * (38 + 12 * k) / 100, cy, l / 28, TFT_WHITE);
-  }
+  snprintf(o, t, "%s", idioma_nome(idioma_atual()));
 }
 
-static void ic_mesh(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(40, 170, 60));
-  const int ax = x + l / 4, ay = y + l * 3 / 4, bx = x + l / 2, by = y + l / 4;
-  const int cx = x + l * 3 / 4, cy = y + l * 3 / 4;
-  for (int k = -1; k <= 1; ++k) {
-    d.drawLine(ax, ay + k, bx, by + k, TFT_WHITE);
-    d.drawLine(bx, by + k, cx, cy + k, TFT_WHITE);
-    d.drawLine(ax, ay + k, cx, cy + k, TFT_WHITE);
-  }
-  d.fillCircle(ax, ay, l / 10, TFT_WHITE);
-  d.fillCircle(bx, by, l / 10, TFT_WHITE);
-  d.fillCircle(cx, cy, l / 10, TFT_WHITE);
-}
-
-static void ic_tela(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(240, 150, 20));
-  const int cx = x + l / 2, cy = y + l / 2;
-  d.fillCircle(cx, cy, l / 6, TFT_WHITE);
-  for (int k = 0; k < 8; ++k) {
-    const float ang = k * (float)M_PI / 4.0f;
-    const int r0 = l * 26 / 100, r1 = l * 36 / 100;
-    for (int e = -1; e <= 1; ++e) {
-      d.drawLine(cx + (int)(r0 * cosf(ang)) + e, cy + (int)(r0 * sinf(ang)),
-                 cx + (int)(r1 * cosf(ang)) + e, cy + (int)(r1 * sinf(ang)), TFT_WHITE);
-    }
-  }
-}
-
-static void ic_teclado(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(110, 116, 128));
-  const int kx = x + l / 8, ky = y + l * 3 / 10, kl = l * 3 / 4, ka = l * 2 / 5;
-  d.fillRoundRect(kx, ky, kl, ka, 4, TFT_WHITE);
-  const uint16_t tec = d.color565(110, 116, 128);
-  const int t = kl / 7;
-  for (int f = 0; f < 2; ++f) {
-    for (int c = 0; c < 5; ++c) { d.fillRect(kx + t / 2 + c * (t + t / 3), ky + 5 + f * (t + 2), t, t - 2, tec); }
-  }
-  d.fillRect(kx + kl / 4, ky + ka - t / 2 - 5, kl / 2, t / 2, tec);
-}
-
-static void ic_grove(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(150, 70, 200));
-  const int cx = x + l / 2;
-  d.fillRoundRect(cx - l / 5, y + l * 35 / 100, l * 2 / 5, l * 3 / 10, 5, TFT_WHITE);
-  d.fillRect(cx - l / 8, y + l / 6, l / 14, l / 5, TFT_WHITE);
-  d.fillRect(cx + l / 8 - l / 14, y + l / 6, l / 14, l / 5, TFT_WHITE);
-  d.fillRect(cx - l / 20, y + l * 65 / 100, l / 10, l / 6, TFT_WHITE);
-}
-
-// O simbolo do USB: haste, triangulo na ponta, e os dois ramos (bola e
-// quadrado) - o mesmo desenho gravado no plugue.
-static void ic_usb(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(40, 120, 170));
-  const int cx = x + l / 2, topo = y + l / 6, base = y + l * 80 / 100, e = l / 24 + 1;
-  d.fillRect(cx - e / 2, topo + l / 10, e, base - topo - l / 10, TFT_WHITE);
-  d.fillTriangle(cx, topo, cx - l / 10, topo + l / 8, cx + l / 10, topo + l / 8, TFT_WHITE);
-  d.fillCircle(cx, base, l / 14, TFT_WHITE);
-  const int ry = y + l * 45 / 100;
-  d.drawLine(cx, ry + l / 8, cx - l / 5, ry, TFT_WHITE);
-  d.drawLine(cx + 1, ry + l / 8, cx - l / 5 + 1, ry, TFT_WHITE);
-  d.fillCircle(cx - l / 5, ry - l / 22, l / 18, TFT_WHITE);
-  const int ry2 = y + l * 55 / 100;
-  d.drawLine(cx, ry2 + l / 8, cx + l / 5, ry2, TFT_WHITE);
-  d.drawLine(cx - 1, ry2 + l / 8, cx + l / 5 - 1, ry2, TFT_WHITE);
-  d.fillRect(cx + l / 5 - l / 20, ry2 - l / 10, l / 10, l / 10, TFT_WHITE);
-}
-
-static void ic_sobre(lgfx::LovyanGFX& d, int x, int y, int l)
-{
-  fundo_icone(d, x, y, l, d.color565(90, 96, 110));
-  const int cx = x + l / 2;
-  d.fillCircle(cx, y + l * 28 / 100, l / 12, TFT_WHITE);
-  d.fillRoundRect(cx - l / 14, y + l * 42 / 100, l / 7, l * 38 / 100, 3, TFT_WHITE);
-}
-
-// ---------------------------------------------------------------------------
-// LINHA DE ESTADO DE CADA PAGINA (o subtitulo na lista)
-// ---------------------------------------------------------------------------
-static void est_wifi(char* o, size_t t)
+void est_wifi(char* o, size_t t)
 {
   const tab5_wifi_estado_t e = tab5_wifi_estado();
-  if (e == TAB5_WIFI_CONECTADO)           { snprintf(o, t, "Conectado a %s", tab5_wifi_ssid()); }
-  else if (e == TAB5_WIFI_SEM_CREDENCIAL) { snprintf(o, t, "Nenhuma rede guardada"); }
-  else if (e == TAB5_WIFI_C6_MUDO)        { snprintf(o, t, "O C6 não responde"); }
-  else if (e == TAB5_WIFI_FALHOU)         { snprintf(o, t, "Não conectou"); }
-  else if (e == TAB5_WIFI_DESLIGADO)      { snprintf(o, t, ajustes_wifi() ? "Solto do roteador" : "Desligado"); }
-  else                                    { snprintf(o, t, "Conectando..."); }
+  if (e == TAB5_WIFI_CONECTADO)           { snprintf(o, t, tr("Conectado a %s"), tab5_wifi_ssid()); }
+  else if (e == TAB5_WIFI_SEM_CREDENCIAL) { snprintf(o, t, tr("Nenhuma rede guardada")); }
+  else if (e == TAB5_WIFI_C6_MUDO)        { snprintf(o, t, tr("O C6 não responde")); }
+  else if (e == TAB5_WIFI_FALHOU)         { snprintf(o, t, tr("Não conectou")); }
+  else if (e == TAB5_WIFI_DESLIGADO)      { snprintf(o, t, ajustes_wifi() ? tr("Solto do roteador") : tr("Desligado")); }
+  else                                    { snprintf(o, t, tr("Conectando...")); }
 }
 
-static void est_bt(char* o, size_t t)
+void est_bt(char* o, size_t t)
 {
   const tab5_ble_estado_t e = tab5_ble_estado();
-  if (e == TAB5_BLE_PRONTO)       { snprintf(o, t, "Ligado"); }
-  else if (e == TAB5_BLE_SUBINDO) { snprintf(o, t, "Ligando..."); }
+  if (e == TAB5_BLE_PRONTO)       { snprintf(o, t, tr("Ligado")); }
+  else if (e == TAB5_BLE_SUBINDO) { snprintf(o, t, tr("Ligando...")); }
   // C6 com o firmware de fabrica (Wi-Fi funciona, Bluetooth nao): nao e
   // defeito, e uma atualizacao opcional - o texto tem que dizer isso.
   else if (e == TAB5_BLE_FALHOU && tab5_wifi_c6_enlace() && !tab5_wifi_c6_nosso())
-                                  { snprintf(o, t, "Rádio C6 de fábrica: atualização opcional"); }
-  else if (e == TAB5_BLE_FALHOU)  { snprintf(o, t, "Falhou - o C6 não deu o Bluetooth"); }
-  else if (e == TAB5_BLE_DESLIGANDO) { snprintf(o, t, "Desligando..."); }
-  else                            { snprintf(o, t, "Desligado"); }
+                                  { snprintf(o, t, tr("Rádio C6 de fábrica: atualização opcional")); }
+  else if (e == TAB5_BLE_FALHOU)  { snprintf(o, t, tr("Falhou - o C6 não deu o Bluetooth")); }
+  else if (e == TAB5_BLE_DESLIGANDO) { snprintf(o, t, tr("Desligando...")); }
+  else                            { snprintf(o, t, tr("Desligado")); }
 }
 
-static void est_espnow(char* o, size_t t)
+void est_espnow(char* o, size_t t)
 {
   if (!tab5_espnow_c6_compativel()) {
     // Sem enlace ainda nao da para saber qual firmware o C6 tem.
-    snprintf(o, t, tab5_wifi_c6_enlace() ? "Rádio C6 de fábrica: atualização opcional"
-                                         : "Ligue o Wi-Fi");
+    snprintf(o, t, tab5_wifi_c6_enlace() ? tr("Rádio C6 de fábrica: atualização opcional")
+                                         : tr("Ligue o Wi-Fi"));
     return;
   }
   const uint8_t f = tab5_espnow_canal_fixo();
-  if (f) { snprintf(o, t, "Canal fixo %u (sem roteador)", (unsigned)f); }
-  else   { snprintf(o, t, "Canal do roteador (%u)", (unsigned)tab5_espnow_canal()); }
+  if (f) { snprintf(o, t, tr("Canal fixo %u (sem roteador)"), (unsigned)f); }
+  else   { snprintf(o, t, tr("Canal do roteador (%u)"), (unsigned)tab5_espnow_canal()); }
 }
 
 static const char* nome_via_mesh(uint8_t via)
 {
-  return via == AJUSTES_MESH_BLUETOOTH ? "Bluetooth" : via == AJUSTES_MESH_INTERNET ? "Internet" : "Cabo Grove";
+  return via == AJUSTES_MESH_BLUETOOTH ? tr("Bluetooth") : via == AJUSTES_MESH_INTERNET ? tr("Internet") : tr("Cabo Grove");
 }
 
 static void est_mesh(char* o, size_t t)
 {
-  snprintf(o, t, "%s - %s", nome_via_mesh(ajustes_mesh_via()), tab5_mesh_enlace_descricao());
+  snprintf(o, t, "%s - %s", nome_via_mesh(ajustes_mesh_via()), tr(tab5_mesh_enlace_descricao()));
 }
 
 static void est_tela(char* o, size_t t)
 {
-  snprintf(o, t, "Apaga em %u s  ·  painel a %d MHz", (unsigned)ajustes_tela_s(),
+  snprintf(o, t, tr("Apaga em %u s  ·  painel a %d MHz"), (unsigned)ajustes_tela_s(),
            tab5_power_relogio_dpi());
 }
 
-static void est_teclado(char* o, size_t t)
+void est_teclado(char* o, size_t t)
 {
-  if (!ajustes_teclado())            { snprintf(o, t, "Desativado"); }
-  else if (tab5_teclado_presente())  { snprintf(o, t, "Encaixado"); }
-  else                               { snprintf(o, t, "Procurando no ExtPort1..."); }
+  snprintf(o, t, "%s", tab5_teclado_presente() ? tr("Encaixado") : tr("Nenhum no ExtPort1"));
 }
 
 static void est_usb(char* o, size_t t)
 {
   tab5_pendrive_estado_t e;
   tab5_pendrive_estado(&e);
-  if (e.fase == PENDRIVE_ATIVO)           { snprintf(o, t, "Cartão no computador"); }
-  else if (e.fase != PENDRIVE_PARADO)     { snprintf(o, t, "Pendrive: aguarde..."); }
-  else if (e.oferta)                      { snprintf(o, t, "Computador conectado"); }
-  else if (ajustes_pendrive())            { snprintf(o, t, "Liga sozinho no computador"); }
-  else                                    { snprintf(o, t, "Pendrive desligado"); }
+  if (e.fase == PENDRIVE_ATIVO)           { snprintf(o, t, tr("Cartão no computador")); }
+  else if (e.fase != PENDRIVE_PARADO)     { snprintf(o, t, tr("Pendrive: aguarde...")); }
+  else if (e.oferta)                      { snprintf(o, t, tr("Computador conectado")); }
+  else if (ajustes_pendrive())            { snprintf(o, t, tr("Liga sozinho no computador")); }
+  else                                    { snprintf(o, t, tr("Pendrive desligado")); }
 }
 
-static void est_grove(char* o, size_t t)
+static void est_pc(char* o, size_t t)
+{
+  const char* abertos[WEB_PARTES_MAX];
+  const int n = tab5_web_abertos(abertos, WEB_PARTES_MAX);
+  if (!n) { snprintf(o, t, "%s", tr("Desligado")); return; }
+  snprintf(o, t, n == 1 ? tr("%d app aberto no PC") : tr("%d apps abertos no PC"), n);
+}
+
+void est_grove(char* o, size_t t)
 {
   const int dono = (int)tab5_grove_dono();
-  if (sistema_grove_sondando())                 { snprintf(o, t, "Sondando o cabo..."); }
-  else if (dono != (int)GROVE_DONO_NINGUEM)     { snprintf(o, t, "Em uso: %s", grove_dono_nome((grove_dono_t)dono)); }
-  else if (ajustes_grove())                     { snprintf(o, t, "Ligado - %s", grove_nome(tab5_grove_tipo())); }
-  else                                          { snprintf(o, t, "Desligado"); }
+  if (sistema_grove_sondando())                 { snprintf(o, t, tr("Sondando o cabo...")); }
+  else if (dono != (int)GROVE_DONO_NINGUEM)     { snprintf(o, t, tr("Em uso: %s"), tr(grove_dono_nome((grove_dono_t)dono))); }
+  else if (ajustes_grove())                     { snprintf(o, t, tr("Ligado - %s"), tr(grove_nome(tab5_grove_tipo()))); }
+  else                                          { snprintf(o, t, tr("Desligado")); }
 }
 
-// O carimbo do build inteiro (main/carimbo.cmake), e nao o __DATE__ deste
-// arquivo - que so mudava quando ESTE arquivo recompilava.
-extern "C" const char* const m5tabos_compilado;
+// ENERGIA MORA AQUI: a linha mostra a bateria agora e abre o app Energia
+// (os graficos pedem a tela inteira), que nao tem mais icone na home.
+const app_t* app_energia(void)
+{
+  for (int i = 0; i < SISTEMA_NUM_APPS; ++i) { if (!strcmp(SISTEMA_APPS[i]->nome, "Energia")) { return SISTEMA_APPS[i]; } }
+  return nullptr;
+}
+
+static void est_energia(char* o, size_t t)
+{
+  const tab5_medida_t m = tab5_power_ultima();
+  if (m.pct < 0) { snprintf(o, t, tr("Bateria e consumo")); return; }
+  snprintf(o, t, m.mA >= 0 ? tr("%d%% - carregando") : tr("%d%% - gastando %.0f mA"), m.pct, (double)-m.mA);
+}
 
 static void est_sobre(char* o, size_t t)
 {
@@ -448,137 +460,134 @@ static void est_sobre(char* o, size_t t)
 }
 
 // ---------------------------------------------------------------------------
-// INICIO: BRILHO, VOLUME e a lista
+// INICIO: a lista de grupos (com BRILHO e VOLUME)
 // ---------------------------------------------------------------------------
-static int barra_x(const area_t& a) { return a.x + MARGEM + PM_L + 16; }
-static int barra_l(const area_t& a) { return a.largura - 2 * MARGEM - 2 * (PM_L + 16); }
-
 // BRILHO NA ESCALA DO OLHO. O valor do PWM e linear na luz, mas o olho nao:
 // 4% de duty ja parece "um quarto do brilho". Com a barra linear quase todo o
 // curso ficava no claro e o primeiro degrau (10 -> 25) pulava de 4% para 10%.
 // A barra anda numa posicao 0..1000 e o PWM sai dela pela curva gama 2,2 - a
 // metade de baixo da barra cobre de 0,9% a ~22%, em degraus finos.
-#define BRILHO_POS_MAX 1000
-static int brilho_para_pos(int b)
-{
-  const float f = (float)(b - AJUSTES_BRILHO_MIN) / (float)(AJUSTES_BRILHO_MAX - AJUSTES_BRILHO_MIN);
-  return (int)(powf(f < 0 ? 0 : f, 1.0f / 2.2f) * BRILHO_POS_MAX + 0.5f);
-}
-static int pos_para_brilho(int pos)
-{
-  const float f = (float)pos / (float)BRILHO_POS_MAX;
-  return AJUSTES_BRILHO_MIN + (int)(powf(f, 2.2f) * (AJUSTES_BRILHO_MAX - AJUSTES_BRILHO_MIN) + 0.5f);
-}
+#define BRILHO_POS_MAX AJUSTES_BRILHO_POS_MAX   // a curva mora em services/ajustes.cpp
+static int brilho_para_pos(int b) { return ajustes_brilho_para_pos(b); }
+static int pos_para_brilho(int pos) { return ajustes_pos_para_brilho(pos); }
 
-static void desenhar_rapido(lgfx::LovyanGFX& d, const area_t& a, int y0, const char* nome,
-                            int valor, int minimo, int maximo, bool tudo, int anterior)
+// A altura de cada linha depende do tipo (o toque usa a mesma conta, via a lista).
+static int item_altura(int i, void*)
 {
-  const int x = a.x + MARGEM;
-  const int pct = ((valor - minimo) * 100) / (maximo - minimo);
-  char buf[16];
-  if (tudo) {
-    texto(d, x, a.y + y0, ROTULO_PX, true, TFT_WHITE, nome);
-    tab5_botao(d, x, a.y + y0 + 44, PM_L, CTRL_A, "-", TFT_ORANGE);
-    tab5_botao(d, a.x + a.largura - MARGEM - PM_L, a.y + y0 + 44, PM_L, CTRL_A, "+", TFT_GREENYELLOW);
-  }
-  // Valor a direita do rotulo (apaga o anterior: largura variavel)
-  d.fillRect(a.x + a.largura - MARGEM - 160, a.y + y0, 160, 40, TFT_BLACK);
-  snprintf(buf, sizeof(buf), "%d%%", pct);
-  texto(d, a.x + a.largura - MARGEM, a.y + y0, ROTULO_PX, false, TFT_LIGHTGREY, buf, top_right);
-
-  // Barra: moldura so na passada completa; o preenchimento so no que mudou.
-  const int bx = barra_x(a), bl = barra_l(a), by = a.y + y0 + 44;
-  const int dentro_l = bl - 8;
-  const int cheio = ((valor - minimo) * dentro_l) / (maximo - minimo);
-  const int antes = (tudo || anterior < 0) ? -1 : ((anterior - minimo) * dentro_l) / (maximo - minimo);
-  if (tudo) {
-    d.fillRoundRect(bx, by, bl, CTRL_A, CTRL_A / 2, d.color565(34, 38, 46));
-  }
-  if (antes < 0) {
-    d.fillRoundRect(bx + 4, by + 4, dentro_l, CTRL_A - 8, (CTRL_A - 8) / 2, d.color565(34, 38, 46));
-    if (cheio > 0) { d.fillRoundRect(bx + 4, by + 4, cheio < CTRL_A - 8 ? CTRL_A - 8 : cheio, CTRL_A - 8, (CTRL_A - 8) / 2, TFT_SKYBLUE); }
-  } else if (cheio != antes) {
-    // Redesenha a barra inteira por dentro - os cantos redondos nao deixam
-    // pintar so a diferenca sem sobrar serrilhado.
-    d.fillRoundRect(bx + 4, by + 4, dentro_l, CTRL_A - 8, (CTRL_A - 8) / 2, d.color565(34, 38, 46));
-    if (cheio > 0) { d.fillRoundRect(bx + 4, by + 4, cheio < CTRL_A - 8 ? CTRL_A - 8 : cheio, CTRL_A - 8, (CTRL_A - 8) / 2, TFT_SKYBLUE); }
-  }
+  if (i < 0 || i >= LINHAS_N) { return ITEM_A; }
+  return LINHAS[i].tipo == L_GRUPO ? GRUPO_A : LINHAS[i].tipo == L_DESLIZANTE ? DESL_A : ITEM_A;
 }
 
-static int item_altura(int, void*) { return ITEM_A; }
+// A largura que a lista deu ao ultimo item desenhado (ela desconta a barra de
+// rolagem): o toque no trilho usa a mesma, para cair exatamente onde foi pintado.
+static int s_larg_item = 0;
 
-static void item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void*)
+// O CARTAO da maquete: cada sequencia de linhas entre dois grupos e UM cartao
+// TEMA_SUPERFICIE recuado das bordas, com os cantos redondos so no topo da
+// primeira linha e na base da ultima. Fora do cartao e o fundo.
+static void cartao_fundo(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, int h, uint16_t cor)
 {
-  if (i < 0 || i >= PAG_N) { return; }
-  d.fillRect(x0, y, largura, ITEM_A, TFT_BLACK);
+  d.fillRect(x0, y, largura, h, TEMA_FUNDO);
+  const int cx0 = x0 + TEMA_ESPACO_3, cl = largura - 2 * TEMA_ESPACO_3;
+  const bool topo = abre_cartao(i), base = fecha_cartao(i);
+  if (!topo && !base) { d.fillRect(cx0, y, cl, h, cor); return; }
+  d.fillRoundRect(cx0, y, cl, h, TEMA_RAIO_G, cor);
+  // O que nao deve ser redondo e reto: a metade de baixo se so o topo arredonda,
+  // a de cima se so a base arredonda.
+  if (topo && !base) { d.fillRect(cx0, y + h / 2, cl, h - h / 2, cor); }
+  if (!topo && base) { d.fillRect(cx0, y, cl, h / 2, cor); }
+}
+
+// O trilho do deslizante (x e largura) dentro de uma linha de largura 'largura'
+// que comeca em x0: a bolinha nas pontas ainda cabe dentro do cartao.
+static void trilho_geo(int x0, int largura, int* tx, int* tl)
+{
+  *tx = x0 + MARGEM + BOTAO_R;
+  *tl = largura - 2 * (MARGEM + BOTAO_R);
+}
+
+// Posicao, minimo e maximo do deslizante k (0 = brilho, na escala perceptual; 1 = volume).
+static void deslizante_valores(int k, int* valor, int* minimo, int* maximo)
+{
+  if (k == 0) { *valor = brilho_para_pos(ajustes_brilho()); *minimo = 0;                  *maximo = BRILHO_POS_MAX; }
+  else        { *valor = ajustes_volume();                  *minimo = AJUSTES_VOLUME_MIN; *maximo = AJUSTES_VOLUME_MAX; }
+}
+
+static void linha_grupo(lgfx::LovyanGFX& d, int i, int x0, int y, int largura)
+{
+  d.fillRect(x0, y, largura, GRUPO_A, TEMA_FUNDO);
+  // Recuo do cartao + 8, colado embaixo (perto do cartao a que pertence).
+  tab5_escrever(d, tr(LINHAS[i].rotulo), x0 + TEMA_ESPACO_3 + TEMA_ESPACO_2, y + GRUPO_A - TEMA_ESPACO_2,
+                TEMA_LETRA_LEGENDA, true, TEMA_TEXTO_2, TEMA_FUNDO, bottom_left);
+}
+
+static void linha_pagina(lgfx::LovyanGFX& d, int i, int x0, int y, int largura)
+{
+  const int p = LINHAS[i].valor;
+  const int cx0 = x0 + TEMA_ESPACO_3, cl = largura - 2 * TEMA_ESPACO_3;
+  const bool escolhida = deitado(sistema_area()) && p == s_pag;
+  const uint16_t cor_cartao = escolhida ? TEMA_DESTAQUE_SUAVE : TEMA_SUPERFICIE;
+  cartao_fundo(d, i, x0, y, largura, ITEM_A, cor_cartao);
   const int ix = x0 + MARGEM, iy = y + (ITEM_A - ICONE_L) / 2;
-  PAGINAS[i].icone(d, ix, iy, ICONE_L);
+  PAGINAS[p].icone(d, ix, iy, ICONE_L);
   const int tx = ix + ICONE_L + 24;
-  texto(d, tx, y + 18, 32, true, TFT_WHITE, PAGINAS[i].nome);
+  tab5_escrever(d, tr(PAGINAS[p].nome), tx, y + 14, TEMA_LETRA_SUBTITULO, true, TEMA_TEXTO, cor_cartao);
   // Estado cortado MEDINDO, para nao passar por baixo do chevron.
   char sub[48];
-  snprintf(sub, sizeof(sub), "%s", s_sub[i]);
-  d.setFont(tab5_fonte_suave(false, 24));
+  snprintf(sub, sizeof(sub), "%s", s_sub[p]);
+  d.setFont(tab5_fonte_suave(false, TEMA_LETRA_CORPO));
   const int max_l = x0 + largura - MARGEM - 40 - tx;
   tab5_cortar_ao_caber(d, sub, max_l);
   tab5_fonte_corpo(d);
-  texto(d, tx, y + 60, 24, false, cor_sub(d), sub);
-  chevron(d, x0 + largura - MARGEM - 12, y + ITEM_A / 2, cor_sub(d));
-  if (i + 1 < PAG_N) { d.drawFastHLine(tx, y + ITEM_A - 1, x0 + largura - tx, cor_linha(d)); }
-}
-
-static void desenhar_inicio(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  const int b = ajustes_brilho(), v = ajustes_volume();
-  const int b_ant = s_ub, v_ant = s_uv;
-  if (pintura_mudou_i(&s_p, &s_ub, b) || tudo) {
-    desenhar_rapido(d, a, RAPIDO_Y0, "Brilho", brilho_para_pos(b), 0, BRILHO_POS_MAX, tudo,
-                    b_ant < 0 ? -1 : brilho_para_pos(b_ant));
-  }
-  if (pintura_mudou_i(&s_p, &s_uv, v) || tudo) {
-    desenhar_rapido(d, a, RAPIDO_Y0 + RAPIDO_A, "Volume", v, AJUSTES_VOLUME_MIN, AJUSTES_VOLUME_MAX, tudo, v_ant);
-  }
-  if (tudo) { d.drawFastHLine(a.x, a.y + DIVISOR_Y, a.largura, cor_linha(d)); }
-
-  // Estado de cada pagina: so o item cujo texto mudou e redesenhado.
-  for (int i = 0; i < PAG_N; ++i) {
-    char agora[48];
-    PAGINAS[i].estado(agora, sizeof(agora));
-    if (strcmp(agora, s_sub[i]) != 0) {
-      snprintf(s_sub[i], sizeof(s_sub[i]), "%s", agora);
-      lista_item_mudou(&s_lista, i);
-    }
-  }
-  const area_t janela = { a.x, a.y + LISTA_Y0, a.largura, a.altura - LISTA_Y0 };
-  lista_desenhar(&s_lista, d, janela, TFT_BLACK, tudo);
-}
-
-static void mexer_rapido(int y0, int tx, int ty, bool so_barra)
-{
-  const area_t a = sistema_area();
-  const bool brilho = (y0 == RAPIDO_Y0);
-  // O brilho anda na posicao perceptual (ver brilho_para_pos).
-  const int minimo = brilho ? 0 : AJUSTES_VOLUME_MIN;
-  const int maximo = brilho ? BRILHO_POS_MAX : AJUSTES_VOLUME_MAX;
-  const int atual  = brilho ? brilho_para_pos(ajustes_brilho()) : ajustes_volume();
-  const int passo  = brilho ? PASSO_BRILHO : PASSO_VOLUME;
-  const int cy = y0 + 44;
-  int novo = atual;
-  const int bx = barra_x(a) - a.x, bl = barra_l(a);
-  if (tab5_dentro(tx, ty, bx - 8, cy, bl + 16, CTRL_A)) {
-    int rel = tx - bx; if (rel < 0) { rel = 0; } if (rel > bl) { rel = bl; }
-    novo = minimo + (rel * (maximo - minimo)) / bl;
-  } else if (so_barra) {
-    return;
-  } else if (tab5_dentro(tx, ty, MARGEM, cy, PM_L, CTRL_A)) {
-    novo = atual - passo;
-  } else if (tab5_dentro(tx, ty, a.largura - MARGEM - PM_L, cy, PM_L, CTRL_A)) {
-    novo = atual + passo;
+  tab5_escrever(d, sub, tx, y + 54, TEMA_LETRA_CORPO, false, TEMA_TEXTO_2, cor_cartao);
+  if (deitado(sistema_area())) {
+    // Deitado nao ha para onde ir (a pagina ja esta ao lado): no lugar do
+    // chevron, a marca do item aberto.
+    d.fillRect(cx0, y + 12, 6, ITEM_A - 24, p == s_pag ? TEMA_DESTAQUE : cor_cartao);
   } else {
-    return;
+    chevron(d, x0 + largura - MARGEM - 12, y + ITEM_A / 2, TEMA_TEXTO_3);
   }
-  if (novo < minimo) { novo = minimo; }
-  if (novo > maximo) { novo = maximo; }
+  // Divisoria entre linhas do MESMO cartao (nao depois da ultima).
+  if (!fecha_cartao(i)) { d.drawFastHLine(tx, y + ITEM_A - 1, cx0 + cl - tx, TEMA_LINHA); }
+}
+
+// Deslizante dentro do cartao: em cima o nome (esquerda) e o "NN%" (direita);
+// embaixo o trilho com a bolinha.
+static void linha_deslizante(lgfx::LovyanGFX& d, int i, int x0, int y, int largura)
+{
+  const int k = LINHAS[i].valor;
+  int valor, minimo, maximo;
+  deslizante_valores(k, &valor, &minimo, &maximo);
+  const int pct = ((valor - minimo) * 100) / (maximo - minimo);
+  cartao_fundo(d, i, x0, y, largura, DESL_A, TEMA_SUPERFICIE);
+  tab5_escrever(d, tr(LINHAS[i].rotulo), x0 + MARGEM, y + 14, TEMA_LETRA_CORPO, false, TEMA_TEXTO, TEMA_SUPERFICIE);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  tab5_escrever(d, buf, x0 + largura - MARGEM, y + 14, TEMA_LETRA_CORPO, false, TEMA_TEXTO_2, TEMA_SUPERFICIE, top_right);
+  int tx, tl;
+  trilho_geo(x0, largura, &tx, &tl);
+  const int cy = y + 70;
+  const int pos = ((valor - minimo) * tl) / (maximo - minimo);
+  d.fillRoundRect(tx, cy - TRILHO_A / 2, tl, TRILHO_A, TRILHO_A / 2, TEMA_SUPERFICIE_ALTA);
+  if (pos > 0) { d.fillRoundRect(tx, cy - TRILHO_A / 2, pos, TRILHO_A, TRILHO_A / 2, TEMA_DESTAQUE); }
+  d.fillCircle(tx + pos, cy, BOTAO_R, TEMA_SOBRE_DESTAQUE);
+  if (!fecha_cartao(i)) { d.drawFastHLine(x0 + MARGEM, y + DESL_A - 1, largura - 2 * MARGEM, TEMA_LINHA); }
+}
+
+static void item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void*)
+{
+  if (i < 0 || i >= LINHAS_N) { return; }
+  s_larg_item = largura;
+  switch (LINHAS[i].tipo) {
+    case L_GRUPO:      linha_grupo(d, i, x0, y, largura); break;
+    case L_PAGINA:     linha_pagina(d, i, x0, y, largura); break;
+    case L_DESLIZANTE: linha_deslizante(d, i, x0, y, largura); break;
+  }
+}
+
+// Aplica o valor novo do brilho (na posicao perceptual) ou do volume.
+static void aplicar_rapido(bool brilho, int novo, int atual, bool beep)
+{
   if (novo == atual) { return; }
   if (brilho) {
     int b = pos_para_brilho(novo);
@@ -593,9 +602,69 @@ static void mexer_rapido(int y0, int tx, int ty, bool so_barra)
   }
   else {
     ajustes_definir_volume((uint8_t)novo);
-    if (!so_barra) { sistema_beep(880.0f, 80); }   // ouvir o volume novo
+    if (beep) { sistema_beep(880.0f, 80); }   // ouvir o volume novo
   }
   sistema_pedir_redesenho();
+}
+
+// ---- OS DESLIZANTES (0 = brilho, 1 = volume), linhas da lista ----
+// O TOQUE CHEGA RELATIVO A AREA do app (0,0 = canto dela): o trilho e medido
+// com x0 = 0 e a mesma largura com que a lista desenhou a linha.
+
+// O dedo DESCEU numa linha de deslizante, na faixa do trilho (com folga nas
+// pontas; na vertical vale a linha toda)? Qual (0/1), ou -1.
+static int deslizante_sob(int tx, int ty)
+{
+  int dy = 0;
+  const int i = lista_item_em(&s_lista, tx, ty, &dy);
+  if (i < 0 || LINHAS[i].tipo != L_DESLIZANTE) { return -1; }
+  int t0, tl;
+  trilho_geo(0, s_larg_item, &t0, &tl);
+  if (tx >= t0 - BOTAO_R - TOQUE_EXTRA && tx <= t0 + tl + BOTAO_R + TOQUE_EXTRA) { return LINHAS[i].valor; }
+  return -1;
+}
+
+// Toque ou arraste: o valor sai da posicao do dedo ao longo do trilho.
+static void mexer_deslizante(int k, int tx)
+{
+  int t0, tl;
+  trilho_geo(0, s_larg_item, &t0, &tl);
+  if (tl <= 0) { return; }
+  int atual, minimo, maximo;
+  deslizante_valores(k, &atual, &minimo, &maximo);
+  int rel = tx - t0;
+  if (rel < 0) { rel = 0; }
+  if (rel > tl) { rel = tl; }
+  aplicar_rapido(k == 0, minimo + (rel * (maximo - minimo)) / tl, atual, false);
+}
+
+// Qual deslizante o dedo agarrou (-1 = nenhum) e se o dedo ja estava embaixo
+// na amostra anterior: so a DESCIDA sobre o trilho agarra o controle, e dai ate
+// soltar a lista nao rola.
+static int  s_desl_preso = -1;
+static bool s_dedo_antes = false;
+
+// Estado de cada linha: so a que mudou de texto ou de valor e redesenhada.
+static void atualizar_estados(void)
+{
+  for (int i = 0; i < PAG_N; ++i) {
+    char agora[48];
+    PAGINAS[i].estado(agora, sizeof(agora));
+    if (strcmp(agora, s_sub[i]) != 0) {
+      snprintf(s_sub[i], sizeof(s_sub[i]), "%s", agora);
+      lista_item_mudou(&s_lista, linha_da_pagina(i));
+    }
+  }
+  // Brilho e volume tambem mudam por fora (barra de cima, teclas): so a linha deles repinta.
+  if (pintura_mudou_i(&s_cfg_p, &s_ub, ajustes_brilho())) { lista_item_mudou(&s_lista, linha_do_deslizante(0)); }
+  if (pintura_mudou_i(&s_cfg_p, &s_uv, ajustes_volume())) { lista_item_mudou(&s_lista, linha_do_deslizante(1)); }
+}
+
+// Em pe: a lista ocupa a area toda.
+static void desenhar_inicio(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
+{
+  atualizar_estados();
+  lista_desenhar(&s_lista, d, a, TEMA_FUNDO, tudo);
 }
 
 // ---------------------------------------------------------------------------
@@ -603,1010 +672,25 @@ static void mexer_rapido(int y0, int tx, int ty, bool so_barra)
 // ---------------------------------------------------------------------------
 // Cada pagina: desenhar(tudo) e tocar(x,y). A pagina redesenha o conteudo
 // inteiro quando a ASSINATURA (os valores que ela mostra) muda - e so entao.
-static void conteudo_limpo(lgfx::LovyanGFX& d, const area_t& a)
+void conteudo_limpo(lgfx::LovyanGFX& d, const area_t& a)
 {
-  tab5_tela_limpar(a.x, a.y + CONTEUDO_Y, a.largura, a.altura - CONTEUDO_Y, TFT_BLACK);
-}
-
-// ---- Wi-Fi -----------------------------------------------------------------
-// Estado, ligar/desligar, procurar, e a LISTA de redes em volta. Tocar numa
-// rede conhecida conecta; numa nova, pede a senha (teclado da tela ou do
-// ExtPort1), guarda cifrada no cartao e conecta. Tocar duas vezes na rede em
-// uso a esquece.
-static const int WF_ITEM_A = 92;
-static lista_t   s_l_wifi;
-static uint32_t  s_wf_ver = 0;
-static int       s_wf_n = 0;
-static tab5_wifi_visto_t s_wf[TAB5_WIFI_MAX_VISTAS];
-static bool      s_wf_senha = false;          // editando a senha de s_wf_alvo
-static char      s_wf_alvo[33];
-static char      s_wf_txt[65];
-static char      s_wf_campo[70];          // o que esta pintado no campo da senha
-static char      s_wf_esquecer[33];           // 1o toque na rede em uso
-static uint32_t  s_wf_esquecer_ms = 0;
-
-static int wf_y_lista(void) { return CONTEUDO_Y + 84 + (BTN_A + 20) * 2 + 44; }
-
-static bool wf_em_uso(const char* ssid)
-{
-  return tab5_wifi_estado() == TAB5_WIFI_CONECTADO && strcmp(tab5_wifi_ssid(), ssid) == 0;
-}
-
-static int wf_item_altura(int, void*) { return WF_ITEM_A; }
-static void wf_item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void*)
-{
-  if (i < 0 || i >= s_wf_n) { return; }
-  const tab5_wifi_visto_t& v = s_wf[i];
-  d.fillRect(x0, y, largura, WF_ITEM_A, TFT_BLACK);
-  const bool uso = wf_em_uso(v.ssid);
-  // Sinal em 4 barras, a esquerda.
-  const int nb = v.rssi > -55 ? 4 : v.rssi > -65 ? 3 : v.rssi > -75 ? 2 : 1;
-  for (int b = 0; b < 4; ++b) {
-    const int h = 8 + b * 8;
-    d.fillRect(x0 + MARGEM + b * 10, y + 56 - h, 7, h, b < nb ? (uso ? TFT_GREENYELLOW : TFT_WHITE) : cor_linha(d));
-  }
-  const int tx = x0 + MARGEM + 56;
-  texto(d, tx, y + 12, 30, true, uso ? TFT_GREENYELLOW : TFT_WHITE, v.ssid);
-  char linha[80], dist[12];
-  tab5_sinal_distancia_txt(v.rssi, TAB5_SINAL_P1M_WIFI, dist, sizeof(dist));
-  snprintf(linha, sizeof(linha), "%s%s%d dBm %s  ·  canal %u  ·  %s", uso ? "conectada  ·  " : "",
-           (!uso && v.conhecida) ? "conhecida  ·  " : "", (int)v.rssi, dist, (unsigned)v.canal,
-           v.aberta ? "aberta" : "com senha");
-  texto(d, tx, y + 52, 22, false, cor_sub(d), linha);
-  d.drawFastHLine(tx, y + WF_ITEM_A - 1, x0 + largura - tx, cor_linha(d));
-}
-
-static void wf_recarregar(void)
-{
-  const int n = tab5_wifi_n_vistas();
-  int k = 0;
-  for (int i = 0; i < n && k < TAB5_WIFI_MAX_VISTAS; ++i) { if (tab5_wifi_vista(i, &s_wf[k])) { ++k; } }
-  s_wf_n = k;
-  lista_itens_mudaram(&s_l_wifi, s_wf_n);
-}
-
-static void pag_wifi(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char sub[48], assin[160];
-  est_wifi(sub, sizeof(sub));
-  const bool con = tab5_wifi_estado() == TAB5_WIFI_CONECTADO;
-  const uint32_t ver = tab5_wifi_redes_versao();
-  if (ver != s_wf_ver) { s_wf_ver = ver; wf_recarregar(); }
-  char det[48];
-  const int r = tab5_wifi_rssi();
-  if (con && r != TAB5_WIFI_RSSI_DESCONHECIDO) { snprintf(det, sizeof(det), "%s  ·  %d dBm", tab5_wifi_ip(), r); }
-  else if (con)                                { snprintf(det, sizeof(det), "%s", tab5_wifi_ip()); }
-  else                                         { snprintf(det, sizeof(det), "%d rede(s) conhecida(s)", tab5_wifi_n_conhecidas()); }
-  // O texto digitado NAO entra na assinatura: cada letra repintava a pagina
-  // inteira e o teclado junto. Agora a letra repinta so o campo.
-  snprintf(assin, sizeof(assin), "%s|%s|%d|%d|%d|%s|%d", sub, det, (int)ajustes_wifi(), (int)tab5_wifi_procurando(),
-           s_wf_n, s_aviso, (int)s_wf_senha);
-  const bool mudou = pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) || tudo;
-  if (s_wf_senha) {
-    const int y_campo = CONTEUDO_Y + 36;
-    tecvirt_posicionar(&s_kb, a);
-    if (mudou) {
-      lista_esconder(&s_l_wifi);
-      conteudo_limpo(d, a);
-      char rot[64];
-      snprintf(rot, sizeof(rot), "Senha de \"%s\"", s_wf_alvo);
-      texto(d, a.x + MARGEM, a.y + CONTEUDO_Y, 24, false, cor_sub(d), rot);
-      paragrafo(d, a.x + MARGEM, a.y + y_campo + 92, a.largura - 2 * MARGEM,
-                "Toque ENVIAR para guardar e conectar. A senha fica cifrada no cartão. X cancela.");
-    }
-    char campo[70];
-    snprintf(campo, sizeof(campo), "%s_", s_wf_txt);
-    if (pintura_mudou_s(&s_p, s_wf_campo, sizeof(s_wf_campo), campo) || mudou) {
-      d.fillRoundRect(a.x + MARGEM, a.y + y_campo, a.largura - 2 * MARGEM, 72, 12, d.color565(40, 44, 54));
-      d.setFont(tab5_fonte_suave(false, 34));
-      d.setTextSize(1);
-      d.setTextDatum(middle_left);
-      d.setTextColor(TFT_WHITE, d.color565(40, 44, 54));
-      d.drawString(campo, a.x + MARGEM + 16, a.y + y_campo + 36);
-      d.setTextDatum(top_left);
-      tab5_fonte_corpo(d);
-    }
-    tecvirt_pintar(&s_kb, d, mudou);
-    return;
-  }
-  if (mudou) {
-    conteudo_limpo(d, a);
-    int y = CONTEUDO_Y;
-    texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Estado");
-    texto(d, a.x + MARGEM, a.y + y + 28, 32, false, con ? TFT_GREENYELLOW : TFT_WHITE, sub);
-    texto(d, a.x + a.largura - MARGEM, a.y + y + 34, 22, false, cor_sub(d), det, top_right);
-    y += 84;
-    y = botao_largo(d, a, y, ajustes_wifi() ? "DESLIGAR O WI-FI" : "LIGAR O WI-FI",
-                    ajustes_wifi() ? TFT_ORANGE : TFT_GREENYELLOW);
-    y = botao_largo(d, a, y, tab5_wifi_procurando() ? "PROCURANDO..." : "PROCURAR REDES",
-                    tab5_wifi_procurando() ? TFT_DARKGREY : TFT_SKYBLUE);
-    texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d),
-          s_aviso[0] ? s_aviso : (s_wf_n ? "Toque numa rede para conectar" : "Toque PROCURAR REDES"));
-  }
-  const area_t janela = { a.x, a.y + wf_y_lista(), a.largura, a.altura - wf_y_lista() };
-  lista_desenhar(&s_l_wifi, d, janela, TFT_BLACK, mudou);
-}
-
-// Gravar no cartao e conectar: no worker (o cartao demora), com a senha
-// numa copia propria que o trabalho apaga ao terminar.
-typedef struct { char ssid[33]; char senha[65]; bool esquecer; } wf_pedido_t;
-
-static void wf_trabalho(void* arg)
-{
-  wf_pedido_t* p = (wf_pedido_t*)arg;
-  // A gravacao monta o cartao sozinha (e, com ele emprestado ao computador,
-  // vai para o diario - a rede nova nao se perde).
-  if (p->esquecer) { tab5_wifi_esquecer(p->ssid); }
-  else             { tab5_wifi_gravar_credenciais(p->ssid, p->senha[0] ? p->senha : "-"); }
-  if (!p->esquecer) { tab5_wifi_conectar(p->ssid); }
-  memset(p, 0, sizeof(*p));
-  free(p);
-}
-
-static void wf_pedir(const char* ssid, const char* senha, bool esquecer)
-{
-  wf_pedido_t* p = (wf_pedido_t*)calloc(1, sizeof(wf_pedido_t));
-  if (!p) { return; }
-  snprintf(p->ssid, sizeof(p->ssid), "%s", ssid);
-  snprintf(p->senha, sizeof(p->senha), "%s", senha ? senha : "");
-  p->esquecer = esquecer;
-  if (!sistema_trabalho_solto(wf_trabalho, p)) { memset(p, 0, sizeof(*p)); free(p); }
-}
-
-// Conectar exige o Wi-Fi ligado: liga (e grava a vontade) se estiver desligado.
-static void wf_ligar_se_preciso(void)
-{
-  if (!ajustes_wifi()) { ajustes_definir_wifi(true); tab5_wifi_ligar(); }
-}
-
-static void wf_fechar_senha(void)
-{
-  s_wf_senha = false;
-  memset(s_wf_txt, 0, sizeof(s_wf_txt));
-  tecvirt_fechar(&s_kb);
-  sistema_pedir_redesenho_completo();
-}
-
-static void wf_enviar_senha(void)
-{
-  if (!s_wf_txt[0]) { return; }
-  wf_ligar_se_preciso();
-  wf_pedir(s_wf_alvo, s_wf_txt, false);
-  snprintf(s_aviso, sizeof(s_aviso), "conectando a %s...", s_wf_alvo);
-  wf_fechar_senha();
-}
-
-static void wf_tecla(int ac)
-{
-  if (ac == TECVIRT_ENVIAR) { wf_enviar_senha(); return; }
-  if (ac == TECVIRT_FECHAR) { wf_fechar_senha(); return; }
-  // Senha e ASCII (como no teclado fisico): o acento da pagina de simbolos nao entra.
-  tecvirt_editar(s_wf_txt, sizeof(s_wf_txt), ac, true);
-  sistema_pedir_redesenho();
-}
-
-static void toque_wifi(int tx, int ty)
-{
-  const area_t a = sistema_area();
-  if (s_wf_senha) {
-    if (tecvirt_contem(&s_kb, a.x + tx, a.y + ty)) {
-      const int ac = tecvirt_clique(&s_kb, a.x + tx, a.y + ty);
-      if (ac) { wf_tecla(ac); }
-    }
-    return;
-  }
-  const int l = a.largura - 2 * MARGEM;
-  int y = CONTEUDO_Y + 84;
-  if (tab5_dentro(tx, ty, MARGEM, y, l, BTN_A)) {
-    const bool ligar = !ajustes_wifi();
-    ajustes_definir_wifi(ligar);
-    if (ligar) { tab5_wifi_ligar(); } else { tab5_wifi_desligar(); }
-    s_aviso[0] = 0;
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 20;
-  if (tab5_dentro(tx, ty, MARGEM, y, l, BTN_A)) {
-    if (!tab5_wifi_procurando()) { tab5_wifi_procurar(); }
-    s_aviso[0] = 0;
-    sistema_pedir_redesenho();
-    return;
-  }
-  int dy = 0;
-  const int i = lista_item_tocado(&s_l_wifi, tx, ty, &dy);
-  if (i < 0 || i >= s_wf_n) { return; }
-  const tab5_wifi_visto_t& v = s_wf[i];
-  const uint32_t agora = tab5_agora_ms();
-  if (wf_em_uso(v.ssid)) {
-    // Em uso: o primeiro toque avisa, o segundo (em 4 s) esquece a rede.
-    if (strcmp(s_wf_esquecer, v.ssid) == 0 && agora - s_wf_esquecer_ms < 4000) {
-      wf_pedir(v.ssid, nullptr, true);
-      snprintf(s_aviso, sizeof(s_aviso), "%s esquecida", v.ssid);
-      s_wf_esquecer[0] = 0;
-    } else {
-      snprintf(s_wf_esquecer, sizeof(s_wf_esquecer), "%s", v.ssid);
-      s_wf_esquecer_ms = agora;
-      snprintf(s_aviso, sizeof(s_aviso), "Conectada. Toque de novo para esquecer");
-    }
-  } else if (v.conhecida || v.aberta) {
-    wf_ligar_se_preciso();
-    if (v.conhecida) { tab5_wifi_conectar(v.ssid); }
-    else             { wf_pedir(v.ssid, nullptr, false); }   // aberta: guarda sem senha e conecta
-    snprintf(s_aviso, sizeof(s_aviso), "conectando a %s...", v.ssid);
-  } else {
-    snprintf(s_wf_alvo, sizeof(s_wf_alvo), "%s", v.ssid);
-    memset(s_wf_txt, 0, sizeof(s_wf_txt));
-    s_wf_senha = true;
-    tecvirt_abrir(&s_kb);
-    sistema_pedir_redesenho_completo();
-    return;
-  }
-  sistema_pedir_redesenho();
-}
-
-static void teclar_wifi(const char* txt, uint8_t codigo)
-{
-  if (!s_wf_senha) { return; }
-  if (codigo == TAB5_TECLA_ENTER)  { wf_enviar_senha(); return; }
-  if (codigo == TAB5_TECLA_APAGAR) { wf_tecla(TECVIRT_APAGAR); return; }
-  if (codigo == TAB5_TECLA_ESC)    { wf_fechar_senha(); return; }
-  // Senha e ASCII: a letra que a tecla morta compos volta a ser as duas teclas.
-  char cru[8];
-  tab5_teclado_ascii(txt, cru, sizeof(cru));
-  for (const char* c = cru; *c; ++c) { if ((unsigned char)*c >= 0x20) { wf_tecla((unsigned char)*c); } }
-}
-
-// ---- Bluetooth -------------------------------------------------------------
-static const int BT_ITEM_A = 92;
-static int bt_lista_y0(void) { return CONTEUDO_Y + 84 + 84 + BTN_A + 20 + BTN_A + 20 + 44; }
-
-static int bt_item_altura(int, void*) { return BT_ITEM_A; }
-static void bt_item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void*)
-{
-  if (i < 0 || i >= s_bt_n) { return; }
-  const tab5_ble_visto_t& v = s_bt[i];
-  d.fillRect(x0, y, largura, BT_ITEM_A, TFT_BLACK);
-  char end[18], linha[80], dist[12];
-  tab5_ble_endereco_txt(v.addr, end);
-  // Rastreador em laranja: e o que se procura quando se quer saber "tem uma
-  // etiqueta perto de mim?".
-  const uint16_t cor = v.meshtastic ? TFT_GREENYELLOW
-                     : v.classe == TAB5_BLE_RASTREADOR ? TFT_ORANGE : TFT_WHITE;
-  char titulo[48];
-  if (v.nome[0])       { snprintf(titulo, sizeof(titulo), "%s", v.nome); }
-  else if (v.marca[0]) { snprintf(titulo, sizeof(titulo), "%s %s", v.classe == TAB5_BLE_RASTREADOR ? "Rastreador" : "Beacon", v.marca); }
-  else                 { snprintf(titulo, sizeof(titulo), "(sem nome)"); }
-  texto(d, x0 + MARGEM, y + 12, 30, true, cor, titulo);
-  tab5_sinal_distancia_txt(v.rssi, v.p1m ? v.p1m : TAB5_SINAL_P1M_BLE, dist, sizeof(dist));
-  const char* tipo = v.meshtastic ? "  ·  Meshtastic" : "";
-  char marca[24] = "";
-  if (!v.meshtastic && v.marca[0] && v.nome[0]) { snprintf(marca, sizeof(marca), "  ·  %s", v.marca); }
-  snprintf(linha, sizeof(linha), "%s  ·  %d dBm %s%s%s", end, (int)v.rssi, dist, tipo, marca);
-  texto(d, x0 + MARGEM, y + 52, 22, false, cor_sub(d), linha);
-  if (v.meshtastic) { chevron(d, x0 + largura - MARGEM - 12, y + BT_ITEM_A / 2, cor_sub(d)); }
-  d.drawFastHLine(x0 + MARGEM, y + BT_ITEM_A - 1, largura - MARGEM, cor_linha(d));
-}
-
-static void bt_recarregar(void)
-{
-  // Meshtastic primeiro, depois por sinal: o que interessa fica no alto.
-  const int n = tab5_ble_n_vistos();
-  int k = 0;
-  for (int i = 0; i < n && k < TAB5_BLE_VISTOS; ++i) { if (tab5_ble_visto(i, &s_bt[k])) { ++k; } }
-  for (int i = 1; i < k; ++i) {
-    tab5_ble_visto_t t = s_bt[i];
-    int j = i - 1;
-    // Meshtastic, depois rastreadores, depois o resto - cada grupo por sinal.
-    auto grupo = [](const tab5_ble_visto_t& x) {
-      return x.meshtastic ? 0 : x.classe == TAB5_BLE_RASTREADOR ? 1 : 2;
-    };
-    auto antes = [grupo](const tab5_ble_visto_t& x, const tab5_ble_visto_t& y) {
-      if (grupo(x) != grupo(y)) { return grupo(x) < grupo(y); }
-      return x.rssi > y.rssi;
-    };
-    while (j >= 0 && antes(t, s_bt[j])) { s_bt[j + 1] = s_bt[j]; --j; }
-    s_bt[j + 1] = t;
-  }
-  s_bt_n = k;
-  lista_itens_mudaram(&s_l_bt, s_bt_n);
-}
-
-static void pag_bt(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char sub[48], assin[160];
-  est_bt(sub, sizeof(sub));
-  const bool pronto = tab5_ble_pronto();
-  const bool varrendo = tab5_ble_varrendo();
-  const uint32_t ver = tab5_ble_versao();
-  if (ver != s_bt_ver) { s_bt_ver = ver; bt_recarregar(); }
-  const bool via_bt = ajustes_mesh_via() == AJUSTES_MESH_BLUETOOTH;
-  const char* enlace = via_bt ? mesh_ble_descricao()
-                     : ajustes_mesh_via() == AJUSTES_MESH_INTERNET ? "Mesh pela internet" : "Mesh pelo cabo Grove";
-  snprintf(assin, sizeof(assin), "%s|%d|%d|%d|%s|%s", sub, (int)ajustes_bluetooth(), (int)varrendo, s_bt_n, s_aviso, enlace);
-  const bool mudou = pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) || tudo;
-  if (mudou) {
-    conteudo_limpo(d, a);
-    int y = CONTEUDO_Y;
-    y = info(d, a, y, "Estado", sub, pronto ? TFT_GREENYELLOW : TFT_WHITE);
-    y = info(d, a, y, "Conexão do Mesh", enlace, mesh_ble_conectado() ? TFT_GREENYELLOW : TFT_WHITE);
-    const bool ligado = tab5_ble_estado() != TAB5_BLE_DESLIGADO;
-    const bool descendo = tab5_ble_estado() == TAB5_BLE_DESLIGANDO;
-    y = botao_largo(d, a, y, descendo ? "DESLIGANDO..." : ligado ? "DESLIGAR O BLUETOOTH" : "LIGAR O BLUETOOTH",
-                    descendo ? TFT_DARKGREY : ligado ? TFT_ORANGE : TFT_GREENYELLOW);
-    y = botao_largo(d, a, y, varrendo ? "PROCURANDO..." : "PROCURAR APARELHOS",
-                    pronto && !varrendo ? TFT_SKYBLUE : TFT_DARKGREY);
-    texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d),
-          s_aviso[0] ? s_aviso : (s_bt_n ? "Toque num Meshtastic (verde) para conectar o Mesh" : "Nenhum aparelho visto ainda"));
-  }
-  const area_t janela = { a.x, a.y + bt_lista_y0(), a.largura, a.altura - bt_lista_y0() };
-  lista_desenhar(&s_l_bt, d, janela, TFT_BLACK, mudou);
-}
-
-static void reiniciar_mesh_trabalho(void*)
-{
-  tab5_mesh_parar();
-  // Bluetooth e internet sobem direto (a internet espera o Wi-Fi por conta
-  // propria). O cabo: a sondagem acha o C6L e sobe a serial.
-  if (ajustes_mesh_via() != AJUSTES_MESH_SERIAL) { tab5_mesh_iniciar(); }
-  else { sistema_grove_redetectar(); }
-}
-
-static void toque_bt(int tx, int ty)
-{
-  const int l = sistema_area().largura - 2 * MARGEM;
-  int y = CONTEUDO_Y + 84 + 84;
-  if (tab5_dentro(tx, ty, MARGEM, y, l, BTN_A)) {
-    // Descendo: o botao espera a pilha terminar (o toque repetido de quem
-    // achou que nao pegou nao empilha pedidos).
-    if (tab5_ble_estado() == TAB5_BLE_DESLIGANDO) { return; }
-    sistema_bluetooth(tab5_ble_estado() == TAB5_BLE_DESLIGADO);
-    s_aviso[0] = 0;
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 20;
-  if (tab5_dentro(tx, ty, MARGEM, y, l, BTN_A)) {
-    if (tab5_ble_varrer(6000)) { s_aviso[0] = 0; }
-    sistema_pedir_redesenho();
-    return;
-  }
-  int dy = 0;
-  const int i = lista_item_tocado(&s_l_bt, tx, ty, &dy);
-  if (i < 0 || i >= s_bt_n) { return; }
-  char end[18];
-  tab5_ble_endereco_txt(s_bt[i].addr, end);
-  const char* nome = s_bt[i].nome[0] ? s_bt[i].nome : end;
-  // Todo toque responde: um aparelho que o sistema nao sabe usar diz isso, em
-  // vez de o toque parecer perdido.
-  if (!s_bt[i].meshtastic) {
-    char dist[12];
-    tab5_sinal_distancia_txt(s_bt[i].rssi, s_bt[i].p1m ? s_bt[i].p1m : TAB5_SINAL_P1M_BLE, dist, sizeof(dist));
-    if (s_bt[i].marca[0]) {
-      snprintf(s_aviso, sizeof(s_aviso), "%s (%s) a %s - só leitura", nome, s_bt[i].marca, dist);
-    } else {
-      snprintf(s_aviso, sizeof(s_aviso), "%s a %s: sem uso ainda (só nós Meshtastic)", nome, dist);
-    }
-    ESP_LOGI("ajustes", "bluetooth: %s (%s) nao e Meshtastic - nada a fazer", nome, end);
-    sistema_pedir_redesenho();
-    return;
-  }
-  // Meshtastic: vira o no do Mesh, e o Mesh passa para o Bluetooth - tocar e
-  // o pedido de conectar, e a linha "Conexão" acompanha o que acontece.
-  ajustes_definir_mesh_ble_endereco(end);
-  if (ajustes_mesh_via() != AJUSTES_MESH_BLUETOOTH) { ajustes_definir_mesh_via(AJUSTES_MESH_BLUETOOTH); }
-  // Conectar liga o Bluetooth - e fica gravado, como no botao.
-  if (!ajustes_bluetooth()) { ajustes_definir_bluetooth(true); }
-  tab5_ble_ligar();   // I2C do trilho: aqui, na interface
-  sistema_trabalho_solto(reiniciar_mesh_trabalho, nullptr);
-  snprintf(s_aviso, sizeof(s_aviso), "conectando a %s...", nome);
-  ESP_LOGI("ajustes", "bluetooth: conectar o Mesh a %s (%s)", nome, end);
-  sistema_pedir_redesenho();
-}
-
-// ---- ESP-NOW ---------------------------------------------------------------
-static void pag_espnow(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char sub[48], assin[160], val[24];
-  est_espnow(sub, sizeof(sub));
-  const uint8_t f = tab5_espnow_canal_fixo();
-  snprintf(assin, sizeof(assin), "%s|%u|%u", sub, (unsigned)f, (unsigned)tab5_espnow_canal());
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  int y = CONTEUDO_Y;
-  y = info(d, a, y, "Canal agora", sub);
-  y = botao_largo(d, a, y, "USAR O CANAL DO ROTEADOR", f ? TFT_SKYBLUE : TFT_DARKGREY);
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Canal fixo");
-  y += 34;
-  if (f) { snprintf(val, sizeof(val), "%u", (unsigned)f); } else { snprintf(val, sizeof(val), "-"); }
-  menos_mais(d, a, y, val);
-  y += BTN_A + 24;
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "O rádio fica em um canal por vez. No canal do roteador o Wi-Fi e o ESP-NOW "
-            "funcionam juntos, mas os outros aparelhos precisam estar nesse canal. "
-            "Canal fixo solta o roteador. A escolha fica salva.");
-}
-static void toque_espnow(int tx, int ty)
-{
-  int y = CONTEUDO_Y + 84;
-  if (tab5_dentro(tx, ty, MARGEM, y, sistema_area().largura - 2 * MARGEM, BTN_A)) {
-    tab5_espnow_definir_canal(0);
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 20 + 34;
-  const int s = menos_mais_toque(tx, ty, y);
-  if (s) {
-    int c = tab5_espnow_canal_fixo();
-    c = (c == 0) ? (s > 0 ? 1 : 13) : c + s;
-    if (c < 1) { c = 13; } if (c > 13) { c = 1; }
-    tab5_espnow_definir_canal((uint8_t)c);
-    sistema_pedir_redesenho();
-  }
-}
-
-// ---- Meshtastic ------------------------------------------------------------
-static int mesh_y_via(void)    { return CONTEUDO_Y + 30; }
-static int mesh_y_pin(void)    { return mesh_y_via() + BTN_A + 24 + 84 + 84; }
-// A posicao do GPS para a malha saiu daqui: e do grupo Localizacao do app
-// Mesh (Configurar o no), junto do que o NO faz com ela - dois lugares para a
-// mesma coisa deixavam um contradizer o outro.
-static int mesh_y_net(void)    { return mesh_y_pin() + 34 + BTN_A + 24; }   // bloco da internet (MQTT)
-
-static bool s_pin_para_no = false;   // o editor abriu porque o no esta pedindo o PIN agora
-static char s_pin_pintado[16];       // o numero que esta na tela
-
-// O numero do PIN, sozinho: limpa so a faixa dele (ate o botao) e escreve.
-static void pin_valor(lgfx::LovyanGFX& d, const area_t& a, bool forcar)
-{
-  char pin[16];
-  if (s_pin_editando) { snprintf(pin, sizeof(pin), "%s_", s_pin_txt); }
-  else                { snprintf(pin, sizeof(pin), "%06lu", (unsigned long)ajustes_mesh_pin()); }
-  if (!pintura_mudou_s(&s_p, s_pin_pintado, sizeof(s_pin_pintado), pin) && !forcar) { return; }
-  const int y = mesh_y_pin() + 34;
-  if (!forcar) { d.fillRect(a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM - 260 - 8, BTN_A, TFT_BLACK); }
-  texto(d, a.x + MARGEM, a.y + y + BTN_A / 2, 40, true, s_pin_editando ? TFT_YELLOW : TFT_WHITE, pin, middle_left);
-}
-
-static void pag_mesh(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  // O no pediu o PIN (modo aleatorio): o teclado abre sozinho.
-  if (mesh_ble_esperando_pin() && !s_pin_editando) {
-    s_pin_editando = true;
-    s_pin_para_no = true;
-    s_pin_txt[0] = 0;
-    tecvirt_abrir(&s_kb);
-    tudo = true;
-  }
-  char assin[320], salvo[18];
-  ajustes_mesh_ble_endereco(salvo);
-  snprintf(assin, sizeof(assin), "%d|%s|%s|%lu|%u|%d|%s|%d|%s", (int)ajustes_mesh_via(), tab5_mesh_enlace_descricao(), salvo,
-           (unsigned long)ajustes_mesh_pin(), 0u, (int)s_pin_editando, "",
-           (int)ajustes_mesh_internet(), tab5_mesh_internet_estado());
-  // A memoria da assinatura (s_assin) guarda 159 caracteres: o que muda
-  // depois disso (os estados, que vem no fim) nao repintaria. Vai o HASH da
-  // assinatura inteira (FNV-1a), que cabe e muda com qualquer caractere.
-  uint32_t h = 2166136261u;
-  for (const char* c = assin; *c; ++c) { h = (h ^ (uint8_t)*c) * 16777619u; }
-  snprintf(assin, sizeof(assin), "mesh|%08lx", (unsigned long)h);
-  // O PIN digitado fica FORA da assinatura: a letra repinta so o numero.
-  if (s_pin_editando) { tecvirt_posicionar(&s_kb, a); }
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) {
-    if (s_pin_editando) { pin_valor(d, a, false); tecvirt_pintar(&s_kb, d, false); }
-    return;
-  }
-  conteudo_limpo(d, a);
-  const int l3 = (a.largura - 2 * MARGEM - 32) / 3;
-
-  // TRES VIAS. O Grove ganha sozinho quando o C6L e achado no cabo; depois
-  // disso a escolha aqui vale ate o proximo achado (ver ajustes.h).
-  texto(d, a.x + MARGEM, a.y + CONTEUDO_Y, 22, false, cor_sub(d), "Falar com a malha por (o Grove tem prioridade)");
-  int y = mesh_y_via();
-  static const char* const ROTULO[3] = { "CABO GROVE", "BLUETOOTH", "INTERNET" };
-  for (int k = 0; k < 3; ++k) {
-    const bool sel = ajustes_mesh_via() == k;
-    tab5_botao(d, a.x + MARGEM + k * (l3 + 16), a.y + y, l3, BTN_A, ROTULO[k],
-               sel ? TFT_GREENYELLOW : d.color565(50, 55, 65), sel ? TFT_BLACK : TFT_LIGHTGREY);
-  }
-  y += BTN_A + 24;
-  y = info(d, a, y, "Enlace", tab5_mesh_enlace_descricao(),
-           tab5_mesh_no_ar() ? TFT_GREENYELLOW : TFT_WHITE);
-  y = info(d, a, y, "Nó Bluetooth", salvo[0] ? salvo : "o primeiro que aparecer");
-
-  // PIN
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "PIN do pareamento Bluetooth");
-  y += 34;
-  pin_valor(d, a, true);
-  tab5_botao(d, a.x + a.largura - MARGEM - 260, a.y + y, 260, BTN_A,
-             s_pin_editando ? "CANCELAR" : "ALTERAR", s_pin_editando ? TFT_ORANGE : TFT_SKYBLUE);
-  y += BTN_A + 24;
-
-  if (s_pin_editando) {
-    paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-              s_pin_para_no ? "O nó está pedindo o PIN agora: digite o que ele mostra e toque ENVIAR (30 s)."
-                            : "Digite o PIN fixo do nó (123456 nos sem tela) e toque ENVIAR.");
-    tecvirt_pintar(&s_kb, d, true);
-    return;
-  }
-
-  // Internet (MQTT pelo Wi-Fi): so roda sem o no; o Grove tem prioridade.
-  const bool net = ajustes_mesh_internet();
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Internet também quando faltar o nó (MQTT pelo Wi-Fi)");
-  y += 34;
-  texto(d, a.x + MARGEM, a.y + y + BTN_A / 2, 32, true, net ? TFT_GREENYELLOW : TFT_WHITE,
-        net ? "Ligada" : "Desligada", middle_left);
-  tab5_botao(d, a.x + a.largura - MARGEM - 260, a.y + y, 260, BTN_A, net ? "DESLIGAR" : "LIGAR",
-             net ? TFT_ORANGE : TFT_SKYBLUE);
-  y += BTN_A + 12;
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM, tab5_mesh_internet_estado());
-  y += 100;
-  if (salvo[0]) { y = botao_largo(d, a, y, "ESQUECER O NÓ BLUETOOTH", d.color565(50, 55, 65)); }
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "Com o nó no Bluetooth o cabo Grove fica livre para o GPS. O que o nó faz "
-            "(localização, internet do Tab5 para ele, rádio): app Mesh, página Nó.");
-}
-
-static void aplicar_pin(void)
-{
-  if (s_pin_txt[0]) {
-    const uint32_t pin = (uint32_t)atol(s_pin_txt);
-    if (s_pin_para_no) {
-      // PIN PEDIDO AGORA PELO NO (o que aparece na tela dele): vai so para
-      // este pareamento. Nao e salvo - o no gera outro na proxima vez, e um
-      // numero velho salvo so faria o pareamento seguinte falhar.
-      if (mesh_ble_esperando_pin()) { mesh_ble_digitar_pin(pin); }
-    } else {
-      // PIN FIXO, editado por conta propria (ALTERAR): fica salvo e e tentado
-      // primeiro nas proximas conexoes.
-      ajustes_definir_mesh_pin(pin);
-      ajustes_definir_mesh_pin_na_tela(false);
-      mesh_ble_tentar_de_novo();
-    }
-  }
-  s_pin_para_no = false;
-  s_pin_editando = false;
-  tecvirt_fechar(&s_kb);
-  sistema_pedir_redesenho_completo();
-}
-
-static void pin_tecla(int ac)
-{
-  const size_t n = strlen(s_pin_txt);
-  if (ac >= '0' && ac <= '9' && n < 6) { s_pin_txt[n] = (char)ac; s_pin_txt[n + 1] = 0; }
-  else if (ac == TECVIRT_APAGAR && n) { s_pin_txt[n - 1] = 0; }
-  else if (ac == TECVIRT_ENVIAR) { aplicar_pin(); return; }
-  else if (ac == TECVIRT_FECHAR) { s_pin_editando = false; tecvirt_fechar(&s_kb); sistema_pedir_redesenho_completo(); return; }
-  sistema_pedir_redesenho();
-}
-
-static void toque_mesh(int tx, int ty)
-{
-  const area_t a = sistema_area();
-  if (s_pin_editando && tecvirt_contem(&s_kb, a.x + tx, a.y + ty)) {
-    const int ac = tecvirt_clique(&s_kb, a.x + tx, a.y + ty);
-    if (ac) { pin_tecla(ac); }
-    return;
-  }
-  const int l3 = (a.largura - 2 * MARGEM - 32) / 3;
-  int y = mesh_y_via();
-  int via = -1;
-  for (int k = 0; k < 3; ++k) { if (tab5_dentro(tx, ty, MARGEM + k * (l3 + 16), y, l3, BTN_A)) { via = k; } }
-  if (via >= 0 && via != ajustes_mesh_via()) {
-    ajustes_definir_mesh_via((uint8_t)via);
-    if (via == AJUSTES_MESH_BLUETOOTH) {   // liga o Bluetooth, e fica gravado como no botao
-      if (!ajustes_bluetooth()) { ajustes_definir_bluetooth(true); }
-      tab5_ble_ligar();   // I2C do trilho: aqui, na interface
-    }
-    sistema_trabalho_solto(reiniciar_mesh_trabalho, nullptr);
-    sistema_pedir_redesenho();
-    return;
-  }
-  y = mesh_y_pin() + 34;
-  if (tab5_dentro(tx, ty, a.largura - MARGEM - 260, y, 260, BTN_A)) {
-    s_pin_editando = !s_pin_editando;
-    s_pin_txt[0] = 0;
-    if (s_pin_editando) { tecvirt_abrir(&s_kb); } else { tecvirt_fechar(&s_kb); }
-    sistema_pedir_redesenho_completo();
-    return;
-  }
-  if (s_pin_editando) { return; }
-  y = mesh_y_net() + 34;
-  if (tab5_dentro(tx, ty, a.largura - MARGEM - 260, y, 260, BTN_A)) {
-    ajustes_definir_mesh_internet(!ajustes_mesh_internet());
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 12 + 100;
-  char salvo[18];
-  ajustes_mesh_ble_endereco(salvo);
-  if (salvo[0] && tab5_dentro(tx, ty, MARGEM, y, a.largura - 2 * MARGEM, BTN_A)) {
-    ajustes_definir_mesh_ble_endereco("");
-    if (ajustes_mesh_via() == AJUSTES_MESH_BLUETOOTH) { sistema_trabalho_solto(reiniciar_mesh_trabalho, nullptr); }
-    sistema_pedir_redesenho();
-  }
-}
-
-static void teclar_mesh(const char* txt, uint8_t codigo)
-{
-  if (!s_pin_editando) { return; }
-  const size_t n = strlen(s_pin_txt);
-  if (codigo == TAB5_TECLA_ENTER) { aplicar_pin(); return; }
-  if (codigo == TAB5_TECLA_APAGAR) { if (n) { s_pin_txt[n - 1] = 0; } sistema_pedir_redesenho(); return; }
-  if (codigo == TAB5_TECLA_ESC) { s_pin_editando = false; tecvirt_fechar(&s_kb); sistema_pedir_redesenho_completo(); return; }
-  if (txt && txt[0] >= '0' && txt[0] <= '9' && n < 6) { s_pin_txt[n] = txt[0]; s_pin_txt[n + 1] = 0; sistema_pedir_redesenho(); }
-}
-
-// ---- Tela ------------------------------------------------------------------
-static void pag_tela(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char assin[64], v1[16], v2[16];
-  snprintf(v1, sizeof(v1), "%u s", (unsigned)ajustes_tela_s());
-  // O relogio EM USO, e nao o gravado: na tela TDDI ele fica no de fabrica
-  // (tab5_painel em hal/tab5_power.hpp) e o gravado nao vale.
-  snprintf(v2, sizeof(v2), "%d MHz", tab5_power_relogio_dpi());
-  snprintf(assin, sizeof(assin), "%s|%s|%d|%d", v1, v2, (int)ajustes_bloqueio(), (int)ajustes_parede());
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  int y = CONTEUDO_Y;
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Apagar a tela depois de, sem toque");
-  y += 34; menos_mais(d, a, y, v1); y += BTN_A + 12;
-  char ajuda[64];
-  snprintf(ajuda, sizeof(ajuda), "De %d a %d segundos.", AJUSTES_TELA_MIN_S, AJUSTES_TELA_MAX_S);
-  y = paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM, ajuda) - a.y + 24;
-  // Bloqueio: alturas fixas, o toque (toque_tela) repete esta conta.
-  const bool bq = ajustes_bloqueio();
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Tela de bloqueio ao ligar e ao acordar");
-  y += 34;
-  texto(d, a.x + MARGEM, a.y + y + BTN_A / 2, 32, true, bq ? TFT_GREENYELLOW : TFT_WHITE,
-        bq ? "Ligada" : "Desligada", middle_left);
-  tab5_botao(d, a.x + a.largura - MARGEM - 260, a.y + y, 260, BTN_A, bq ? "DESLIGAR" : "LIGAR",
-             bq ? TFT_ORANGE : TFT_SKYBLUE);
-  y += BTN_A + 24;
-  // Papel de parede do inicio: TROCAR passa pelas opcoes em roda.
-  static const char* const PAREDE[] = { "Sorteio", "Fios", "Ondas", "Teia", "Raios", "Círculos", "Nenhum" };
-  const uint8_t pp = ajustes_parede();
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Papel de parede do início");
-  y += 34;
-  texto(d, a.x + MARGEM, a.y + y + BTN_A / 2, 32, true,
-        pp == AJUSTES_PAREDE_NENHUM ? TFT_WHITE : TFT_GREENYELLOW, PAREDE[pp], middle_left);
-  tab5_botao(d, a.x + a.largura - MARGEM - 260, a.y + y, 260, BTN_A, "TROCAR", TFT_SKYBLUE);
-  y += BTN_A + 24;
-  texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), "Relógio do painel");
-  y += 34; menos_mais(d, a, y, v2); y += BTN_A + 12;
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "Menor economiza bateria (menos leitura da memória pelo painel), mas reduz "
-            "os quadros por segundo. 60 MHz é o padrão.");
-}
-static void toque_tela(int tx, int ty)
-{
-  int y = CONTEUDO_Y + 34;
-  int s = menos_mais_toque(tx, ty, y);
-  if (s) { ajustes_definir_tela_s((uint8_t)(ajustes_tela_s() + s * PASSO_TELA_S)); sistema_pedir_redesenho(); return; }
-  y += BTN_A + 12 + 32 + 24 + 34;   // linha do botao do bloqueio
-  if (tab5_dentro(tx, ty, sistema_area().largura - MARGEM - 260, y, 260, BTN_A)) {
-    ajustes_definir_bloqueio(!ajustes_bloqueio());
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 24 + 34;   // linha do papel de parede
-  if (tab5_dentro(tx, ty, sistema_area().largura - MARGEM - 260, y, 260, BTN_A)) {
-    ajustes_definir_parede((uint8_t)((ajustes_parede() + 1) % (AJUSTES_PAREDE_NENHUM + 1)));
-    sistema_pedir_redesenho();
-    return;
-  }
-  y += BTN_A + 24 + 34;
-  s = menos_mais_toque(tx, ty, y);
-  if (s) {
-    int v = tab5_power_relogio_dpi() + s * PASSO_RELOGIO;
-    if (v < AJUSTES_RELOGIO_MIN) { v = AJUSTES_RELOGIO_MIN; }
-    if (v > AJUSTES_RELOGIO_MAX) { v = AJUSTES_RELOGIO_MAX; }
-    // Aplica primeiro, grava so se deu certo: um valor que o painel recusou
-    // nao pode virar o do proximo boot.
-    if (tab5_power_relogio_dpi(v)) {
-      ajustes_definir_relogio_painel((uint8_t)v);
-      sistema_pedir_redesenho_completo();
-    }
-  }
-}
-
-// ---- Teclado ---------------------------------------------------------------
-static void pag_teclado(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char sub[48], assin[64];
-  est_teclado(sub, sizeof(sub));
-  if (ajustes_teclado() && tab5_teclado_presente()) {
-    snprintf(sub, sizeof(sub), "Encaixado (firmware %u)", (unsigned)tab5_teclado_versao());
-  }
-  snprintf(assin, sizeof(assin), "%s|%d", sub, (int)ajustes_teclado());
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  int y = info(d, a, CONTEUDO_Y, "Estado", sub, tab5_teclado_presente() ? TFT_GREENYELLOW : TFT_WHITE);
-  y = botao_largo(d, a, y, ajustes_teclado() ? "DESATIVAR" : "ATIVAR",
-                  ajustes_teclado() ? TFT_ORANGE : TFT_GREENYELLOW);
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "O teclado encaixa no ExtPort1. Desativado, o sistema não procura por ele "
-            "e o teclado da tela é usado nas conversas.");
-}
-static void toque_teclado(int tx, int ty)
-{
-  if (tab5_dentro(tx, ty, MARGEM, CONTEUDO_Y + 84, sistema_area().largura - 2 * MARGEM, BTN_A)) {
-    const bool novo = !ajustes_teclado();
-    ajustes_definir_teclado(novo);
-    tab5_teclado_habilitar(novo);
-    sistema_pedir_redesenho();
-  }
-}
-
-// ---- Grove -----------------------------------------------------------------
-static void pag_grove(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char sub[48], assin[64];
-  est_grove(sub, sizeof(sub));
-  snprintf(assin, sizeof(assin), "%s|%d", sub, (int)ajustes_grove());
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  int y = info(d, a, CONTEUDO_Y, "Estado", sub);
-  y = botao_largo(d, a, y, ajustes_grove() ? "DESLIGAR O 5V" : "LIGAR O 5V",
-                  ajustes_grove() ? TFT_ORANGE : TFT_GREENYELLOW);
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "Ligado, o módulo do cabo (C6L, GPS) fica sempre alimentado e não reinicia "
-            "a cada uso. Desligado economiza bateria sem nada plugado.");
-}
-static void toque_grove(int tx, int ty)
-{
-  if (tab5_dentro(tx, ty, MARGEM, CONTEUDO_Y + 84, sistema_area().largura - 2 * MARGEM, BTN_A)) {
-    ajustes_definir_grove(!ajustes_grove());
-    sistema_reaplicar_perfil();
-    sistema_grove_redetectar();
-    sistema_pedir_redesenho();
-  }
-}
-
-// ---- Sobre -----------------------------------------------------------------
-static void pag_sobre(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  char assin[96], mem[48], ps[48], ativo[32];
-  const size_t li = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-  const size_t lp = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-  snprintf(mem, sizeof(mem), "%u KB livres", (unsigned)(li / 1024));
-  snprintf(ps, sizeof(ps), "%u KB livres", (unsigned)(lp / 1024));
-  const uint32_t s = (uint32_t)(esp_timer_get_time() / 1000000);
-  snprintf(ativo, sizeof(ativo), "%lu h %02lu min", (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60));
-  snprintf(assin, sizeof(assin), "%s|%s|%s", mem, ps, ativo);
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  int y = CONTEUDO_Y;
-  char sistema[48];
-  snprintf(sistema, sizeof(sistema), "M5tabOS %s", esp_app_get_description()->version);
-  y = info(d, a, y, "Sistema", sistema);
-  y = info(d, a, y, "Compilado em", m5tabos_compilado);
-  y = info(d, a, y, "ESP-IDF", esp_get_idf_version());
-  y = info(d, a, y, "Memória interna", mem);
-  y = info(d, a, y, "PSRAM", ps);
-  y = info(d, a, y, "Ligado há", ativo);
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "M5Stack Tab5: ESP32-P4 (sistema) e ESP32-C6 (Wi-Fi, Bluetooth e ESP-NOW).");
-}
-
-// ---- USB (pendrive) --------------------------------------------------------
-// A tela do pendrive inteira: estado, transferencia, o diario das gravacoes
-// guardadas, o resultado da ultima volta e o ajuste de ligar sozinho. O
-// trabalho mora no servico (services/tab5_pendrive) - esta pagina so pede e
-// mostra, e a pessoa pode sair dela a vontade: o pendrive segue em segundo
-// plano. A CONFIRMACAO de devolver sem o computador ter ejetado e daqui.
-typedef struct { int x, y, l, a; } usb_ret_t;
-static usb_ret_t s_usb_bt[3];          // os botoes como desenhados (coordenadas da area)
-static bool      s_usb_confirmar = false;
-
-static void kb_txt(char* o, size_t t, uint64_t b)
-{
-  if (b < 1024ULL * 1024)             { snprintf(o, t, "%u KB", (unsigned)(b / 1024)); }
-  else if (b < 1024ULL * 1024 * 1024) { snprintf(o, t, "%.1f MB", (double)b / (1024.0 * 1024.0)); }
-  else                                { snprintf(o, t, "%.2f GB", (double)b / (1024.0 * 1024.0 * 1024.0)); }
-}
-
-static int usb_botao(lgfx::LovyanGFX& d, const area_t& a, int i, int y, const char* txt, uint16_t cor)
-{
-  s_usb_bt[i] = { MARGEM, y, a.largura - 2 * MARGEM, BTN_A };
-  tab5_botao(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM, BTN_A, txt, cor);
-  return y + BTN_A + 20;
-}
-
-static void pag_usb(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
-{
-  tab5_pendrive_estado_t e;
-  tab5_pendrive_estado(&e);
-  tab5_sd_resumo_t r;
-  tab5_sd_resumo(&r);
-  if (e.fase != PENDRIVE_ATIVO) { s_usb_confirmar = false; }
-  // Aberta com um resultado esperando: a pessoa viu - o aviso da barra sai.
-  if (e.fase == PENDRIVE_PARADO) { tab5_pendrive_resultado_visto(); }
-
-  // O QUE MOSTRAR
-  char estado[64], l2[96] = "", l3[80] = "", fim[96] = "";
-  uint16_t cor = TFT_WHITE;
-  switch (e.fase) {
-    case PENDRIVE_PREPARANDO: snprintf(estado, sizeof(estado), "Preparando o cartão..."); break;
-    case PENDRIVE_DEVOLVENDO: snprintf(estado, sizeof(estado), "Devolvendo o cartão..."); break;
-    case PENDRIVE_ATIVO:
-      if (!e.usb.montado)       { snprintf(estado, sizeof(estado), "Esperando o computador"); cor = TFT_YELLOW; }
-      else if (e.usb.suspenso)  { snprintf(estado, sizeof(estado), "Computador parado ou cabo solto"); cor = TFT_ORANGE; }
-      else if (e.usb.ativo)     { snprintf(estado, sizeof(estado), "Copiando..."); cor = TFT_SKYBLUE; }
-      else                      { snprintf(estado, sizeof(estado), "Cartão no computador"); cor = TFT_GREENYELLOW; }
-      break;
-    default:
-      snprintf(estado, sizeof(estado), "%s", e.oferta ? "Computador conectado" : "Desligado");
-      cor = e.oferta ? TFT_YELLOW : TFT_WHITE;
-      break;
-  }
-  if (e.fase == PENDRIVE_ATIVO) {
-    char li[24], gr[24];
-    kb_txt(li, sizeof(li), e.usb.lidos);
-    kb_txt(gr, sizeof(gr), e.usb.gravados);
-    snprintf(l2, sizeof(l2), "Lidos %s  ·  gravados %s%s", li, gr, e.usb.erros ? "  ·  ERROS" : "");
-  }
-  if (e.fase != PENDRIVE_PARADO || r.no_diario) {
-    snprintf(l3, sizeof(l3), "%u gravação(ões) guardadas (%u de %u KB)",
-             (unsigned)r.no_diario, (unsigned)(r.diario_usado / 1024), (unsigned)(r.diario_total / 1024));
-  }
-  // DIAGNOSTICO: ate onde o computador chegou, na ordem em que ele faz. E o
-  // que diz, num disco que nao aparece, se o problema e no USB (nem
-  // reconheceu), no pedido do disco ou na leitura (o sistema dele desistiu).
-  char diag[96] = "";
-  if (e.fase == PENDRIVE_ATIVO) {
-    const tab5_pendrive_usb_t& u = e.usb;
-    if (!u.n_config)            { snprintf(diag, sizeof(diag), "USB: o computador não reconheceu o aparelho"); }
-    else if (!u.n_inquiry)      { snprintf(diag, sizeof(diag), "USB: reconheceu, mas não pediu o disco"); }
-    else if (!u.n_respostas)    { snprintf(diag, sizeof(diag), "USB: pediu o disco %ux, a resposta não chegou",
-                                           (unsigned)u.n_inquiry); }
-    else if (!u.n_capacidade)   { snprintf(diag, sizeof(diag), "USB: pediu o disco, não o tamanho (resp. %u, últ. 0x%02X)",
-                                           (unsigned)u.n_respostas, (unsigned)u.op_respondido); }
-    else if (!u.n_leituras)     { snprintf(diag, sizeof(diag), "USB: viu o disco, ainda não leu"); }
-    else                        { snprintf(diag, sizeof(diag), "USB: %u leitura(s), %u entregue(s), a mais lenta %u ms",
-                                           (unsigned)u.n_cmd_leitura, (unsigned)u.n_leituras_ok,
-                                           (unsigned)u.leitura_max_ms); }
-    // Parou ha mais de 3 s: diz ONDE - e o que separa um travamento do USB
-    // (ou do cartao) do computador que simplesmente parou de pedir.
-    if (u.n_config && u.parado_ms >= 3000) {
-      switch (u.onde) {
-        case PENDRIVE_ESPERA_CARTAO:
-          snprintf(diag, sizeof(diag), "USB: PARADO no cartão (setor %u)", (unsigned)u.ultimo_setor); break;
-        case PENDRIVE_ESPERA_USB:
-          snprintf(diag, sizeof(diag), "USB: PARADO no USB, entregando o setor %u (%u/%u)",
-                   (unsigned)u.ultimo_setor, (unsigned)u.n_leituras_ok, (unsigned)u.n_cmd_leitura); break;
-        default:
-          if (u.n_cmd_leitura) {
-            snprintf(diag, sizeof(diag), "USB: o computador parou de pedir (%u/%u leituras)",
-                     (unsigned)u.n_leituras_ok, (unsigned)u.n_cmd_leitura);
-          }
-          break;
-      }
-    }
-    if (u.op_recusado) {
-      const size_t k = strlen(diag);
-      snprintf(diag + k, sizeof(diag) - k, " · recusou 0x%02X", (unsigned)u.op_recusado);
-    }
-  }
-  char perdas[64] = "";
-  if (r.perdidas) {
-    snprintf(perdas, sizeof(perdas), "%u gravação(ões) perdidas: memória cheia", (unsigned)r.perdidas);
-  }
-  if (e.fase == PENDRIVE_PARADO) {
-    switch (e.motivo) {
-      case PENDRIVE_RECUSA_APP:        snprintf(fim, sizeof(fim), "Feche o app que usa o cartão (Arquivos, Câmera)."); break;
-      case PENDRIVE_RECUSA_EM_USO:     snprintf(fim, sizeof(fim), "O cartão estava em uso. Tente de novo."); break;
-      case PENDRIVE_RECUSA_SEM_CARTAO: snprintf(fim, sizeof(fim), "Sem cartão SD, ou ele não respondeu."); break;
-      case PENDRIVE_RECUSA_SEM_DIARIO: snprintf(fim, sizeof(fim), "Falta a memória interna do pendrive: grave o firmware de novo."); break;
-      case PENDRIVE_RECUSA_USB:        snprintf(fim, sizeof(fim), "O USB não iniciou. O cartão continua no Tab5."); break;
-      default:
-        if (e.sem_ejetar) {
-          // Ver tab5_pendrive.cpp (s_saiu_sem_ejetar): o disco nao aparecer
-          // logo da proxima vez e o computador verificando o cartao.
-          snprintf(fim, sizeof(fim), "Saiu sem ejetar: o computador verifica o cartão antes de abrir.");
-        } else if (r.completo) {
-          snprintf(fim, sizeof(fim), "Última vez: %u gravação(ões) aplicada(s)%s%s",
-                   (unsigned)r.aplicadas, r.conflitos ? ", conflito em " : "",
-                   r.conflitos ? "arquivo(s) .tab5" : "");
-        }
-        break;
-    }
-  }
-
-  char assin[sizeof(s_assin)];
-  snprintf(assin, sizeof(assin), "%d|%d|%d|%s|%s|%s|%s|%d|%u|%u|%s", (int)e.fase, (int)e.motivo, (int)s_usb_confirmar,
-           estado, l2, l3, fim, (int)ajustes_pendrive(), (unsigned)r.conflitos, (unsigned)r.perdidas, diag);
-  if (!pintura_mudou_s(&s_p, s_assin, sizeof(s_assin), assin) && !tudo) { return; }
-  conteudo_limpo(d, a);
-  memset(s_usb_bt, 0, sizeof(s_usb_bt));
-
-  int y = info(d, a, CONTEUDO_Y, "Cartão SD como pendrive (USB-C)", estado, cor);
-  if (l2[0])  { texto(d, a.x + MARGEM, a.y + y, 26, false, TFT_WHITE, l2); y += 44; }
-  if (l3[0])  { texto(d, a.x + MARGEM, a.y + y, 24, false, cor_sub(d), l3); y += 44; }
-  if (diag[0])   { texto(d, a.x + MARGEM, a.y + y, 22, false, cor_sub(d), diag); y += 40; }
-  if (perdas[0]) { texto(d, a.x + MARGEM, a.y + y, 24, false, TFT_RED, perdas); y += 44; }
-  if (fim[0]) { texto(d, a.x + MARGEM, a.y + y, 24, false, TFT_ORANGE, fim); y += 44; }
-  y += 8;
-
-  switch (e.fase) {
-    case PENDRIVE_PARADO:
-      y = usb_botao(d, a, 0, y, "USAR COMO PENDRIVE", TFT_SKYBLUE);
-      break;
-    case PENDRIVE_ATIVO:
-      if (s_usb_confirmar) {
-        y = paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-                      "O computador não avisou que ejetou. Se ele tiver algo em cache, arquivos "
-                      "podem ficar incompletos. Ejete no computador e o cartão volta sozinho. Já "
-                      "usou \"Remover com segurança\" no Windows? Pode devolver.") - a.y + 16;
-        y = usb_botao(d, a, 0, y, "VOLTAR", TFT_SKYBLUE);
-        y = usb_botao(d, a, 1, y, "DEVOLVER MESMO ASSIM", TFT_RED);
-      } else {
-        y = usb_botao(d, a, 0, y, "DEVOLVER O CARTÃO AO TAB5", TFT_ORANGE);
-      }
-      break;
-    default:
-      y = usb_botao(d, a, 0, y, "AGUARDE...", TFT_DARKGREY);
-      s_usb_bt[0] = { };   // nao responde
-      break;
-  }
-  y = usb_botao(d, a, 2, y, ajustes_pendrive() ? "LIGAR SOZINHO NO COMPUTADOR: SIM" : "LIGAR SOZINHO NO COMPUTADOR: NÃO",
-                ajustes_pendrive() ? TFT_GREENYELLOW : TFT_LIGHTGREY);
-  paragrafo(d, a.x + MARGEM, a.y + y, a.largura - 2 * MARGEM,
-            "O Tab5 segue usável enquanto isso. O que ele gravar fica na memória interna e "
-            "vai para o cartão na volta. Arquivos e Câmera esperam o cartão. Para terminar, "
-            "ejete o disco no computador.");
-}
-
-static bool usb_em(int i, int tx, int ty)
-{
-  const usb_ret_t& b = s_usb_bt[i];
-  return b.l > 0 && tab5_dentro(tx, ty, b.x, b.y, b.l, b.a);
-}
-
-static void toque_usb(int tx, int ty)
-{
-  tab5_pendrive_estado_t e;
-  tab5_pendrive_estado(&e);
-  if (usb_em(2, tx, ty)) {
-    ajustes_definir_pendrive(!ajustes_pendrive());
-    sistema_pedir_redesenho();
-    return;
-  }
-  if (e.fase == PENDRIVE_PARADO && usb_em(0, tx, ty)) {
-    tab5_pendrive_iniciar();
-    sistema_pedir_redesenho();
-    return;
-  }
-  if (e.fase == PENDRIVE_ATIVO) {
-    const bool montado = e.usb.montado && !e.usb.ejetado;
-    if (!s_usb_confirmar && usb_em(0, tx, ty)) {
-      if (montado) { s_usb_confirmar = true; } else { tab5_pendrive_devolver(); }
-    } else if (s_usb_confirmar && usb_em(0, tx, ty)) {
-      s_usb_confirmar = false;
-    } else if (s_usb_confirmar && usb_em(1, tx, ty)) {
-      ESP_LOGW("ajustes", "cartao devolvido sem ejecao do computador");
-      s_usb_confirmar = false;
-      tab5_pendrive_devolver();
-    }
-    sistema_pedir_redesenho();
-  }
+  tab5_tela_limpar(a.x, a.y + CONTEUDO_Y, a.largura, a.altura - CONTEUDO_Y, TEMA_FUNDO);
 }
 
 // ---------------------------------------------------------------------------
 // DESPACHO
 // ---------------------------------------------------------------------------
-typedef void (*pag_desenhar_fn)(lgfx::LovyanGFX&, const area_t&, bool);
-typedef void (*pag_tocar_fn)(int, int);
-static const pag_desenhar_fn PAG_DESENHAR[PAG_N] = {
-  pag_wifi, pag_bt, pag_espnow, pag_mesh, pag_tela, pag_teclado, pag_grove, pag_usb, pag_sobre };
-static const pag_tocar_fn PAG_TOCAR[PAG_N] = {
-  toque_wifi, toque_bt, toque_espnow, toque_mesh, toque_tela, toque_teclado, toque_grove, toque_usb, nullptr };
-
 static void abrir_pagina(int p)
 {
-  if (s_pin_editando) { s_pin_editando = false; tecvirt_fechar(&s_kb); }
+  if (p == PAG_ENERGIA) { sistema_abrir_app("Energia"); return; }   // um app, nao uma pagina
+  if (s_pin_editando) { s_pin_editando = false; tecvirt_fechar(&s_cfg_kb); }
   s_pag = p;
   s_assin[0] = 0;
   s_aviso[0] = 0;
-  if (s_wf_senha) { s_wf_senha = false; memset(s_wf_txt, 0, sizeof(s_wf_txt)); tecvirt_fechar(&s_kb); }
+  if (s_wf_senha) { s_wf_senha = false; memset(s_wf_txt, 0, sizeof(s_wf_txt)); tecvirt_fechar(&s_cfg_kb); }
+  if (s_mq_campo >= 0) { s_mq_campo = -1; memset(s_mq_txt, 0, sizeof(s_mq_txt)); tecvirt_fechar(&s_cfg_kb); }
+  s_mq_ed = false;
+  memset(&s_mq_p, 0, sizeof(s_mq_p));
   if (p == PAG_WIFI) {
     lista_definir(&s_l_wifi, ROLAGEM_INICIO, 0, wf_item_altura, wf_item_desenhar, nullptr);
     s_wf_ver = 0;
@@ -1623,8 +707,10 @@ static void abrir_pagina(int p)
     lista_esconder(&s_l_bt);
   }
   if (p == PAG_INICIO) { s_ub = s_uv = -1; }
-  else { lista_esconder(&s_lista); }
-  pintura_pedir(&s_p);
+  else if (!deitado(sistema_area())) { lista_esconder(&s_lista); }   // deitado a lista fica ao lado
+  rolagem_zerar(&s_rol_pag);
+  s_pag_h = 0;
+  pintura_pedir(&s_cfg_p);
   sistema_pedir_redesenho_completo();
 }
 
@@ -1634,8 +720,8 @@ static bool ao_abrir(void)
   s_ub = s_uv = -1;
   memset(s_sub, 0, sizeof(s_sub));
   for (int i = 0; i < PAG_N; ++i) { PAGINAS[i].estado(s_sub[i], sizeof(s_sub[i])); }
-  lista_definir(&s_lista, ROLAGEM_INICIO, PAG_N, item_altura, item_desenhar, nullptr);
-  pintura_pedir(&s_p);
+  lista_definir(&s_lista, ROLAGEM_INICIO, LINHAS_N, item_altura, item_desenhar, nullptr);
+  pintura_pedir(&s_cfg_p);
   // O aviso do pendrive (barra de status) abre Ajustes: cai direto na pagina.
   if (tab5_pendrive_pede_atencao()) { abrir_pagina(PAG_USB); }
   return true;
@@ -1643,8 +729,69 @@ static bool ao_abrir(void)
 
 static void ao_fechar(void)
 {
-  if (s_pin_editando) { s_pin_editando = false; tecvirt_fechar(&s_kb); }
-  if (s_wf_senha) { s_wf_senha = false; memset(s_wf_txt, 0, sizeof(s_wf_txt)); tecvirt_fechar(&s_kb); }
+  if (s_mq_campo >= 0) { s_mq_campo = -1; memset(s_mq_txt, 0, sizeof(s_mq_txt)); tecvirt_fechar(&s_cfg_kb); }
+  memset(&s_mq_p, 0, sizeof(s_mq_p));   // a senha digitada nao fica na RAM
+  if (s_pin_editando) { s_pin_editando = false; tecvirt_fechar(&s_cfg_kb); }
+  if (s_wf_senha) { s_wf_senha = false; memset(s_wf_txt, 0, sizeof(s_wf_txt)); tecvirt_fechar(&s_cfg_kb); }
+}
+
+// DEITADO: a lista a esquerda e a pagina ao lado, rolando.
+static void desenhar_deitado(lgfx::LovyanGFX& d, const area_t& a, bool tudo)
+{
+  const area_t dir = { a.x + PAG_X, a.y, a.largura - PAG_X, a.altura };
+  s_dx_pag = PAG_X;
+  s_dy_pag = 0;
+
+  if (tudo) {
+    d.drawFastVLine(dir.x - 1, dir.y, dir.altura, cor_linha(d));
+  }
+  atualizar_estados();
+  const area_t janela = { a.x, dir.y, LADO_L, dir.altura };
+  lista_desenhar(&s_lista, d, janela, TEMA_FUNDO, tudo);
+
+  // ---- a pagina ----
+  if (s_pag == PAG_INICIO) {
+    if (tudo) {
+      tab5_escrever(d, tr("Escolha uma opção"), dir.x + dir.largura / 2, dir.y + dir.altura / 2, 28, false,
+                    cor_sub(d), TEMA_FUNDO, middle_center);
+    }
+    return;
+  }
+  // Rolou desde a ultima passada: desloca os pixels que ja estao certos e
+  // pinta so a faixa exposta (o mesmo do kernel); sem como deslocar, tudo.
+  const area_t* recorte = &dir;
+  rolagem_passada_t rp = {};
+  bool completa = tudo;
+  if (!tudo && rolagem_pendente(&s_rol_pag)) {
+    rp = rolagem_deslocar(&s_rol_pag, dir, TEMA_FUNDO);
+    if (rp.deslocou) { recorte = &rp.exposta; }
+    else             { tab5_tela_limpar(dir.x, dir.y, dir.largura, dir.altura, TEMA_FUNDO); }
+    completa = true;
+  }
+  area_t pa = dir;
+  pa.y -= s_rol_pag.atual;
+  if (s_pag_h > pa.altura) { pa.altura = s_pag_h; }
+  // Devolve o recorte que achou (o do kernel: a area do app), em vez de
+  // apaga-lo - o resto deste desenho continua sem poder pintar as barras.
+  int32_t cx, cy, cl, ca;
+  d.getClipRect(&cx, &cy, &cl, &ca);
+  d.setClipRect(recorte->x, recorte->y, recorte->largura, recorte->altura);
+  s_fim = 0;
+  if (completa) { cabecalho(d, pa, tr(PAGINAS[s_pag].nome)); }
+  if (PAGINAS[s_pag].desenhar) { PAGINAS[s_pag].desenhar(d, pa, completa); }
+  d.setClipRect(cx, cy, cl, ca);
+  // A altura sai do que a pagina desenhou numa passada inteira (as de lista
+  // contam a lista inteira - ver janela_da_lista).
+  if (tudo && s_fim > 0) {
+    const int h = s_fim - pa.y + 32;
+    if (h != s_pag_h) {
+      s_pag_h = h;
+      if (rolagem_limite(&s_rol_pag, h, dir.altura)) { sistema_pedir_redesenho_completo(); }
+    }
+  }
+  // A BARRINHA, como a das listas (o deslocamento a arrastou junto: refaz).
+  if (completa) { rolagem_barra(d, &s_rol_pag, dir, TEMA_FUNDO); }
+  rolagem_sincronizar(&s_rol_pag);
 }
 
 static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
@@ -1652,46 +799,81 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   // O NO PEDIU O PIN: em qualquer pagina de Ajustes, vai para a do
   // Meshtastic, que abre o teclado (o pareamento espera ~30 s).
   if (mesh_ble_esperando_pin() && s_pag != PAG_MESH) { abrir_pagina(PAG_MESH); }
-  pintura_iniciar(&s_p);
-  const bool tudo = pintura_completa(&s_p);
+  pintura_iniciar(&s_cfg_p);
+  const bool tudo = pintura_completa(&s_cfg_p);
+  if (deitado(a)) { desenhar_deitado(d, a, tudo); return; }
+  s_dx_pag = 0;
+  s_dy_pag = 0;
   if (s_pag == PAG_INICIO) { desenhar_inicio(d, a, tudo); return; }
-  if (tudo) { cabecalho(d, a, PAGINAS[s_pag].nome); }
-  PAG_DESENHAR[s_pag](d, a, tudo);
+  if (tudo) { cabecalho(d, a, tr(PAGINAS[s_pag].nome)); }
+  if (PAGINAS[s_pag].desenhar) { PAGINAS[s_pag].desenhar(d, a, tudo); }
 }
 
 static void ao_tocar(int tx, int ty)
 {
-  if (s_pag == PAG_INICIO) {
-    if (ty < DIVISOR_Y) {
-      mexer_rapido(ty < RAPIDO_Y0 + RAPIDO_A ? RAPIDO_Y0 : RAPIDO_Y0 + RAPIDO_A, tx, ty, false);
+  if (deitado(sistema_area())) {
+    if (tx < PAG_X) {                                     // a lista
+      int dy = 0;
+      const int i = lista_item_tocado(&s_lista, tx, ty, &dy);
+      // Grupo e deslizante nao abrem nada (o deslizante foi tratado no nivel).
+      if (i >= 0 && i < LINHAS_N && LINHAS[i].tipo == L_PAGINA && LINHAS[i].valor != s_pag) { abrir_pagina(LINHAS[i].valor); }
       return;
     }
-    int dy = 0;
-    const int i = lista_item_tocado(&s_lista, tx, ty, &dy);
-    if (i >= 0 && i < PAG_N) { abrir_pagina(i); }
+    if (rolagem_foi_arraste(&s_rol_pag)) { return; }   // fim de arraste nao e clique
+    const int px = tx - s_dx_pag, py = ty + s_rol_pag.atual - s_dy_pag;
+    if (s_pag == PAG_INICIO) { return; }
+    if (PAGINAS[s_pag].tocar) { PAGINAS[s_pag].tocar(px, py); }
     return;
   }
-  if (!s_pin_editando && !s_wf_senha && tab5_dentro(tx, ty, 16, 16, VOLTAR_L, VOLTAR_A)) { abrir_pagina(PAG_INICIO); return; }
-  if (PAG_TOCAR[s_pag]) { PAG_TOCAR[s_pag](tx, ty); }
+  if (s_pag == PAG_INICIO) {
+    int dy = 0;
+    const int i = lista_item_tocado(&s_lista, tx, ty, &dy);
+    if (i >= 0 && i < LINHAS_N && LINHAS[i].tipo == L_PAGINA) { abrir_pagina(LINHAS[i].valor); }
+    return;
+  }
+  if (!s_pin_editando && !s_wf_senha && s_mq_campo < 0 && tab5_dentro(tx, ty, 16, 16, VOLTAR_L, VOLTAR_A)) { abrir_pagina(PAG_INICIO); return; }
+  if (PAGINAS[s_pag].tocar) { PAGINAS[s_pag].tocar(tx, ty); }
 }
 
 static void ao_tocar_nivel(int x, int y, bool pressionado)
 {
   // Teclado aberto (senha do Wi-Fi ou PIN): os dedos sao dele.
-  if (tecvirt_aberto(&s_kb)) {
+  if (tecvirt_aberto(&s_cfg_kb)) {
     int acoes[8];
-    const int n = tecvirt_nivel(&s_kb, acoes, 8);
-    for (int i = 0; i < n && tecvirt_aberto(&s_kb); ++i) {
+    const int n = tecvirt_nivel(&s_cfg_kb, acoes, 8);
+    for (int i = 0; i < n && tecvirt_aberto(&s_cfg_kb); ++i) {
       if (s_wf_senha)          { wf_tecla(acoes[i]); }
       else if (s_pin_editando) { pin_tecla(acoes[i]); }
+      else if (s_mq_campo >= 0) { mq_tecla(acoes[i]); }
     }
     return;
   }
+  // ARBITRAGEM DEDO x ROLAGEM: so a DESCIDA do dedo sobre o trilho de um
+  // deslizante agarra o controle - dai ate soltar o dedo e dele (o valor segue o
+  // x) e a lista nao rola. Dedo que desceu fora do trilho rola a lista, passe
+  // por onde passar; toque curto abre a pagina (ao_tocar).
+  const bool lista_visivel = deitado(sistema_area()) || s_pag == PAG_INICIO;
+  if (!pressionado) { s_desl_preso = -1; s_dedo_antes = false; }
+  else if (!s_dedo_antes) {
+    s_dedo_antes = true;
+    s_desl_preso = lista_visivel ? deslizante_sob(x, y) : -1;
+  }
+  if (s_desl_preso >= 0) {
+    mexer_deslizante(s_desl_preso, x);
+    return;   // a lista nem ve este dedo: sem ancora de rolagem, sem arraste a ser lido como clique
+  }
+  if (deitado(sistema_area())) {
+    // CADA ZONA SABE, A CADA AMOSTRA, SE O DEDO ESTA NELA - e solta a ancora
+    // quando nao esta (soltou, ou passou para outra coluna). Antes a soltura
+    // ia so para a coluna onde a coordenada caia: a pagina guardava o ultimo
+    // ponto do arraste, o toque seguinte media dali e ela pulava para cima.
+    const bool na_lista  = pressionado && x < PAG_X;
+    const bool na_pagina = pressionado && x >= PAG_X && s_pag != PAG_INICIO;
+    if (lista_arrastar(&s_lista, x, y, na_lista)) { sistema_pedir_redesenho(); }
+    if (rolagem_arrastar(&s_rol_pag, y, na_pagina)) { sistema_pedir_redesenho(); }
+    return;
+  }
   if (s_pag == PAG_INICIO) {
-    // Arrastar o dedo na barra de brilho/volume ajusta ao vivo.
-    if (pressionado && y >= 0 && y < DIVISOR_Y) {
-      mexer_rapido(y < RAPIDO_Y0 + RAPIDO_A ? RAPIDO_Y0 : RAPIDO_Y0 + RAPIDO_A, x, y, true);
-    }
     if (lista_arrastar(&s_lista, x, y, pressionado)) { sistema_pedir_redesenho(); }
   } else if (s_pag == PAG_BLUETOOTH) {
     if (lista_arrastar(&s_l_bt, x, y, pressionado)) { sistema_pedir_redesenho(); }
@@ -1703,91 +885,8 @@ static void ao_tocar_nivel(int x, int y, bool pressionado)
 static void ao_teclar(const char* txt, uint8_t codigo, uint8_t)
 {
   if (s_pag == PAG_MESH) { teclar_mesh(txt, codigo); }
+  if (s_pag == PAG_MQTT) { teclar_mqtt(txt, codigo); }
   if (s_pag == PAG_WIFI) { teclar_wifi(txt, codigo); }
-}
-
-// ---------------------------------------------------------------------------
-// ICONE DA TELA INICIAL
-// ---------------------------------------------------------------------------
-// Primitivas e fracao do lado, como a marca do Mesh: sai limpo em qualquer
-// tamanho, nao gasta flash e nao serrilha. A letra grande que estava aqui era
-// a fonte embutida ampliada 6x - cada pixel dela virava um quadrado de 6.
-
-// ENGRENAGENS QUE ENGRENAM DE VERDADE (terceira versao).
-//
-// A anterior tinha a composicao certa - grande, e duas menores ao
-// lado, como na referencia do icone de ajustes classico - mas as tres se
-// SOBREPUNHAM: a distancia entre centros era bem menor que a soma dos raios, e
-// viravam um borrao so. Agora e engrenagem de verdade:
-//   - MESMO PASSO de dente nas tres (PASSO, % do lado): so assim o dente de
-//     uma cabe no vao da outra; o raio de cada uma sai do numero de dentes;
-//   - distancia entre centros = soma dos raios primitivos (onde os dentes se
-//     encontram);
-//   - FASE calculada: a grande aponta um dente para a media, a media poe um
-//     VAO ali; para a pequena, a fase compensa onde o dente da grande caiu.
-// Dente TRAPEZIOIDAL (mais largo na raiz que na ponta), baixo e largo - o
-// dente fino e comprido da primeira prova lia como sol, nao engrenagem.
-// Prototipado em imagem antes (a mesma conta), conferido tambem a 96 px.
-static const float ENG_PASSO = 10.5f;   // passo circular, % do lado
-static const float ENG_DENTE = 6.0f;    // altura do dente, % do lado
-
-static float eng_raio(int n) { return (float)n * ENG_PASSO / (2.0f * (float)M_PI); }
-
-static void desenhar_engrenagem(lgfx::LovyanGFX& d, int x0, int y0, int lado,
-                                float cx, float cy, int n, float fase_graus,
-                                uint16_t escuro, uint16_t fundo)
-{
-  const float k  = (float)lado / 100.0f;   // % do lado -> pixels
-  const float rp = eng_raio(n);
-  const float rr = rp - ENG_DENTE / 2.0f;  // raiz
-  const float rt = rp + ENG_DENTE / 2.0f;  // ponta
-  auto px = [&](float v) { return x0 + (int)lroundf(v * k); };
-  auto py = [&](float v) { return y0 + (int)lroundf(v * k); };
-
-  d.fillCircle(px(cx), py(cy), (int)lroundf(rr * k), escuro);
-  const float passo = 360.0f / (float)n;
-  const float hb = passo * 0.36f * (float)M_PI / 180.0f;   // meia largura na raiz
-  const float ht = passo * 0.22f * (float)M_PI / 180.0f;   // meia largura na ponta
-  for (int i = 0; i < n; ++i) {
-    const float a = (fase_graus + (float)i * passo) * (float)M_PI / 180.0f;
-    const int x1 = px(cx + rr * cosf(a - hb)), y1 = py(cy + rr * sinf(a - hb));
-    const int x2 = px(cx + rt * cosf(a - ht)), y2 = py(cy + rt * sinf(a - ht));
-    const int x3 = px(cx + rt * cosf(a + ht)), y3 = py(cy + rt * sinf(a + ht));
-    const int x4 = px(cx + rr * cosf(a + hb)), y4 = py(cy + rr * sinf(a + hb));
-    d.fillTriangle(x1, y1, x2, y2, x3, y3, escuro);
-    d.fillTriangle(x1, y1, x3, y3, x4, y4, escuro);
-  }
-  // Furo do meio, na cor do fundo.
-  d.fillCircle(px(cx), py(cy), (int)lroundf(rr * 0.40f * k), fundo);
-}
-
-static void icone_config(lgfx::LovyanGFX& d, int x, int y, int lado)
-{
-  const uint16_t fundo  = d.color565(250, 205, 60);
-  const uint16_t escuro = d.color565(50, 42, 10);
-  d.fillRoundRect(x, y, lado, lado, lado / 6, fundo);
-
-  // Grande embaixo a esquerda; a media engrena nela para cima-direita (-40
-  // graus), a pequena para baixo-direita (+20). Folgas conferidas: nenhuma
-  // encosta na borda arredondada, e media e pequena nao se tocam.
-  const int   nG = 14, nM = 9, nP = 6;
-  const float gx = 40.0f, gy = 58.0f;
-  const float t1 = -40.0f, t2 = 20.0f;
-  const float rG = eng_raio(nG), rM = eng_raio(nM), rP = eng_raio(nP);
-  const float r2g = (float)M_PI / 180.0f;
-
-  const float mx = gx + (rG + rM) * cosf(t1 * r2g), my = gy + (rG + rM) * sinf(t1 * r2g);
-  const float sx = gx + (rG + rP) * cosf(t2 * r2g), sy = gy + (rG + rP) * sinf(t2 * r2g);
-
-  const float fG = t1;                              // dente da grande apontando para a media
-  const float fM = t1 + 180.0f + 180.0f / nM;       // vao da media no mesmo ponto
-  const float pG = 360.0f / nG;
-  const float dlt = t2 - (fG + roundf((t2 - fG) / pG) * pG);   // onde o dente da grande caiu
-  const float fP = (t2 + 180.0f - dlt * rG / rP) + 180.0f / nP;
-
-  desenhar_engrenagem(d, x, y, lado, gx, gy, nG, fG, escuro, fundo);
-  desenhar_engrenagem(d, x, y, lado, mx, my, nM, fM, escuro, fundo);
-  desenhar_engrenagem(d, x, y, lado, sx, sy, nP, fP, escuro, fundo);
 }
 
 
@@ -1804,6 +903,7 @@ static uint32_t periodo_agora(void)
   if (sistema_grove_sondando()) { return 500; }
   switch (s_pag) {
     case PAG_TELA:      return 0;
+    case PAG_IDIOMA:    return 0;
     case PAG_WIFI:      return tab5_wifi_procurando() ? 500 : 1000;
     case PAG_BLUETOOTH: return tab5_ble_varrendo() ? 500 : 1000;
     case PAG_USB: {
@@ -1817,10 +917,9 @@ static uint32_t periodo_agora(void)
 
 extern const app_t APP_CONFIG = {
   .nome  = "Ajustes",
-  .cor   = TFT_YELLOW,
+  .cor   = TEMA_APP_AMARELO,
   .perfil = { .alto_falante = true },
   .usa_sd = false,
-  .piso_repouso_mhz = 0,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -1831,4 +930,5 @@ extern const app_t APP_CONFIG = {
   .periodo_agora = periodo_agora,
   .altura_conteudo = 0,   // nao rola inteiro: a lista e as paginas rolam por dentro
   .icone = icone_config,
+  .fundo_tema = true,   // ja migrado para o tema central
 };

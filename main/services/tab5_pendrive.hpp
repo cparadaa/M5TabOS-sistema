@@ -49,7 +49,7 @@
 //   - nao comeca com um app que EXIGE o cartao aberto (app_t.exige_sd), e esse
 //     app nao abre enquanto durar (o kernel mostra o motivo);
 //   - com o disco montado no computador a tela nao entra em repouso
-//     (SISTEMA_ACORDADO_PENDRIVE);
+//     (RECURSO_TELA_ACESA, kernel/recursos.h);
 //   - durante o pendrive o cabo nao e console nem gravacao, e a CPU fica no
 //     clock maximo enquanto o computador estiver falando;
 //   - barramento parado (cabo puxado sem ejetar, computador dormindo) por
@@ -66,7 +66,7 @@ typedef enum {
 // Por que a ultima tentativa nao ligou (PENDRIVE_OK = ligou ou nunca tentou).
 typedef enum {
   PENDRIVE_OK = 0,
-  PENDRIVE_RECUSA_APP,         // um app que exige o cartao esta aberto
+  PENDRIVE_RECUSA_APP,         // um app aberto exige ou segura o cartao (feche-o)
   PENDRIVE_RECUSA_EM_USO,      // um servico segurou o cartao alem do prazo
   PENDRIVE_RECUSA_SEM_CARTAO,  // sem cartao, ou ele nao respondeu
   PENDRIVE_RECUSA_SEM_DIARIO,  // falta a particao "reserva" (grave a tabela nova)
@@ -131,6 +131,8 @@ typedef struct {
   tab5_pendrive_usb_t    usb;
 } tab5_pendrive_estado_t;
 void tab5_pendrive_estado(tab5_pendrive_estado_t* e);
+// O motivo de uma recusa em palavras (o mesmo texto do log), para o console.
+const char* tab5_pendrive_motivo_texto(tab5_pendrive_motivo_t m);
 
 // Algo para a pessoa ver em Ajustes > USB (sessao em andamento, computador
 // oferecido, conflito da ultima volta) - Ajustes abre direto nessa pagina.
@@ -142,6 +144,13 @@ void tab5_pendrive_resultado_visto(void);
 // quem ve e o USB-Serial-JTAG (os quadros SOF que o computador manda a cada
 // 1 ms); carregador de parede nao manda SOF - nao conta.
 bool tab5_pendrive_pc_presente(void);
+
+// O CONSOLE SE REANUNCIA: solta o pull-up do D+ por um instante e religa - para
+// o computador e tirar e por o cabo. Para quando o cabo chegou com o chip em
+// sono leve: o USB nao respondeu a enumeracao e o Mac desistiu da porta. Nao
+// faz nada com o pendrive ligado ou com o computador ja vendo o console.
+// Bloqueia ~150 ms. Da tarefa de interface (services/tab5_bateria chama).
+void tab5_pendrive_console_reanunciar(void);
 
 // Boot, depois do sistema: registra o aviso e liga a vigia do cabo (que liga
 // o pendrive sozinho quando o ajuste pede - ajustes_pendrive()).

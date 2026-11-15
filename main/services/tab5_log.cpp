@@ -2,6 +2,7 @@
 #include "esp_attr.h"   // EXT_RAM_BSS_ATTR - buffers grandes na PSRAM
 #include "tab5_sd.hpp"
 #include "tab5_hora.hpp"   // tab5_hora_nome_do_dia
+#include "tab5_heap_psram.hpp"   // reinicios limpos da checagem do boot
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,10 +12,15 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"   // esp_reset_reason
+#include "esp_core_dump.h"
+#include "esp_rom_sys.h"    // esp_rom_get_reset_reason: o motivo cru do chip
+#include "esp_app_desc.h"   // esp_app_get_elf_sha256: o core dump e deste firmware?
+#include "esp_heap_caps.h"
 #include <time.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <atomic>
 
 static const char* TAG = "log";
 
@@ -93,14 +99,14 @@ void tab5_log_estado(size_t* bytes_pendentes, uint32_t* linhas_gravadas,
 // CCM. Cada recusa vira um contador; a tarefa de log imprime um resumo, no
 // maximo uma linha por minuto.
 static volatile int64_t  s_ccm_cadeia_ate = 0;
-static volatile uint32_t s_ccm_recusas    = 0;
+static std::atomic<uint32_t> s_ccm_recusas    = 0;
 
 static bool ruido_da_ccm(const char* linha)
 {
   const int64_t agora = esp_timer_get_time();
   if (strstr(linha, "ISP_CCM") && strstr(linha, "out of range")) {
     s_ccm_cadeia_ate = agora + 10000;
-    s_ccm_recusas = s_ccm_recusas + 1;
+    ++s_ccm_recusas;
     return true;
   }
   if (agora > s_ccm_cadeia_ate) { return false; }
@@ -281,9 +287,73 @@ void tab5_log_iniciar(void)
     case ESP_RST_DEEPSLEEP: motivo = "acordou do sono profundo"; break;
     default: break;
   }
+  // O MOTIVO CRU DO CHIP (soc_reset_reason_t, soc/reset_reasons.h) vai junto:
+  // nesta placa o "outro watchdog" (codigo 7) tambem aparece quando o aparelho
+  // volta pelo botao depois de desligado (visto 06/11/2026: depois da guarda
+  // da bateria desligar em 0%). So o cru separa um do outro.
+  const int cru = (int)esp_rom_get_reset_reason(0);
   if (r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT) {
-    ESP_LOGW(TAG, "boot: o ultimo reinicio foi %s (codigo %d)", motivo, (int)r);
+    ESP_LOGW(TAG, "boot: o ultimo reinicio foi %s (codigo %d, chip %d)", motivo, (int)r, cru);
+    tab5_log_travamento(false);
   } else {
-    ESP_LOGI(TAG, "boot: o ultimo reinicio foi %s (codigo %d)", motivo, (int)r);
+    ESP_LOGI(TAG, "boot: o ultimo reinicio foi %s (codigo %d, chip %d)", motivo, (int)r, cru);
   }
+  if (const uint32_t n = tab5_heap_psram_reinicios()) {
+    ESP_LOGW(TAG, "boot: heap da PSRAM estragado antes do M5.begin - %lu reinicio(s) limpo(s) seguido(s)",
+             (unsigned long)n);
+  }
+}
+
+// O RETRATO DO ULTIMO TRAVAMENTO (core dump na flash, ver partitions.csv). A
+// tarefa, onde estava (PC) e quem chamou (RA): com o .elf da mesma versao,
+//   riscv32-esp-elf-addr2line -pfiaC -e build/M5tabOS.elf <PC> <RA>
+// diz a linha. Um watchdog que travou os DOIS nucleos nao chega a gravar nada.
+bool tab5_log_travamento(bool no_console)
+{
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+  if (esp_core_dump_image_check() != ESP_OK) {
+    if (no_console) { printf("nenhum travamento guardado na flash\n"); }
+    return false;
+  }
+  esp_core_dump_summary_t* r = (esp_core_dump_summary_t*)heap_caps_malloc(sizeof(esp_core_dump_summary_t), MALLOC_CAP_SPIRAM);
+  if (!r) { return false; }
+  const bool ok = esp_core_dump_get_summary(r) == ESP_OK;
+  if (ok) {
+    char sha[APP_ELF_SHA256_SZ + 1];
+    memcpy(sha, r->app_elf_sha256, APP_ELF_SHA256_SZ);
+    sha[APP_ELF_SHA256_SZ] = '\0';
+    // DESTE FIRMWARE? O retrato fica na flash ate outro travamento o trocar, e
+    // gravar um firmware novo nao apaga: sem isto, um travamento de semanas
+    // atras parece de hoje a cada boot.
+    char meu[APP_ELF_SHA256_SZ + 1] = "";
+    esp_app_get_elf_sha256(meu, sizeof(meu));
+    const bool deste = strncmp(meu, sha, 8) == 0;
+    // Aviso (W): vai ao cartao na hora, sem esperar a descarga de 60 s.
+    ESP_LOGW(TAG, "travamento: tarefa '%s', PC 0x%08lx, RA 0x%08lx, SP 0x%08lx, mcause %lu, mtval 0x%08lx (elf %.8s, %s)",
+             r->exc_task, (unsigned long)r->exc_pc, (unsigned long)r->ex_info.ra, (unsigned long)r->ex_info.sp,
+             (unsigned long)r->ex_info.mcause, (unsigned long)r->ex_info.mtval, sha,
+             deste ? "DESTE firmware" : "de um firmware anterior");
+    // Os enderecos de codigo que estavam na pilha: quase sempre a cadeia de
+    // chamadas (0x4xxxxxxx), na ordem em que aparecem.
+    char linha[160];
+    int k = 0, n = 0;
+    for (uint32_t i = 0; i + 4 <= r->exc_bt_info.dump_size && n < 16; i += 4) {
+      uint32_t v;
+      memcpy(&v, r->exc_bt_info.stackdump + i, 4);
+      if (v < 0x40000000u || v >= 0x44000000u) { continue; }
+      k += snprintf(linha + k, sizeof(linha) - (size_t)k, " 0x%08lx", (unsigned long)v);
+      ++n;
+      if (k > (int)sizeof(linha) - 14) {
+        ESP_LOGW(TAG, "travamento: pilha%s", linha);
+        k = 0;
+      }
+    }
+    if (k) { ESP_LOGW(TAG, "travamento: pilha%s", linha); }
+  }
+  heap_caps_free(r);
+  return ok;
+#else
+  if (no_console) { printf("core dump desligado no sdkconfig\n"); }
+  return false;
+#endif
 }

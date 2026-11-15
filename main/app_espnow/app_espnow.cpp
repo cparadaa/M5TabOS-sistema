@@ -10,12 +10,15 @@
 // firmware oficial de ESP-NOW, por exemplo). Em difusao nao existe ACK - o
 // visto verde diz "saiu pela antena", nao "alguem recebeu".
 #include "app.h"
+#include "idioma.h"
 #include "conversa.hpp"
 #include "pintura.hpp"
 #include "tab5_espnow.hpp"
 #include "tab5_wifi.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
 #include "tab5_tela.hpp"
+#include "ajustes.h"
 #include <cstdio>
 #include <cstring>
 #include "esp_attr.h"   // EXT_RAM_BSS_ATTR
@@ -37,8 +40,15 @@ static const int BARRA_A = 88;
 static const uint8_t CANAIS[] = { 0, 1, 6, 11 };
 static int s_pilula_x0 = -1, s_pilula_x1 = -1;   // onde ela foi desenhada (x da area)
 
+// O TAMANHO DA LETRA DA CONVERSA: o botao "Aa" da barra passa ao proximo
+// (guardado nos ajustes). 1.0 e o calibrado no Mesh; o resto, para ler de
+// longe com o aparelho na mesa.
+static const float LETRA[AJUSTES_ESPNOW_LETRA_MAX + 1] = { 1.0f, 1.2f, 1.4f, 1.65f };
+static int s_aa_x0 = -1, s_aa_x1 = -1;
+
 // Cor estavel por aparelho: o mesmo MAC tem sempre a mesma cor no rotulo, e
 // numa mesa com tres Cardputers da para saber quem e quem de relance.
+// Sao cores de DADO (identificam o aparelho): ficam fora do tema.
 static uint16_t cor_do_mac(const uint8_t mac[6])
 {
   static const uint16_t CORES[] = { TFT_SKYBLUE, TFT_ORANGE, TFT_GREENYELLOW, TFT_PINK,
@@ -73,8 +83,8 @@ static bool ler(int i, conversa_msg_t* out, void*)
   // na mesa, diz quem fala o formato do componente esp-now e quem manda texto puro.
   out->meta[0] = 0;
   if (!m.minha) {
-    snprintf(out->meta, sizeof(out->meta), "%s", m.espressif ? "esp-now Espressif" : "texto puro");
-    out->cor_meta = m.espressif ? TFT_SKYBLUE : TFT_DARKGREY;
+    snprintf(out->meta, sizeof(out->meta), "%s", m.espressif ? tr("esp-now Espressif") : tr("texto puro"));
+    out->cor_meta = m.espressif ? TEMA_DESTAQUE : TEMA_TEXTO_3;
   }
   return true;
 }
@@ -98,10 +108,10 @@ static int estado_agora(void)
 static const char* motivo(int est)
 {
   switch (est) {
-    case 0:  return "rádio C6 de fábrica: ESP-NOW pede atualização (opcional)";
-    case 1:  return "ligue o Wi-Fi em Ajustes (o C6 só tem energia com ele)";
-    case 2:  return "ligando o ESP-NOW...";
-    case 4:  return "rádio parado - ligue o Wi-Fi ou fixe um canal em Ajustes";
+    case 0:  return tr("rádio C6 de fábrica: ESP-NOW pede atualização (opcional)");
+    case 1:  return tr("ligue o Wi-Fi em Ajustes (o C6 só tem energia com ele)");
+    case 2:  return tr("ligando o ESP-NOW...");
+    case 4:  return tr("rádio parado - ligue o Wi-Fi ou fixe um canal em Ajustes");
     default: return "";
   }
 }
@@ -118,10 +128,10 @@ static void desenhar_barra(lgfx::LovyanGFX& d, const area_t& a, int est)
   const bool pe = a.largura < a.altura;
   if (fixo && est == 3 && real && real != fixo) {
     if (pe) { snprintf(canal, sizeof(canal), "ch %u? (%u)", (unsigned)real, (unsigned)fixo); }
-    else    { snprintf(canal, sizeof(canal), "canal %u?  fixo %u", (unsigned)real, (unsigned)fixo); }
-  } else if (fixo) { snprintf(canal, sizeof(canal), pe ? "ch %u" : "canal %u  fixo", (unsigned)fixo); }
-  else if (est == 3) { snprintf(canal, sizeof(canal), pe ? "ch %u" : "canal %u  roteador", (unsigned)tab5_espnow_canal()); }
-  else { snprintf(canal, sizeof(canal), pe ? "ch auto" : "canal: roteador"); }
+    else    { snprintf(canal, sizeof(canal), tr("canal %u?  fixo %u"), (unsigned)real, (unsigned)fixo); }
+  } else if (fixo) { snprintf(canal, sizeof(canal), pe ? tr("ch %u") : tr("canal %u  fixo"), (unsigned)fixo); }
+  else if (est == 3) { snprintf(canal, sizeof(canal), pe ? tr("ch %u") : tr("canal %u  roteador"), (unsigned)tab5_espnow_canal()); }
+  else { snprintf(canal, sizeof(canal), pe ? tr("ch auto") : tr("canal: roteador")); }
 
   char txt[80];
   if (est == 3) {
@@ -129,38 +139,38 @@ static void desenhar_barra(lgfx::LovyanGFX& d, const area_t& a, int est)
     tab5_espnow_meu_mac(mac);
     const uint32_t ms = tab5_espnow_ms_desde_rx();
     char ultimo[24];
-    if (ms == UINT32_MAX)  { snprintf(ultimo, sizeof(ultimo), "nada ouvido"); }
-    else if (ms < 60000)   { snprintf(ultimo, sizeof(ultimo), "último %lus", (unsigned long)(ms / 1000)); }
-    else                   { snprintf(ultimo, sizeof(ultimo), "último %lumin", (unsigned long)(ms / 60000)); }
+    if (ms == UINT32_MAX)  { snprintf(ultimo, sizeof(ultimo), tr("nada ouvido")); }
+    else if (ms < 60000)   { snprintf(ultimo, sizeof(ultimo), tr("último %lus"), (unsigned long)(ms / 1000)); }
+    else                   { snprintf(ultimo, sizeof(ultimo), tr("último %lumin"), (unsigned long)(ms / 60000)); }
     // EM PE NAO CABE O MAC. Depois do titulo e da pilula sobram ~150 px, e
     // a linha inteira encolhida ate o minimo ainda passava da borda. O MAC e
     // o dado que menos muda (e o do proprio Tab5): sai ele, fica o que diz
     // se ha alguem por perto.
     if (pe) {
-      snprintf(txt, sizeof(txt), "%d ouvido(s)  %s", tab5_espnow_vistos(), ultimo);
+      snprintf(txt, sizeof(txt), tr("%d ouvido(s)  %s"), tab5_espnow_vistos(), ultimo);
     } else {
-      snprintf(txt, sizeof(txt), "%02X:%02X:%02X:%02X:%02X:%02X   %d ouvido(s)   %s",
+      snprintf(txt, sizeof(txt), tr("%02X:%02X:%02X:%02X:%02X:%02X   %d ouvido(s)   %s"),
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], tab5_espnow_vistos(), ultimo);
     }
   } else {
-    snprintf(txt, sizeof(txt), "%s", est == 2 ? "ligando..." : est == 4 ? "rádio parado" : "fora do ar");
+    snprintf(txt, sizeof(txt), "%s", est == 2 ? tr("ligando...") : est == 4 ? tr("rádio parado") : tr("fora do ar"));
   }
 
   char tudo[128];
-  snprintf(tudo, sizeof(tudo), "%s|%s", canal, txt);
+  snprintf(tudo, sizeof(tudo), "%s|%u|%s", canal, (unsigned)ajustes_espnow_letra(), txt);
   const bool m1 = pintura_mudou_i(&s_p, &s_barra_estado, est);
   const bool m2 = pintura_mudou_s(&s_p, s_barra_txt, sizeof(s_barra_txt), tudo);
   if (!m1 && !m2) { return; }
 
-  const uint16_t FUNDO = d.color565(13, 17, 23);
+  const uint16_t FUNDO = TEMA_SUPERFICIE;   // a barra e um painel sobre o fundo da tela
   tab5_tela_limpar(a.x, a.y, a.largura, BARRA_A, FUNDO);
   const int cy = a.y + BARRA_A / 2;
-  const uint16_t cor = (est == 3) ? TFT_GREENYELLOW : (est == 2) ? TFT_ORANGE : TFT_DARKGREY;
+  const uint16_t cor = (est == 3) ? TEMA_SUCESSO : (est == 2) ? TEMA_ALERTA : TEMA_TEXTO_3;
   d.fillCircle(a.x + 34, cy, 15, cor);
 
   d.setTextDatum(middle_left);
   tab5_texto(d, 3.6f);
-  d.setTextColor(TFT_WHITE, FUNDO);
+  d.setTextColor(TEMA_TEXTO, FUNDO);
   d.drawString("ESP-NOW", a.x + 64, cy);
   int x = a.x + 64 + (int)d.textWidth("ESP-NOW") + 28;
 
@@ -168,13 +178,28 @@ static void desenhar_barra(lgfx::LovyanGFX& d, const area_t& a, int est)
   tab5_texto(d, 3.2f);
   const int pl = (int)d.textWidth(canal) + 44;
   const int pa = BARRA_A - 22;
-  const uint16_t cor_p = fixo ? d.color565(120, 70, 10) : d.color565(38, 60, 90);
+  const uint16_t cor_p = fixo ? (uint16_t)TEMA_DESTAQUE : (uint16_t)TEMA_SUPERFICIE_ALTA;   // canal fixo = destaque
   d.fillRoundRect(x, cy - pa / 2, pl, pa, pa / 2, cor_p);
-  d.setTextColor(TFT_WHITE, cor_p);
+  d.setTextColor(fixo ? (uint16_t)TEMA_SOBRE_DESTAQUE : (uint16_t)TEMA_TEXTO, cor_p);
   d.drawString(canal, x + 22, cy);
   s_pilula_x0 = x - a.x;
   s_pilula_x1 = x - a.x + pl;
-  x += pl + 24;
+  x += pl + 16;
+
+  // "Aa": o tamanho da letra da conversa. A letra do botao cresce com o nivel
+  // - o proprio botao mostra o que esta valendo.
+  const uint8_t nivel = ajustes_espnow_letra();
+  const int al = pa + 10;
+  const uint16_t cor_aa = TEMA_SUPERFICIE_ALTA;
+  d.fillRoundRect(x, cy - pa / 2, al, pa, pa / 2, cor_aa);
+  tab5_texto(d, 2.6f + 0.4f * nivel);
+  d.setTextColor(TEMA_TEXTO, cor_aa);
+  d.setTextDatum(middle_center);
+  d.drawString("Aa", x + al / 2, cy);
+  d.setTextDatum(middle_left);
+  s_aa_x0 = x - a.x;
+  s_aa_x1 = x - a.x + al;
+  x += al + 24;
 
   // O resto (MAC, ouvidos, ultimo) no MAIOR tamanho que caiba no que sobrou -
   // medido, nao chutado: em retrato ou com MAC comprido, encolhe sozinho em
@@ -189,9 +214,9 @@ static void desenhar_barra(lgfx::LovyanGFX& d, const area_t& a, int est)
   // No menor tamanho e ainda sem caber: corta no fim, por caractere (UTF-8),
   // em vez de passar da borda da tela.
   tab5_cortar_ao_caber(d, txt, sobra);
-  d.setTextColor(TFT_LIGHTGREY, FUNDO);
+  d.setTextColor(TEMA_TEXTO_2, FUNDO);
   d.drawString(txt, x, cy);
-  d.drawFastHLine(a.x, a.y + BARRA_A - 1, a.largura, d.color565(38, 42, 50));
+  d.drawFastHLine(a.x, a.y + BARRA_A - 1, a.largura, TEMA_LINHA);
   d.setTextDatum(top_left);
 }
 
@@ -226,6 +251,7 @@ static bool ao_abrir(void)
   s_barra_estado = -1;
   s_barra_txt[0] = 0;
   conversa_abrir(&s_c, &s_p, contar, ler, enviar, nullptr);
+  conversa_escala(&s_c, LETRA[ajustes_espnow_letra()]);
   tab5_espnow_marcar_lidas();
   tab5_espnow_janela(true);    // conversa na frente: o servico pede o receptor ligado
   return true;
@@ -260,6 +286,12 @@ static void ao_tocar(int x, int y)
     sistema_pedir_redesenho();
     return;
   }
+  if (y < BARRA_A && s_aa_x0 >= 0 && x >= s_aa_x0 && x < s_aa_x1) {
+    const uint8_t n = (uint8_t)((ajustes_espnow_letra() + 1) % (AJUSTES_ESPNOW_LETRA_MAX + 1));
+    ajustes_definir_espnow_letra(n);
+    conversa_escala(&s_c, LETRA[n]);   // re-mede os baloes e pede a passada completa
+    return;
+  }
   if (y < BARRA_A) { return; }
   conversa_tocar(&s_c, x, y);
 }
@@ -277,7 +309,6 @@ extern const app_t APP_ESPNOW = {
   // (igual ao Mesh). A conversa e o componente do sistema e ja se mede pela
   // largura que chega - so a barra de cima precisa saber do retrato.
   .orientacao = ORI_SEGUE_IMU,
-  .piso_repouso_mhz = 0,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -288,4 +319,5 @@ extern const app_t APP_ESPNOW = {
   .avisos = AVISO_ESPNOW,
   .ao_aviso = ao_aviso,
   .icone = marca_espnow,
+  .fundo_tema = true,   // a conversa pega o fundo por sistema_cor_fundo()
 };

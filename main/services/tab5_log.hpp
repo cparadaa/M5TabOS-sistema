@@ -73,3 +73,9 @@ void tab5_log_descarregar_logo(void);
 // ("" se a captura ainda nao tentou escrever nenhuma vez).
 void tab5_log_estado(size_t* bytes_pendentes, uint32_t* linhas_gravadas,
                       uint32_t* linhas_perdidas, char* arquivo, size_t arquivo_tam);
+
+// O ULTIMO TRAVAMENTO guardado na flash (core dump): anota no log a tarefa, o
+// PC, o RA e os enderecos de codigo da pilha. O boot chama sozinho depois de
+// um panic ou watchdog; o console ('travamento') chama quando quiser.
+// false = nao ha nada guardado ('no_console' = diz isso no console).
+bool tab5_log_travamento(bool no_console);

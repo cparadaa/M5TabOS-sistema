@@ -7,7 +7,7 @@
 //
 // Quem escreve nas paginas e SO o compositor (kernel/compositor.cpp). Todo o
 // resto do sistema desenha na tela virtual (kernel/tela_virtual.cpp), que o
-// painel nunca le. Ver COMPOSITOR.md.
+// painel nunca le. Ver docs/COMPOSITOR.md.
 //
 // HISTORIA, para quem estranhar o tamanho: este modulo tinha
 // ~800 linhas de defesa contra escrever na pagina que o painel varre - faixas,
@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <atomic>
 #include <M5Unified.h>
 #include "tab5_quadro.hpp"
 
@@ -33,7 +34,7 @@ void tab5_tela_encerrar(void);
 // EPOCA DAS PAGINAS: sobe sempre que as paginas deixam de valer (painel
 // encerrado) ou nascem de novo. Le-se de graca - e o que deixa o compositor
 // conferir "minha pagina ainda existe?" a cada escrita sem chamar nada.
-extern volatile uint32_t g_tab5_tela_epoca;
+extern std::atomic<uint32_t> g_tab5_tela_epoca;
 
 // Sobe a cada painel novo. O compositor usa para saber que as paginas que ele
 // conhecia morreram (e que a tela inteira precisa ir para as novas).

@@ -29,6 +29,11 @@ except ImportError:
     sys.exit("Falta o pyserial. Rode:  source ambiente.sh && ./baixar.py")
 
 ORIGEM  = sys.argv[1] if len(sys.argv) > 1 else "/sdcard/apps/Sistema/energia.csv"
+# Binario (foto, firmware) vem em base64 ('despejar -b'): texto puro quebra
+# no primeiro byte nulo.
+BINARIO = ORIGEM.lower().endswith((".bmp", ".png", ".jpg", ".bin", ".mp3", ".wav"))
+import re
+B64 = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 DESTINO = ORIGEM.split("/")[-1]
 
 # DOIS PRAZOS, e a diferenca importa.
@@ -49,9 +54,16 @@ porta = portas[0]
 
 print(f">>> {porta}: pedindo {ORIGEM}")
 s = serial.Serial(porta, 115200, timeout=1)
-time.sleep(0.3)
+# ABRIR A PORTA REINICIA O TAB5 (USB-Serial-JTAG). Espera o boot assentar -
+# 2 s sem nada chegando, no maximo 20 s - antes de pedir: pedido no meio do
+# boot tem log do boot no meio do arquivo.
+fim_boot = time.time() + 20
+quieto = time.time()
+while time.time() < fim_boot and time.time() - quieto < 2:
+    if s.read(4096):
+        quieto = time.time()
 s.reset_input_buffer()
-s.write(f"despejar {ORIGEM}\n".encode())
+s.write(f"despejar {'-b ' if BINARIO else ''}{ORIGEM}\n".encode())
 
 linhas   = []
 dentro   = False
@@ -89,6 +101,12 @@ while time.time() < mudo_ate:
         sys.exit(f"O Tab5 respondeu: {linha}")
 
     if dentro:
+        # Log de outra tarefa que escapou do silencio (ex.: um driver com
+        # nivel proprio): linha inteira de log, nao e do arquivo.
+        # Binario: so base64 e do arquivo. Log de outra tarefa que escapou do
+        # silencio, um printf de outro servico, linha vazia da serial: fora.
+        if BINARIO and (not linha or not B64.match(linha)):
+            continue
         linhas.append(linha)
         if len(linhas) % 200 == 0:
             print(f"    {len(linhas)} linhas", end="\r", flush=True)
@@ -103,6 +121,25 @@ if contadas is None:
                  "  - o cartao esta no aparelho?")
     sys.exit(f"\nO despejo parou no meio ({len(linhas)} linhas). "
              "Rode de novo - arquivo pela metade nao serve para ajustar curva.")
+
+if BINARIO:
+    import base64
+    # Linha a linha: cada uma sao 57 bytes inteiros (76 caracteres), entao
+    # uma linha estragada na serial se acha e se conta, em vez de virar um
+    # erro de "padding" no fim.
+    ruins = [i for i, l in enumerate(linhas[:-1]) if len(l) != 76]
+    if ruins:
+        sys.exit(f"!!! {len(ruins)} linha(s) estragada(s) na serial (ex.: linha {ruins[0]}: "
+                 f"{linhas[ruins[0]][:40]!r}) - rode de novo.")
+    dados = b"".join(base64.b64decode(l) for l in linhas)
+    open(DESTINO, "wb").write(dados)
+    print(f"\n>>> {DESTINO}: {len(dados)} bytes")
+    if esperado is not None and len(dados) != esperado:
+        # Gravado mesmo assim: numa foto, 0,2% a menos e uma faixa torta, e
+        # ela ainda serve para olhar. Para firmware, NAO - rode de novo.
+        sys.exit(f"!!! o Tab5 disse {esperado} bytes e chegaram {len(dados)} (gravado assim mesmo) - "
+                 "para foto serve; para o resto, rode de novo.")
+    sys.exit(0)
 
 corpo = "\n".join(linhas) + "\n"
 open(DESTINO, "w").write(corpo)

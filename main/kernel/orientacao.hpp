@@ -22,12 +22,14 @@
 // calculado a partir delas precisa ver o valor novo.
 void orientacao_ao_abrir(const app_t* app);
 
-// O app fechou: volta em pe (a home e sempre em pe) e para de vigiar.
+// O app fechou: volta em pe (a home e em pe; deitada com o teclado fisico
+// encaixado) e para de vigiar o IMU.
 void orientacao_ao_fechar(void);
 
-// Uma volta da vigia. 'pode_girar' = nenhum dedo na tela, nada na frente do
-// app (bloqueio), app ja aberto de fato. A amostragem continua mesmo quando
-// nao pode - so a troca espera.
+// Uma volta da vigia. 'pode_girar' = nenhum dedo na tela, nada na frente
+// (bloqueio). A amostragem continua mesmo quando nao pode - so a troca
+// espera. Vale tambem na home: encaixar ou tirar o teclado fisico gira a tela
+// de qualquer um (ver s_teclado no .cpp); o IMU so para app ORI_SEGUE_IMU.
 //
 // Devolve true quando GIROU nesta chamada: quem chama pede a passada
 // completa e avisa o app (ao_girar).

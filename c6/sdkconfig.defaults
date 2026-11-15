@@ -82,3 +82,31 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584
 # Retrato do travamento na particao 'coredump' (partitions.csv): sobrevive ao
 # reinicio, e o INFO avisa o P4 que ha um guardado.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
+# --- ENERGIA -----------------------------------------------------------------
+# Clock variavel (DFS) para o Wi-Fi soltar a CPU entre beacons - ver o bloco
+# "CLOCK VARIAVEL" no app_main.c. Light sleep continua fora (SDIO escravo).
+CONFIG_PM_ENABLE=y
+
+# --- O HOST DORME, O C6 TAMBEM (firmware c6-5) ---------------------------------
+# O "host power save" do esp_hosted: o P4 avisa pela interrupcao do SDIO, o
+# escravo e desmontado e este chip pode entrar em light sleep associado; o
+# trafego para o host o acorda pelo IO2 (fio ate o G14 do P4). "DEEP_SLEEP" e
+# o nome que o esp_hosted da a opcao do pino de despertar - o P4 NAO entra em
+# deep sleep, ele fica em light sleep e remonta o enlace (main/hal/tab5_c6_sono).
+# Pulso no boot desligado: o P4 so escuta o G14 quando pediu para dormir.
+CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS=y
+CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS_DEEP_SLEEP=y
+CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS_WAKE_HOST_ON_CP_BOOT=n
+CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS_HOST_WAKEUP_GPIO=2
+CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS_HOST_WAKEUP_GPIO_LEVEL_HIGH=y
+# Sem tickless o light sleep do PM nunca acontece; os callbacks contam o sono
+# para o INFO (o P4 nao ve a serial daqui).
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+# O BLE do C6 so dorme junto com o tickless se o MAC/baseband apagar no sono
+# (bt.c exige). Custa ~5 KB de RAM (retencao de Wi-Fi + BT) e economiza mais.
+CONFIG_ESP_PHY_MAC_BB_PD=y
+# Tempo em cada modo do PM (inclusive SLEEP) na tabela de travas que o P4 pede
+# ('c6 travas'): e assim que se ve, do P4, se o light sleep acontece.
+CONFIG_PM_PROFILING=y

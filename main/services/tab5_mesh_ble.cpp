@@ -1,4 +1,5 @@
 #include "tab5_mesh_ble.hpp"
+#include "idioma.h"
 #include "tab5_hora.hpp"   // tab5_agora_ms
 #include "tab5_ble.hpp"
 #include "tab5_donos.hpp"
@@ -126,7 +127,7 @@ static int ao_gap(struct ble_gap_event* ev, void*)
           s_pin_conn = ev->passkey.conn_handle;
           s_pin_esperando = true;
           estado("digite o PIN que o nó mostra");
-          if (s_notif >= 0) { notif_publicar(s_notif, 1, NOTIF_ATENCAO, "PIN do Meshtastic"); }
+          if (s_notif >= 0) { notif_publicar(s_notif, 1, NOTIF_ATENCAO, tr("PIN do Meshtastic")); }
           ESP_LOGI(TAG, "o no pediu o PIN - esperando o usuario (Ajustes > Meshtastic)");
           break;
         }
@@ -468,7 +469,11 @@ static void vTaskMeshBle(void*)
     s_ler = true;   // o que o no ja tinha na queue
     TickType_t ultima = xTaskGetTickCount();
     while (conexao_viva() && !parada_pedida(&s_parada)) {
-      ulTaskNotifyTake(pdTRUE, s_ler ? 0 : pdMS_TO_TICKS(1000));
+      // Tudo que interessa ACORDA esta tarefa: o aviso do fromNum, um envio
+      // na fila, a queda da conexao e o pedido de parada (xTaskNotifyGive).
+      // O prazo e so a leitura de seguranca (VOLTA_MS) - era 1 s, cinco
+      // despertares a toa para cada um util com o no conectado.
+      ulTaskNotifyTake(pdTRUE, s_ler ? 0 : pdMS_TO_TICKS(VOLTA_MS));
       while (xQueueReceive(s_tx, &s_envio, 0) == pdTRUE) {
         if (escrever(s_h_to, s_envio.d, s_envio.n) != 0) { ESP_LOGW(TAG, "escrita no toRadio falhou"); }
         s_ler = true;   // a resposta vem pelo fromRadio
@@ -576,12 +581,6 @@ bool        mesh_ble_conectado(void) { return s_conectado; }
 const char* mesh_ble_descricao(void) { return s_estado; }
 
 bool mesh_ble_rodando(void) { return parada_rodando(&s_parada); }
-
-void mesh_ble_no(char nome[24], char endereco[18])
-{
-  if (nome)     { snprintf(nome, 24, "%s", s_conectado ? s_nome : ""); }
-  if (endereco) { snprintf(endereco, 18, "%s", s_conectado ? s_end : ""); }
-}
 
 bool mesh_ble_esperando_pin(void) { return s_pin_esperando; }
 

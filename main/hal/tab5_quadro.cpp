@@ -1,6 +1,7 @@
 #include "tab5_quadro.hpp"
 
 #include <string.h>
+#include <atomic>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -15,6 +16,8 @@
 #include "soc/mipi_dsi_bridge_struct.h"
 #include "soc/mipi_dsi_host_struct.h"
 #include "esp_cpu.h"
+#include "esp_intr_alloc.h"   // esp_intr_dump (tab5_quadro_listar_irqs)
+#include "riscv/rv_utils.h"   // RV_READ_CSR(mepc)
 #include "esp_private/esp_clk.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
@@ -46,7 +49,7 @@ static SemaphoreHandle_t      s_troca  = nullptr;   // dado a cada fim de frame
 static esp_async_fbcpy_handle_t s_dma2d = nullptr;
 static SemaphoreHandle_t        s_dma2d_fim = nullptr;
 static ppa_client_handle_t      s_ppa   = nullptr;
-static volatile uint32_t      s_quadros = 0;
+static std::atomic<uint32_t>      s_quadros = 0;
 
 // ---------------------------------------------------------------------------
 // CONTADOR DE UNDERRUN
@@ -60,14 +63,14 @@ static volatile uint32_t      s_quadros = 0;
 //
 // Roda dentro de ISR: IRAM, sem chamada nenhuma, so comparacao de caractere.
 static const char     PALAVRA[] = "underrun";
-static volatile uint8_t  s_casou = 0;
-static volatile uint32_t s_underruns = 0;
+static std::atomic<uint8_t>  s_casou = 0;
+static std::atomic<uint32_t> s_underruns = 0;
 
 static void IRAM_ATTR vigia_canal2(char c)
 {
   if (c == PALAVRA[s_casou]) {
-    s_casou = s_casou + 1;
-    if (s_casou == sizeof(PALAVRA) - 1) { s_underruns = s_underruns + 1; s_casou = 0; }
+    ++s_casou;
+    if (s_casou == sizeof(PALAVRA) - 1) { ++s_underruns; s_casou = 0; }
   } else {
     s_casou = (c == PALAVRA[0]) ? 1 : 0;
   }
@@ -103,11 +106,11 @@ static void IRAM_ATTR vigia_canal2(char c)
 // 3) A COR DO UNDERRUN - ver tab5_quadro_iniciar.
 static volatile int64_t  s_ult_us      = 0;   // em us (esp_timer), NAO ciclos - ver a ISR
 static volatile uint32_t s_periodo_min = UINT32_MAX;   // us
-static volatile uint32_t s_atrasos     = 0;            // desde o boot
+static std::atomic<uint32_t> s_atrasos     = 0;            // desde o boot
 static volatile uint32_t s_pior_atraso = 0;            // us, desde a ultima leitura
 static volatile uint32_t s_dsi_st0     = 0;            // OU acumulado desde a ultima leitura
 static volatile uint32_t s_dsi_st1     = 0;
-static volatile uint32_t s_dsi_erros   = 0;
+static std::atomic<uint32_t> s_dsi_erros   = 0;
 static volatile bool     s_primeiro_quadro = true;
 // QUEM ESTAVA RODANDO quando o frame atrasado finalmente foi atendido. A ISR
 // interrompe justamente quem segurou o core (interrupcoes desligadas, secao
@@ -115,12 +118,17 @@ static volatile bool     s_primeiro_quadro = true;
 // espera cruzada (trava do kernel, operacao de flash) prende o outro tambem.
 static char              s_atr_t[2][16];
 static volatile int      s_atr_nucleo = -1;   // core em que a ISR roda (-1 = nenhum atraso ainda)
-static volatile uint32_t s_atr_seq = 0;       // sobe a cada registro novo
-static volatile int64_t  s_atr_us  = 0;       // uptime (us) em que o frame atrasado foi atendido            // frames com algum bit, desde o boot
+static std::atomic<uint32_t> s_atr_seq = 0;       // sobe a cada registro novo
+static volatile int64_t  s_atr_us  = 0;       // uptime (us) em que o frame atrasado foi atendido
+// ONDE o core estava quando a ISR atrasada finalmente entrou (o mepc: o
+// endereco de retorno da interrupcao). Dentro do IDLE = outra ISR segurou o
+// core antes; dentro de vPortExitCritical/esp_cache/esp_pm = secao critica,
+// e o endereco diz qual (addr2line no build/M5tabOS.elf).
+static volatile uint32_t s_atr_pc  = 0;            // frames com algum bit, desde o boot
 
 static bool IRAM_ATTR ao_fim_do_quadro(esp_lcd_panel_handle_t, esp_lcd_dpi_panel_event_data_t*, void*)
 {
-  s_quadros = s_quadros + 1;   // escritor unico: esta ISR
+  ++s_quadros;   // escritor unico: esta ISR
 
   // EM MICROSSEGUNDOS, E NAO EM CICLOS. Ciclos contam no ritmo do
   // clock da CPU, e o clock muda (360 -> 40 no repouso): o monitor dividia
@@ -135,7 +143,7 @@ static bool IRAM_ATTR ao_fim_do_quadro(esp_lcd_panel_handle_t, esp_lcd_dpi_panel
     } else if (intervalo < s_periodo_min) {
       s_periodo_min = intervalo;
     } else if (intervalo > s_periodo_min + s_periodo_min / 2) {
-      s_atrasos = s_atrasos + 1;
+      ++s_atrasos;
       if (intervalo > s_pior_atraso) { s_pior_atraso = intervalo; }
       for (int c = 0; c < 2; ++c) {
         const char* nm = pcTaskGetName(xTaskGetCurrentTaskHandleForCore(c));
@@ -144,8 +152,9 @@ static bool IRAM_ATTR ao_fim_do_quadro(esp_lcd_panel_handle_t, esp_lcd_dpi_panel
         s_atr_t[c][k] = 0;
       }
       s_atr_nucleo = xPortGetCoreID();
+      s_atr_pc = (uint32_t)RV_READ_CSR(mepc);
       s_atr_us = agora;
-      s_atr_seq = s_atr_seq + 1;
+      ++s_atr_seq;
     }
   }
   s_ult_us = agora;
@@ -157,7 +166,7 @@ static bool IRAM_ATTR ao_fim_do_quadro(esp_lcd_panel_handle_t, esp_lcd_dpi_panel
   // novo trazia st0=0x40 (bit 6 do ACK = "false control error" observado pelo
   // painel durante o init) - sempre um, sempre ali, nunca depois.
   if (s_primeiro_quadro) { s_primeiro_quadro = false; }
-  else if (st0 | st1) { s_dsi_st0 |= st0; s_dsi_st1 |= st1; s_dsi_erros = s_dsi_erros + 1; }
+  else if (st0 | st1) { s_dsi_st0 |= st0; s_dsi_st1 |= st1; ++s_dsi_erros; }
 
   BaseType_t acordou = pdFALSE;
   xSemaphoreGiveFromISR(s_troca, &acordou);
@@ -369,6 +378,52 @@ uint32_t tab5_quadro_atrasos(uint32_t* pior_us, uint32_t* periodo_us)
 }
 
 int64_t tab5_quadro_atraso_quando(void) { return s_atr_us; }
+uint32_t tab5_quadro_atraso_pc(void) { return s_atr_pc; }
+
+void tab5_quadro_listar_irqs(void) { esp_intr_dump(stdout); }
+
+// PROVA DO ATRASO: segura o core 'nucleo' por 'ms', ou com as interrupcoes
+// desligadas (portDISABLE_INTERRUPTS: nada entra, como uma ISR longa de
+// nivel alto) ou numa secao critica (portENTER_CRITICAL: mascara os niveis
+// 1-3 - os das ISRs comuns, a do painel inclusive). 'vezes' repeticoes com
+// 1 s entre elas, para dar tempo de ver a tela. Se a tela piscar, o atraso da
+// ISR do painel e a causa da piscada; se nao piscar, a causa e outra.
+struct prova_t { int ms, vezes; bool critica; SemaphoreHandle_t fim; };
+static void tarefa_prova(void* arg)
+{
+  prova_t* p = (prova_t*)arg;
+  static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+  for (int i = 0; i < p->vezes; ++i) {
+    if (p->critica) {
+      portENTER_CRITICAL(&mux);
+      esp_rom_delay_us((uint32_t)p->ms * 1000u);
+      portEXIT_CRITICAL(&mux);
+    } else {
+      portDISABLE_INTERRUPTS();
+      esp_rom_delay_us((uint32_t)p->ms * 1000u);
+      portENABLE_INTERRUPTS();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  xSemaphoreGive(p->fim);
+  vTaskDelete(nullptr);
+}
+
+bool tab5_quadro_prova_atraso(int ms, bool critica, int nucleo, int vezes)
+{
+  // Teto de 100 ms: o watchdog de interrupcao (800 ms) fica longe.
+  if (ms < 1 || ms > 100 || nucleo < 0 || nucleo > 1 || vezes < 1 || vezes > 20) { return false; }
+  prova_t p = { ms, vezes, critica, xSemaphoreCreateBinary() };
+  if (!p.fim) { return false; }
+  // Pilha na RAM interna (a tarefa desliga interrupcoes: nada de PSRAM).
+  if (xTaskCreatePinnedToCore(tarefa_prova, "prova", 2048, &p, 5, nullptr, nucleo) != pdPASS) {
+    vSemaphoreDelete(p.fim);
+    return false;
+  }
+  xSemaphoreTake(p.fim, portMAX_DELAY);
+  vSemaphoreDelete(p.fim);
+  return true;
+}
 
 int64_t tab5_quadro_ultimo_fim_us(void) { return s_ult_us; }
 

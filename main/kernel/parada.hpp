@@ -48,17 +48,20 @@
 
 typedef struct {
   SemaphoreHandle_t saiu;     // dado pela tarefa ao sair; quem pediu espera nele
+  SemaphoreHandle_t acordar;  // tira a tarefa do parada_dormir (pedido ou cutucada)
   volatile bool     pedido;   // pediram para parar - a tarefa le a cada volta
   volatile bool     viva;     // ha uma execucao que ainda nao foi recolhida
 } parada_t;
 
-// Antes de criar a tarefa. O semaforo nasce uma vez e serve para sempre.
+// Antes de criar a tarefa. Os semaforos nascem uma vez e servem para sempre.
 // false = sem memoria (nao crie a tarefa).
 static inline bool parada_preparar(parada_t* p)
 {
-  if (!p->saiu) { p->saiu = xSemaphoreCreateBinary(); }
-  if (!p->saiu) { return false; }
-  xSemaphoreTake(p->saiu, 0);   // sobra de uma execucao anterior: nao conta para esta
+  if (!p->saiu)    { p->saiu = xSemaphoreCreateBinary(); }
+  if (!p->acordar) { p->acordar = xSemaphoreCreateBinary(); }
+  if (!p->saiu || !p->acordar) { return false; }
+  xSemaphoreTake(p->saiu, 0);      // sobra de uma execucao anterior: nao conta para esta
+  xSemaphoreTake(p->acordar, 0);
   p->pedido = false;
   p->viva   = true;
   return true;
@@ -73,6 +76,21 @@ static inline bool parada_pedida(const parada_t* p) { return p->pedido; }
 // Na tarefa: a ULTIMA coisa antes de retornar. Daqui em diante quem pediu
 // pode desmontar tudo o que ela usava.
 static inline void parada_confirmar(parada_t* p) { xSemaphoreGive(p->saiu); }
+
+// O COCHILO DA TAREFA ENTRE DUAS VOLTAS. Uma tarefa que trabalha "a cada N
+// segundos" e precisa parar rapido dormia em fatias de 100 ms so para olhar
+// o pedido - 10 despertares por segundo, a toa, a bateria pagando. Aqui ela
+// dorme o prazo INTEIRO num semaforo que o parada_pedir (ou um
+// parada_cutucar) da: acorda na hora certa ou no instante do pedido, e mais
+// nunca. Devolve true se foi acordada antes do prazo.
+static inline bool parada_dormir(parada_t* p, uint32_t ms)
+{
+  return xSemaphoreTake(p->acordar, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+
+// Acorda a tarefa do cochilo SEM pedir para parar (ex.: a configuracao
+// mudou e a proxima volta deve vir ja, e nao no fim do prazo).
+static inline void parada_cutucar(parada_t* p) { if (p->acordar) { xSemaphoreGive(p->acordar); } }
 
 // A tarefa existe e ainda nao confirmou saida.
 static inline bool parada_rodando(const parada_t* p)
@@ -99,6 +117,7 @@ static inline bool parada_pedir(parada_t* p, uint32_t ms, void (*cutucar)(void) 
 {
   if (!p->viva) { return true; }
   p->pedido = true;
+  parada_cutucar(p);   // quem esta no parada_dormir acorda ja e ve o pedido
   const uint32_t fatia = cutucar ? 100 : ms;
   for (uint32_t esperou = 0; ; esperou += fatia) {
     if (cutucar) { cutucar(); }

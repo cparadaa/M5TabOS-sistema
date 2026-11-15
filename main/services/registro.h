@@ -53,3 +53,20 @@ void registro_app_atual(const char* nome);
 // Quantas amostras estao esperando na RAM, e quantas ja foram para o cartao.
 // Serve para o app Energia mostrar que o registro esta vivo.
 void registro_estado(int* na_ram, uint32_t* gravadas, uint32_t* falhas);
+
+// ---- ler o dia gravado (para o app Energia desenhar) -------------------------------
+// Um dia em minutos: a posicao 'm' e o minuto 'm' depois de 't0'. Quem sabe o
+// formato das linhas (ENE3, acima) e o registro; o app so recebe os pontos.
+#define REGISTRO_MIN_DIA 1440
+typedef struct {
+  uint32_t t0;                          // epoch UTC do slot 0 (0 = sem relogio)
+  float    v[REGISTRO_MIN_DIA], ma[REGISTRO_MIN_DIA], temp[REGISTRO_MIN_DIA];
+  int8_t   pct[REGISTRO_MIN_DIA];       // a % que o sistema mostrava (estimador), -1 = sem
+  uint8_t  tem[REGISTRO_MIN_DIA];       // 0 = sem amostra, 1 = acordado, 2 = em repouso
+} registro_dia_t;
+
+// Preenche 'd' (zerado aqui) com as amostras das 24 h a partir de 'd->t0',
+// lidas dos arquivos de energia do dia daquele instante e do dia de hoje.
+// Monta o cartao e desmonta no fim: chamar FORA da interface
+// (sistema_trabalho). false = t0 = 0 ou o cartao nao montou.
+bool registro_ler_dia(registro_dia_t* d, uint32_t t0);

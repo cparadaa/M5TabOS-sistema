@@ -52,8 +52,8 @@ struct tab5_perfil_t
 
   // BMI270 (acelerometro + giroscopio). ATENCAO: quando ligado, o M5Unified o
   // deixa com giro ativo e advanced power save DESLIGADO (PWR_CONF=0x00) - o
-  // pior caso de consumo do chip. Se voce so precisa de orientacao, ligue este
-  // campo e chame tab5_power_imu_so_acelerometro() depois do begin.
+  // pior caso de consumo do chip. O servico hal/tab5_imu corrige isso: sem
+  // ninguem pedindo o giroscopio, so o acelerometro em economia.
   bool imu           = false;
 
   // ES7210: os microfones. Ligado = codec ADC alimentado.
@@ -122,11 +122,8 @@ struct tab5_perfil_t
 
   // Light sleep automatico no idle.
   //
-  // HOJE ESTE CAMPO NAO FAZ NADA, e e importante saber disso antes de tentar:
-  // CONFIG_FREERTOS_USE_TICKLESS_IDLE esta DESLIGADO no sdkconfig (conferido em
-  // ). Sem tickless o idle acorda a cada tick e nunca chega a dormir,
-  // entao passar true aqui nao da erro nenhum - simplesmente nao acontece nada,
-  // que e o pior tipo de falha para depurar.
+  // NAO USE: com o DSI de pe o sono nao acontece. O sono leve do repouso e do
+  // kernel (tab5_power_sono_leve), nao do perfil de app.
   //
   // Ligar tickless e uma decisao de medicao, nao de gosto: com FREERTOS_HZ=1000
   // o ganho depende de haver janelas ociosas de varios milissegundos, e o painel
@@ -163,8 +160,13 @@ void tab5_power_grove(bool ligar);
 // Trilho ja esta ligado AGORA? Existe para tab5_grove.cpp decidir se precisa
 // esperar o modulo bootar antes de sondar - pergunta de ESTADO DE HARDWARE,
 // nao de preferencia do usuario (por isso mora aqui, e nao em ajustes.h: HAL
-// pergunta a HAL, nunca a um servico - ver ESCREVENDO_APPS.md secao 8).
+// pergunta a HAL, nunca a um servico - ver docs/ESCREVENDO_APPS.md secao 8).
 bool tab5_power_grove_ligado(void);
+
+// Trilho de 5V do USB-A (expansor 1, USB5V_EN), sozinho - sem reaplicar o
+// perfil inteiro. Quem decide e services/tab5_usb (o repouso); o resto do
+// tempo ele segue o perfil (usb_a_5v). Da tarefa de interface (I2C).
+void tab5_power_usb_a(bool ligar);
 
 // Quando o Tab5 mexeu no 5V do Grove / reaplicou o perfil pela ultima vez
 // (esp_timer em ms, 0 = nunca). Prova ou descarta o Tab5 num reinicio do no.
@@ -174,9 +176,10 @@ uint32_t tab5_power_aplicar_ms(void);
 // CAM_RST. false = camera segurada em reset.
 void tab5_power_camera(bool ligar);
 
-// Poe o BMI270 so com acelerometro e com advanced power save ligado.
-// Devolve false se nao achou o chip (ou se perfil.imu era false).
-bool tab5_power_imu_so_acelerometro(void);
+// O GIROSCOPIO DO BMI270: ligado (desempenho) ou so o acelerometro em
+// economia. So da tarefa de interface (I2C interno). Quem decide e o servico
+// hal/tab5_imu (tab5_imu_giroscopio), nao o app.
+bool tab5_power_imu_giroscopio(bool ligar);
 
 // O perfil de boot pediu a IMU (cfg.internal_imu). Para quem precisa saber se
 // uma IMU ausente e escolha ou falha - ver tab5_imu_medir().
@@ -213,6 +216,13 @@ int tab5_power_pct(float volts, float mA);
 // agora, de onde o estimador partiu, e minutos desde a ultima carga (-1 =
 // nenhuma neste boot).
 void tab5_power_soc_debug(float* soc, float* curva, const char** fonte, float* min_desde_carga);
+
+// SEMENTE DE FORA: a carga guardada por quem persiste (services/tab5_bateria).
+// So vale se o estimador partiu da curva no boot (nao da RTC) - e quem chama
+// decide quando a curva nao merece confianca (boot carregando). true = usou.
+bool tab5_power_soc_semear(float soc, const char* fonte);
+// true enquanto o estimador partiu da curva neste boot e ninguem semeou.
+bool tab5_power_soc_da_curva_no_boot(void);
 
 // ---- medicao (INA226 embutido, shunt de 5 mOhm no barramento da bateria) ---
 
@@ -339,11 +349,12 @@ void tab5_power_travas(const char* etiqueta);
 //    esp_lcd_mipi_dsi_bus.c e igual (72 -> 151). O set_pattern() nao tem uma
 //    unica referencia a pm_lock.
 //
-// Consequencia pratica: ligar CONFIG_FREERTOS_USE_TICKLESS_IDLE hoje daria
-// ZERO - o sistema nunca chegaria a dormir. O unico caminho para light sleep e
-// DESTRUIR painel e barramento ao apagar a tela e recria-los ao acordar, o que
-// e obra grande e arriscada (o M5GFX e dono desses objetos). Nao tente pelo
-// caminho barato: ele nao existe.
+// Consequencia pratica: com o DSI de pe, ligar CONFIG_FREERTOS_USE_TICKLESS_IDLE
+// daria ZERO. O caminho foi DESTRUIR painel e barramento ao apagar a tela e
+// recria-los ao acordar (desmontar_tela/montar_tela) - feito. Desde 2026-10-16
+// o tickless esta ligado e o repouso dorme de verdade: tab5_power_sono_leve(),
+// chamado pelo kernel depois do repouso, com o toque/teclado armados para
+// acordar (ver "SONO LEVE: QUEM ACORDA O P4" em kernel/core.cpp).
 
 // Entra em repouso: apaga a tela, para o fluxo de video e baixa o teto de
 // clock. Devolve false se algum passo falhar (e nesse caso desfaz o que deu).
@@ -417,6 +428,15 @@ const char*   tab5_painel_nome(void);
 // GPIO 23 confirmado, repouso fundo e relogio ajustavel validados nele).
 bool          tab5_painel_toque_gt911(void);
 
+// REINICIO DO GT911 pelo pino de reset (TP_RST, expansor 0x43 saida 5), a
+// mesma sequencia do boot: INT em alto durante o reset (fica no endereco
+// 0x14, o que o driver ja usa). Para o GT911 "mudo": visto em 13-14/11/2026,
+// ele passou a pulsar o INT ~10x/s SEM nunca ter relatorio pronto, e so voltou
+// com o aparelho reiniciado - em repouso a tela nao acordava mais. Leva ~130 ms.
+// So na tarefa de interface (a dona do I2C interno e do toque). false = nao e
+// GT911, ou o expansor nao respondeu.
+bool          tab5_toque_reiniciar(void);
+
 // ---------------------------------------------------------------------------
 // RELOGIO DE PIXEL DO PAINEL
 // ---------------------------------------------------------------------------
@@ -436,9 +456,19 @@ bool tab5_power_relogio_dpi(int mhz);
 // Relogio atual, em MHz; 0 se nao ha painel.
 int  tab5_power_relogio_dpi(void);
 
+// Velocidade do link DSI (Mbps por via), SO PARA TESTE (nao grava). Remonta o
+// painel como o relogio; volta sozinha se nao subir. Na tarefa de interface.
+bool tab5_power_link_dsi(int mbps);
+int  tab5_power_link_dsi(void);
+
 // Quadros por segundo no relogio atual, pelos porticos que o M5GFX programou
 // NESTA tela (cada uma tem os seus). 0 se nao ha painel.
 double tab5_power_quadros_por_segundo(void);
+
+// Proximo relogio REAL da tabela (80, 60, 48, 40, 30, 24): para cima com
+// passo > 0, para baixo com passo < 0. Para nas pontas. O app usa isto nos
+// botoes de mais/menos; tab5_power_relogio_dpi(mhz) aproxima qualquer pedido.
+int tab5_power_relogio_vizinho(int atual, int passo);
 
 // ---------------------------------------------------------------------------
 // TETO DO CPU COM A TELA ACORDADA - diagnostico, criado
@@ -461,3 +491,10 @@ bool tab5_power_teto_cpu(int mhz);
 
 // true enquanto estiver em repouso.
 bool tab5_power_em_repouso(void);
+
+// SONO LEVE (light sleep automatico no idle) - so em repouso com a tela
+// DESMONTADA. Quem decide e o kernel (que arma os pinos que acordam: toque e
+// teclado); retomar/ajustar o teto desliga sozinho. false = nao deu (fora do
+// repouso, repouso so de luz, PM ou tickless fora do sdkconfig).
+bool tab5_power_sono_leve(bool ligar);
+bool tab5_power_sono_leve_ligado(void);

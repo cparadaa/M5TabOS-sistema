@@ -32,6 +32,7 @@
 #include "lista.hpp"
 #include "pintura.hpp"
 #include "teclado_virtual.hpp"
+#include "toque_longo.hpp"
 
 #define CONVERSA_TEXTO        256
 // Bytes de UMA linha desenhada. Com acento (2 bytes) e emoji (4), 64 acabava
@@ -78,6 +79,10 @@ typedef struct {
   // COR DO BOTAO DE ENVIAR (0 = a padrao do sistema). O app pinta com a
   // identidade dele - o Mesh usa o verde da marca do Meshtastic.
   uint16_t          cor_enviar;
+  // TAMANHO DA LETRA dos baloes (0 = 1.0, o calibrado no Mesh). Mensagem,
+  // nome e linha pequena crescem juntos; a barra de escrita fica como esta.
+  // Depois do conversa_abrir, por conversa_escala (re-mede tudo).
+  float             escala;
 
   // Estado interno - o app nao mexe.
   lista_t   lista;
@@ -103,12 +108,15 @@ typedef struct {
   lgfx::LovyanGFX* disp;                 // para medir texto ao tocar no campo (so a tarefa de interface)
   bool      pode_escrever;        // o do ultimo desenho (o toque obedece o que esta na tela)
   area_t    tec;                  // onde o teclado abre (tela); largura 0 = o proprio retangulo
+  toque_longo_t lp;               // segurar num balao copia; no campo, cola
 } conversa_t;
 
 void conversa_abrir(conversa_t* c, pintura_t* p, conversa_contar_t contar, conversa_ler_t ler,
                     conversa_enviar_t enviar, void* ctx);
 void conversa_fechar(conversa_t* c);
 void conversa_mudou(conversa_t* c);
+// O tamanho da letra dos baloes (ver conversa_t.escala).
+void conversa_escala(conversa_t* c, float escala);
 
 // 'pode_escrever' false: a barra vira aviso ('motivo') e nao abre teclado.
 void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,

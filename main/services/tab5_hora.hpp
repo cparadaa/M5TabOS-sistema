@@ -55,15 +55,17 @@ void tab5_hora_ao_saltar(tab5_hora_salto_cb cb);
 // -------------------------------------------------------------------------
 // FUSO.
 // -------------------------------------------------------------------------
-// FIXO, sem horario de verao - o Brasil parou de observar DST em 2019. Se um
-// dia isto precisar variar por regiao/estacao, e AQUI que entra a logica -
-// nao espalhada pelos apps.
+// ESCOLHIDO PELA PESSOA (ajustes_fuso_min: assistente de boas-vindas e
+// Ajustes > Tela), padrao UTC-3. Sem horario de verao: um deslocamento fixo.
+// Se um dia precisar variar por estacao, e AQUI que entra a logica - nao
+// espalhada pelos apps.
 //
 // SO AFETA EXIBICAO. O RTC, a sincronizacao e os logs continuam em UTC PURO
 // de proposito - e o unico jeito de comparar carimbo de tempo entre nos da
 // malha, arquivos de log e GPS sem ambiguidade. So quem vai MOSTRAR a hora
 // chama isto - gmtime_r() direto continua certo para qualquer outro uso.
-#define TAB5_FUSO_S (-3 * 3600)
+int tab5_hora_fuso_s(void);
+#define TAB5_FUSO_S (tab5_hora_fuso_s())
 
 // O RELOGIO JA FOI ACERTADO? Abaixo disto (2020-09-13) uma hora nao e de
 // verdade: o RTC sem acerto (sem GPS, rede ou malha desde o boot) ou um
@@ -100,3 +102,18 @@ void tab5_hora_nome_do_dia(uint32_t epoch_utc, const char* prefixo, const char* 
 // pelo tick do FreeRTOS e metade pelo esp_timer). Da a volta em ~49 dias:
 // compare sempre por diferenca (agora - antes), nunca por maior/menor.
 static inline uint32_t tab5_agora_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+// SEGUNDOS DESDE A CHAMADA ANTERIOR, arredondados, para quem acumula tempo a
+// cada medida (bateria, ensaio de energia, cochilo do Wi-Fi). Em repouso o
+// kernel mede a cada 5 s, acordado a cada 1 (contrato de economia, app.h).
+// Primeira chamada = 1 s; um buraco grande (reinicio de contagem) vale no
+// maximo 10. Eram tres copias iguais.
+static inline int tab5_passou_s(int64_t* ult)
+{
+  const int64_t agora = esp_timer_get_time();
+  int s = *ult ? (int)((agora - *ult + 500000) / 1000000) : 1;
+  *ult = agora;
+  if (s < 0)  { s = 0; }
+  if (s > 10) { s = 10; }
+  return s;
+}

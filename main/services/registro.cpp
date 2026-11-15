@@ -104,6 +104,42 @@ static void descarregar(void)
   s_n = 0;
 }
 
+// Uma linha ENE3 do arquivo do dia vira o minuto dela em 'd'. Linha de outro
+// formato, anterior a 't0' ou depois das 24 h e ignorada.
+static void ler_arquivo_dia(registro_dia_t* d, const char* nome)
+{
+  FILE* f = tab5_sd_abrir(TAB5_SD_ENERGIA, nome, "r");
+  if (!f) { return; }
+  char linha[160];
+  while (fgets(linha, sizeof(linha), f)) {
+    unsigned long ep; char hora[8]; float v, ma, mw, temp; int pct, mhz, rep;
+    if (sscanf(linha, "ENE3,%lu,%7[^,],%f,%f,%f,%d,%d,%d,%f", &ep, hora, &v, &ma, &mw, &pct, &mhz, &rep, &temp) < 9) { continue; }
+    if (ep < d->t0) { continue; }
+    const uint32_t m = ((uint32_t)ep - d->t0) / 60;
+    if (m >= REGISTRO_MIN_DIA) { continue; }
+    d->tem[m] = rep ? 2 : 1;
+    d->v[m] = v; d->ma[m] = ma; d->temp[m] = temp;
+    d->pct[m] = (int8_t)((pct >= 0 && pct <= 100) ? pct : -1);
+  }
+  fclose(f);
+}
+
+bool registro_ler_dia(registro_dia_t* d, uint32_t t0)
+{
+  memset(d, 0, sizeof(*d));
+  d->t0 = t0;
+  if (!t0 || !tab5_sd_montar()) { return false; }
+  // A janela de 24 h pode atravessar a meia-noite: o dia de t0 e o de hoje
+  // (o mesmo arquivo, se nao atravessou, e lido uma vez so).
+  char nome_t0[40], nome_hoje[40];
+  nome_do_dia(t0, nome_t0, sizeof(nome_t0));
+  nome_do_dia((uint32_t)time(nullptr), nome_hoje, sizeof(nome_hoje));
+  ler_arquivo_dia(d, nome_t0);
+  if (strcmp(nome_t0, nome_hoje) != 0) { ler_arquivo_dia(d, nome_hoje); }
+  tab5_sd_desmontar();
+  return true;
+}
+
 // SEM TAREFA PROPRIA: uma amostra por minuto nao paga 4 KB de pilha parada.
 // Pega carona na tarefa "cartao" (tab5_sd_carona), que ja acorda a cada 1 s e
 // e quem grava no cartao de qualquer jeito; aqui so se conta o minuto.

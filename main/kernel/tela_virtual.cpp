@@ -1,4 +1,5 @@
 #include "tela_virtual.hpp"
+#include <string.h>
 #include "app.h"
 
 #include "compositor.hpp"
@@ -191,6 +192,82 @@ struct PainelRastreado : public lgfx::Panel_Sprite
     Panel_Sprite::readRect(x, y, w, h, dst, p);
   }
 
+  // MISTURA UMA MASCARA (texto suave transparente) DIRETO NA PAGINA DE TRAS.
+  // O retangulo ja vem recortado (coordenadas de desenho). So os pixels de
+  // tinta sao lidos e escritos; a conta e a do M5GFX (VLWfont::drawChar,
+  // "alpha blend mode"), com o fundo expandido de RGB565 como ele expande.
+  // false = formato que nao e o da pagina (fica com o caminho comum).
+  bool misturar(int x, int y, int w, int h, const uint8_t* m, int passo, uint32_t cor888)
+  {
+    if (w <= 0 || h <= 0) { return true; }
+    if (_write_bits != 16) { return false; }
+    anotar(x, y, w, h);            // abre o quadro e poe a pagina de tras em dia ali
+    // Endereco de (x, y) e quanto ele anda por coluna e por linha - com a
+    // rotacao, a mesma conta do drawPixelPreclipped do Panel_Sprite.
+    auto indice = [this](int px, int py) -> int32_t {
+      const uint_fast8_t r = _rotation;
+      if (r) {
+        if ((1u << r) & 0b10010110) { py = _height - (py + 1); }
+        if (r & 2)                  { px = _width  - (px + 1); }
+        if (r & 1) { std::swap(px, py); }
+      }
+      return px + py * (int32_t)_bitwidth;
+    };
+    const int32_t base = indice(x, y);
+    const int32_t dx = indice(x + 1, y) - base;
+    const int32_t dy = indice(x, y + 1) - base;
+    uint16_t* const img = _img.img16();
+    const uint32_t fr = (cor888 >> 16) & 0xFF, fg = (cor888 >> 8) & 0xFF, fb = cor888 & 0xFF;
+    for (int j = 0; j < h; ++j) {
+      const uint8_t* linha = m + (size_t)j * passo;
+      int32_t i = base + j * dy;
+      for (int k = 0; k < w; ++k, i += dx) {
+        const uint32_t a = linha[k];
+        if (!a) { continue; }
+        const uint32_t p = 1 + a, q = 257 - p;
+        const uint32_t c = img[i];
+        const uint32_t r5 = c >> 11, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+        const uint32_t r = (fr * p + ((r5 << 3) + (r5 >> 2)) * q) >> 8;
+        const uint32_t g = (fg * p + ((g6 << 2) + (g6 >> 4)) * q) >> 8;
+        const uint32_t b = (fb * p + ((b5 << 3) + (b5 >> 2)) * q) >> 8;
+        img[i] = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+      }
+    }
+    return true;
+  }
+
+  // COLA UMA IMAGEM RGB565 (uma camada) DIRETO NA PAGINA DE TRAS: linha a
+  // linha por memcpy quando a tela nao esta girada, pixel a pixel quando
+  // esta. O pushImage do M5GFX passava cada pixel por uma rotina de copia
+  // generica (~70 ns/pixel: uma faixa de 720x200 levava 11 ms).
+  // 'passo' = pixels por linha da origem. O retangulo ja vem recortado.
+  bool colar(int x, int y, int w, int h, const uint16_t* src, int passo)
+  {
+    if (w <= 0 || h <= 0) { return true; }
+    if (_write_bits != 16) { return false; }
+    anotar(x, y, w, h, true);      // coberto inteiro: nada vem da frente antes
+    auto indice = [this](int px, int py) -> int32_t {
+      const uint_fast8_t r = _rotation;
+      if (r) {
+        if ((1u << r) & 0b10010110) { py = _height - (py + 1); }
+        if (r & 2)                  { px = _width  - (px + 1); }
+        if (r & 1) { std::swap(px, py); }
+      }
+      return px + py * (int32_t)_bitwidth;
+    };
+    const int32_t base = indice(x, y);
+    const int32_t dx = indice(x + 1, y) - base;
+    const int32_t dy = indice(x, y + 1) - base;
+    uint16_t* const img = _img.img16();
+    for (int j = 0; j < h; ++j) {
+      const uint16_t* o = src + (size_t)j * passo;
+      uint16_t* d = img + base + j * dy;
+      if (dx == 1) { memcpy(d, o, (size_t)w * 2); continue; }
+      for (int k = 0; k < w; ++k, d += dx) { *d = o[k]; }
+    }
+    return true;
+  }
+
 private:
   // A janela inteira, uma vez por setWindow - writeBlock/writePixels podem vir
   // em varias chamadas para a mesma janela.
@@ -266,6 +343,19 @@ void tela_virtual_seguir_rotacao(void)
 void tela_virtual_cobrir(int x, int y, int w, int h)
 {
   if (s_tv) { s_tv->painel.anotar(x, y, w, h, true); }
+}
+
+bool tela_virtual_misturar_mascara(lgfx::LGFXBase* gfx, int x, int y, int w, int h,
+                                   const uint8_t* mascara, int passo, uint32_t cor888)
+{
+  if (!s_tv || gfx != s_tv) { return false; }
+  return s_tv->painel.misturar(x, y, w, h, mascara, passo, cor888);
+}
+
+bool tela_virtual_colar(lgfx::LGFXBase* gfx, int x, int y, int w, int h, const uint16_t* src, int passo)
+{
+  if (!s_tv || gfx != s_tv) { return false; }
+  return s_tv->painel.colar(x, y, w, h, src, passo);
 }
 
 void tela_virtual_invalidar_tudo(void)

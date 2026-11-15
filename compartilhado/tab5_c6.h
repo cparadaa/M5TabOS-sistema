@@ -39,6 +39,7 @@
 #define C6_MSG_CSI         16   // c6_csi_cab_t + bytes crus de CSI
 #define C6_MSG_FTM         17   // c6_ftm_rep_t
 #define C6_MSG_154         18   // c6_154_cab_t + bytes crus do quadro 802.15.4
+#define C6_MSG_PM          19   // texto: a tabela de travas de PM do C6 (esp_pm_dump_locks), sob C6_AJ_PM
 
 // QUANTOS msg_id CADA LADO ESCUTA. O peer_data do C6 tem tabela FIXA de 8
 // callbacks (EH_CP_FEAT_PEER_DATA_MAX_HANDLERS); o 9o registro falha calado e
@@ -67,6 +68,14 @@
 // --- C6_MSG_HOST_AJUSTE: chaves --------------------------------------------
 #define C6_AJ_INFO         1    // sem valor: responde C6_MSG_INFO
 #define C6_AJ_CRU          2    // 1B: 1 = repassar todo ESP-NOW recebido tambem como C6_MSG_RECEBIDO_CRU
+#define C6_AJ_IP           3    // 4B: o IPv4 do P4 (ordem da rede) - com o host dormindo o C6 responde o ARP dele
+#define C6_AJ_PM           4    // sem valor: responde C6_MSG_PM (quem impede o light sleep do C6)
+// A JANELA DO ESP-NOW. Com o ESP-NOW iniciado o padrao do IDF e a janela
+// MAXIMA: o radio nunca dorme entre beacons (modem sleep sem efeito - medido no
+// C6: a trava "wifi" presa 99% do tempo). 2B intervalo + 2B janela, em ms
+// (little-endian): a cada 'intervalo' o radio fica 'janela' ms ouvindo o
+// ESP-NOW. janela 0xFFFF = sempre ouvindo (o padrao); intervalo 0 = o do IDF.
+#define C6_AJ_ESPNOW_JANELA 5
 
 // --- C6_MSG_HOST_RADIO: sub-comandos ---------------------------------------
 // Os extras do radio, cada um ligado/desligado por aqui. Todos valem a MESMA
@@ -163,8 +172,29 @@ typedef struct __attribute__((packed)) {
   uint8_t  z154_estado;      // 0 nunca ligado, 1 ouvindo, 2 dormindo (driver habilitado, RF solto)
   uint8_t  chip_rev;         // 0x80 | maior<<4 | menor (0 = firmware que nao informa)
   uint8_t  flags;            // C6_INFO_F_* (firmware c6-4 em diante; antes era reserva = 0)
-  uint8_t  reserva_info;
-} c6_info_t;                 // 48 B (firmware c6-3; o P4 aceita os mais curtos)
+  uint8_t  sono_estado;      // C6_SONO_* (firmware c6-5 em diante; antes era reserva = 0)
+  // O C6 DORMINDO COM O WI-FI ASSOCIADO (firmware c6-5). Contado no proprio
+  // C6 - o P4 nao ve a serial dele: quantas vezes entrou em light sleep, o
+  // tempo somado la dentro, e quantas vezes o enlace foi desmontado/remontado.
+  uint32_t sono_n;
+  uint32_t sono_ms;
+  uint16_t sono_entradas;    // vezes que o P4 pediu (POWER_SAVE_ON) e o SDIO caiu
+  uint16_t sono_despertares; // vezes que o enlace voltou (pelo P4 ou por trafego)
+  // O que o P4 mandou para a rede e o C6 passou ao Wi-Fi (esp_wifi_internal_tx).
+  uint32_t tx_wifi_n;
+  uint32_t tx_wifi_erros;
+  int16_t  tx_wifi_ultimo_err;
+  uint8_t  sta_conectada;    // o esp_hosted acha que a estacao esta associada
+  uint8_t  reserva_sono;
+  // O FILTRO com o host dormindo: o que o C6 resolveu sozinho, sem acordar o P4.
+  uint32_t filtro_arp;       // ARP pelo IP do P4, respondido pelo C6
+  uint32_t filtro_descartes; // broadcast/multicast e ARP alheio, descartados
+  uint32_t filtro_acordou;   // quadros para o P4 que o acordaram
+} c6_info_t;                 // 84 B (firmware c6-5; o P4 aceita os mais curtos)
+// C6_SONO_*: em que pe esta o "host dorme" do lado do C6.
+#define C6_SONO_SEM        0      // firmware sem a funcao (ou mais velho)
+#define C6_SONO_ACORDADO   1      // enlace de pe, light sleep proibido (trava)
+#define C6_SONO_DORMINDO   2      // SDIO desmontado, light sleep livre, CMD arma o despertar
 #define C6_INFO_V1_TAM 20
 #define C6_INFO_F_COREDUMP 0x01   // ha retrato de travamento guardado na particao coredump do C6
 #define C6_INFO_F_EM_PROVA 0x02   // imagem nova (OTA) ainda nao confirmada pelo VIVO    // tamanho do INFO de quem nao traz o diagnostico

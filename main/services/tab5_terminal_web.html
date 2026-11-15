@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab5 · Terminal</title>
+<!-- O MESMO Terminal do aparelho (services/tab5_terminal_web): os comandos do
+     sistema e, quando 'ssh usuario@host' abre a sessao, o terminal remoto. O
+     xterm.js vem do proprio Tab5 (flash, comprimido): sem internet no PC
+     funciona igual. -->
+<link rel="stylesheet" href="xterm.css">
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<style>
+:root { --fundo:#0f1115; --painel:#171a21; --linha:#2a2e38; --texto:#dfe3ea; --apagado:#8a91a0;
+        --verde:#a6e22e; --laranja:#ff9f43; --erro:#ff6b6b; --mono:ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace; }
+* { box-sizing:border-box; }
+html, body { height:100%; margin:0; background:var(--fundo); color:var(--texto);
+             font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#tudo { display:flex; flex-direction:column; height:100%; }
+#barra { display:flex; align-items:center; gap:10px; padding:8px 14px; background:var(--painel); border-bottom:1px solid var(--linha); min-height:46px; }
+#barra b { font-size:15px; display:flex; align-items:center; }
+#estado { color:var(--apagado); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ponto { display:inline-block; width:9px; height:9px; border-radius:50%; background:#555; margin-right:8px; }
+.ponto.on { background:var(--verde); } .ponto.meio { background:var(--laranja); }
+button { font:inherit; border:0; border-radius:8px; padding:6px 12px; cursor:pointer; background:#3a3f4c; color:#fff; }
+button:hover { filter:brightness(1.15); }
+button.verde { background:#2c6fb0; } button.verm { background:#8a2f2f; }
+.oculto { display:none !important; }
+
+/* OS COMANDOS */
+#cmd { flex:1; display:flex; flex-direction:column; min-height:0; font:14px/1.5 var(--mono); }
+#saida { flex:1; overflow:auto; padding:12px 16px 4px; white-space:pre-wrap; word-break:break-all; }
+#saida div { min-height:1.5em; }
+#saida .t1 { color:#c5ef6a; }          /* a linha digitada, com o prompt */
+#saida .t2 { color:var(--laranja); }   /* o proprio terminal (^C, fila) */
+#linha { display:flex; align-items:center; padding:8px 16px 12px; gap:0; border-top:1px solid #1d2028; }
+#prompt { color:#c5ef6a; white-space:pre; }
+#entrada { flex:1; min-width:0; background:transparent; border:0; outline:none; color:#fff; font:inherit; padding:2px 0; caret-color:var(--verde); }
+#dica { color:var(--apagado); font:12px system-ui, sans-serif; padding:0 16px 10px; }
+#dica code { font-family:var(--mono); color:#cfd6e2; background:#1d2129; padding:1px 5px; border-radius:4px; }
+
+/* O SSH */
+#ssh { flex:1; display:flex; flex-direction:column; min-height:0; }
+#term { flex:1; min-height:0; padding:6px 8px; }
+#teclas { display:flex; gap:4px; padding:6px; background:var(--painel); border-top:1px solid var(--linha); overflow-x:auto; }
+#teclas button { padding:7px 12px; min-width:44px; font-family:var(--mono); }
+#teclas button.ativa { background:#2c6fb0; }
+
+.caixa-fundo { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:10; }
+.caixa-fundo.aberto { display:flex; }
+.caixa { background:var(--painel); width:min(460px,92vw); border-radius:12px; padding:20px; border:1px solid var(--linha); }
+.caixa h2 { font-size:17px; margin:0 0 6px; }
+.caixa p { color:var(--apagado); margin:4px 0 12px; }
+.caixa input { width:100%; padding:9px 11px; border-radius:8px; border:1px solid var(--linha); background:var(--fundo); color:var(--texto); font:inherit; }
+.caixa .botoes { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+.caixa code { display:block; background:var(--fundo); padding:8px; border-radius:8px; word-break:break-all; color:#ffd479; margin:8px 0; font-family:var(--mono); }
+.erro { color:var(--erro); min-height:18px; margin-top:8px; font-size:13px; }
+</style>
+</head>
+<body>
+<div id="tudo">
+  <div id="barra">
+    <b><span class="ponto" id="ponto"></span>Terminal</b>
+    <span id="estado">conectando ao Tab5...</span>
+    <button id="pararBt" class="verm oculto" title="Ctrl+C">Parar</button>
+    <button id="limparBt" title="Ctrl+L">Limpar</button>
+    <button id="fecharBt" class="verm oculto" title="ssh fechar">Encerrar SSH</button>
+  </div>
+
+  <div id="cmd">
+    <div id="saida"></div>
+    <div id="linha"><span id="prompt"></span><input id="entrada" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="comando"></div>
+    <div id="dica"><code>help</code> lista os comandos · <code>ssh usuario@servidor</code> abre outra máquina aqui · ↑ ↓ histórico · Ctrl+C para · Ctrl+L limpa</div>
+  </div>
+
+  <div id="ssh" class="oculto">
+    <div id="term"></div>
+    <div id="teclas"></div>
+  </div>
+</div>
+
+<div class="caixa-fundo" id="confirmar"><div class="caixa">
+  <h2>Servidor novo</h2>
+  <p>É a primeira conexão com <b id="kHost"></b>. Confira se a impressão digital é a do servidor
+     (nele: <span style="font-family:var(--mono)">ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</span>).</p>
+  <code id="kImp"></code>
+  <div class="botoes"><button id="kNao">Recusar</button><button id="kSim" class="verde">Aceitar e guardar</button></div>
+</div></div>
+
+<div class="caixa-fundo" id="senha"><div class="caixa">
+  <h2>Senha</h2>
+  <p id="sQuem"></p>
+  <input id="sTxt" type="password" autocomplete="current-password">
+  <div class="erro" id="sErro"></div>
+  <div class="botoes"><button id="sCancelar">Cancelar</button><button id="sIr" class="verde">Entrar</button></div>
+</div></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const ES = { LIVRE: 0, CONECTANDO: 1, CONFIRMAR: 2, SENHA: 3, ABERTA: 4, FIM: 5 };
+const POST = (corpo) => ({ method: "POST", headers: { "X-Tab5": "1", "Content-Type": "text/plain;charset=utf-8" }, body: corpo || "" });
+const enc = new TextEncoder();
+
+// ==================================================================================
+// OS COMANDOS - a sessao do Tab5, por HTTP: o que mudou desde a ultima linha que
+// esta pagina tem. A MESMA sessao da tela do aparelho.
+// ==================================================================================
+let con = { v: -1, ate: 0, primeira: 0, ocupado: false, lendo: false, oculto: false };
+let mudou_em = 0;   // quando a saida mudou por ultimo (o ritmo das perguntas)
+const hist = [];
+let histK = -1, rascunho = "";
+
+function linhaEl(tipo, txt) {
+  const d = document.createElement("div");
+  if (tipo) d.className = "t" + tipo;
+  d.textContent = txt;
+  return d;
+}
+
+async function lerConsole() {
+  try {
+    const r = await fetch("api/console?v=" + con.v + "&desde=" + Math.max(con.ate - 1, con.primeira), { cache: "no-store" });
+    if (!r.ok) return;
+    const o = await r.json();
+    if (o.linhas === undefined) return;   // nada mudou
+    const s = $("saida");
+    const noFim = s.scrollHeight - s.scrollTop - s.clientHeight < 40;
+    // As linhas mais antigas que o Tab5 ja descartou (ou o 'clear') saem daqui.
+    while (s.firstChild && Number(s.firstChild.dataset.n) < o.primeira) s.firstChild.remove();
+    // A partir de 'de', o que veio substitui (a ultima podia ter crescido).
+    while (s.lastChild && Number(s.lastChild.dataset.n) >= o.de) s.lastChild.remove();
+    o.linhas.forEach(([tipo, txt], i) => { const d = linhaEl(tipo, txt); d.dataset.n = o.de + i; s.appendChild(d); });
+    con = { v: o.mais ? -1 : o.v, ate: o.de + o.linhas.length, primeira: o.primeira, ocupado: o.ocupado, lendo: o.lendo, oculto: o.oculto };
+    mudou_em = Date.now();
+    $("prompt").textContent = o.prompt;
+    $("entrada").type = o.oculto ? "password" : "text";
+    $("pararBt").classList.toggle("oculto", !o.ocupado);
+    if (noFim) s.scrollTop = s.scrollHeight;
+    if (o.mais) lerConsole();
+  } catch (e) { /* a proxima volta tenta de novo */ }
+}
+
+async function enviar(linha) {
+  if (!con.oculto && linha && hist[0] !== linha) hist.unshift(linha);
+  if (hist.length > 50) hist.pop();
+  histK = -1;
+  mudou_em = Date.now();   // a resposta vem a seguir: o ritmo rapido
+  try {
+    const r = await (await fetch("api/enviar", POST(linha))).json();
+    if (!r.ok) $("saida").appendChild(linhaEl(2, "(" + (r.msg || "não foi") + ")"));
+  } catch (e) {}
+  lerConsole();
+}
+const parar = () => fetch("api/parar", POST()).then(lerConsole, () => {});
+const limpar = () => fetch("api/limpar", POST()).then(lerConsole, () => {});
+
+$("entrada").addEventListener("keydown", (e) => {
+  const inp = $("entrada");
+  if (e.key === "Enter") { e.preventDefault(); const l = inp.value; inp.value = ""; enviar(l); }
+  else if (e.key === "ArrowUp" && !con.oculto) {
+    e.preventDefault();
+    if (histK < hist.length - 1) { if (histK < 0) rascunho = inp.value; inp.value = hist[++histK]; }
+  } else if (e.key === "ArrowDown" && !con.oculto) {
+    e.preventDefault();
+    if (histK >= 0) { --histK; inp.value = histK < 0 ? rascunho : hist[histK]; }
+  } else if (e.ctrlKey && (e.key === "c" || e.key === "C") && !inp.value.slice(inp.selectionStart, inp.selectionEnd)) {
+    e.preventDefault(); inp.value = ""; parar();
+  } else if (e.ctrlKey && (e.key === "l" || e.key === "L")) { e.preventDefault(); limpar(); }
+});
+$("saida").addEventListener("mouseup", () => { if (!getSelection().toString()) $("entrada").focus(); });
+$("pararBt").onclick = parar;
+$("limparBt").onclick = () => (vendoSsh() ? term.clear() : limpar());
+
+// ==================================================================================
+// O SSH - a sessao compartilhada, pelo WebSocket. Enquanto ela esta de pe, a
+// pagina e o terminal remoto; quando termina, volta aos comandos (como no Tab5).
+// ==================================================================================
+let ws = null, sess = { estado: 0, c: 0, l: 0 }, espera = 500, ctrl = false, alt = false;
+const term = new Terminal({ cursorBlink: true, fontSize: 14, scrollback: 2000, fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--mono"),
+                            theme: { background: "#0f1115" } });
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open($("term"));
+
+const ativa = (e) => e >= ES.CONECTANDO && e <= ES.ABERTA;
+const vendoSsh = () => ativa(sess.estado);
+function mandar(o) { if (ws && ws.readyState === 1) ws.send(typeof o === "string" ? o : JSON.stringify(o)); }
+
+// O TAMANHO E DE QUEM DIGITOU POR ULTIMO (como no tmux).
+function reclamar() {
+  const d = fit.proposeDimensions();
+  if (d && d.cols && d.rows && (d.cols !== sess.c || d.rows !== sess.l)) mandar({ t: "tamanho", c: d.cols, l: d.rows });
+}
+
+function teclar(d) {
+  if (sess.estado !== ES.ABERTA) return;
+  if (ctrl && d.length === 1) { const c = d.toUpperCase().charCodeAt(0); if (c >= 64 && c < 96) d = String.fromCharCode(c - 64); }
+  if (alt) d = "\x1b" + d;
+  if (ctrl || alt) { ctrl = alt = false; pintarModificadores(); }
+  reclamar();
+  if (ws && ws.readyState === 1) ws.send(enc.encode(d));
+}
+term.onData(teclar);
+term.onBinary((d) => { if (ws && ws.readyState === 1) ws.send(Uint8Array.from(d, (c) => c.charCodeAt(0) & 255)); });
+window.addEventListener("resize", () => { if (vendoSsh()) { fit.fit(); reclamar(); } });
+
+// A fileira de teclas que o teclado do PC (ou do celular) nao tem a mao.
+const TECLAS = [["Esc", "\x1b"], ["Tab", "\t"], ["Ctrl", "ctrl"], ["Alt", "alt"], ["←", "\x1b[D"], ["↑", "\x1b[A"],
+                ["↓", "\x1b[B"], ["→", "\x1b[C"], ["|", "|"], ["~", "~"], ["/", "/"], ["-", "-"], ["Home", "\x1b[H"], ["End", "\x1b[F"]];
+for (const [rot, v] of TECLAS) {
+  const b = document.createElement("button");
+  b.textContent = rot; b.dataset.v = v;
+  b.onmousedown = (e) => e.preventDefault();   // o foco fica no terminal
+  b.onclick = () => {
+    if (v === "ctrl") { ctrl = !ctrl; pintarModificadores(); }
+    else if (v === "alt") { alt = !alt; pintarModificadores(); }
+    else teclar(v);
+    term.focus();
+  };
+  $("teclas").appendChild(b);
+}
+function pintarModificadores() {
+  for (const b of $("teclas").children) {
+    if (b.dataset.v === "ctrl") b.className = ctrl ? "ativa" : "";
+    if (b.dataset.v === "alt") b.className = alt ? "ativa" : "";
+  }
+}
+
+function abrirCaixa(id, sim) { $(id).classList.toggle("aberto", sim); }
+
+// A TROCA DE TELA segue a sessao: de pe = terminal remoto; terminou = comandos.
+function trocar(ssh) {
+  $("cmd").classList.toggle("oculto", ssh);
+  $("ssh").classList.toggle("oculto", !ssh);
+  $("fecharBt").classList.toggle("oculto", !ssh);
+  if (ssh) { fit.fit(); term.focus(); } else { $("entrada").focus(); lerConsole(); }
+}
+
+function estado(e) {
+  const antes = sess.estado;
+  sess = e;
+  const quem = e.u && e.h ? e.u + "@" + e.h + (e.p && e.p !== 22 ? ":" + e.p : "") : "";
+  if (ativa(e.estado) !== ativa(antes)) {
+    if (ativa(e.estado)) { term.reset(); }
+    trocar(ativa(e.estado));
+  }
+  pintarEstado();
+  abrirCaixa("confirmar", e.estado === ES.CONFIRMAR);
+  if (e.estado === ES.CONFIRMAR) { $("kHost").textContent = quem; $("kImp").textContent = e.impressao; }
+  abrirCaixa("senha", e.estado === ES.SENHA);
+  if (e.estado === ES.SENHA) {
+    $("sQuem").textContent = quem;
+    $("sErro").textContent = e.msg || "";
+    if (antes !== ES.SENHA) { $("sTxt").value = ""; setTimeout(() => $("sTxt").focus(), 50); }
+  }
+  if (e.estado === ES.ABERTA) {
+    if (e.c && e.l && (term.cols !== e.c || term.rows !== e.l)) term.resize(e.c, e.l);
+    if (antes !== ES.ABERTA) { fit.fit(); reclamar(); term.focus(); }
+  }
+  // Terminou: a razao fica na saida dos comandos, como fica na tela do Tab5.
+  if (e.estado === ES.FIM && ativa(antes)) $("saida").appendChild(linhaEl(2, "[ssh " + quem + ": " + (e.msg || "fim") + "]"));
+}
+
+function pintarEstado() {
+  const e = sess, quem = e.u && e.h ? e.u + "@" + e.h : "";
+  if (!ws || ws.readyState !== 1) {
+    $("ponto").className = "ponto";
+    $("estado").textContent = "sem conexão com o Tab5 - tentando de novo...";
+    return;
+  }
+  const txt = { [ES.CONECTANDO]: "conectando a " + quem + "...", [ES.CONFIRMAR]: quem + ": servidor novo, confira",
+                [ES.SENHA]: quem + ": senha", [ES.ABERTA]: quem + " · " + e.c + "×" + e.l }[e.estado];
+  $("estado").textContent = txt || "comandos do Tab5 · a mesma sessão da tela do aparelho";
+  $("ponto").className = "ponto" + (e.estado === ES.ABERTA || !ativa(e.estado) ? " on" : " meio");
+}
+
+function conectar() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + location.pathname.replace(/\/?$/, "/") + "ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    espera = 500;
+    const d = fit.proposeDimensions() || { cols: 80, rows: 24 };
+    mandar({ t: "ola", c: d.cols, l: d.rows });
+    pintarEstado();
+  };
+  ws.onmessage = (m) => {
+    if (typeof m.data === "string") { const o = JSON.parse(m.data); if (o.t === "estado") estado(o); }
+    else term.write(new Uint8Array(m.data));
+  };
+  ws.onclose = () => {
+    pintarEstado();
+    setTimeout(conectar, espera);
+    espera = Math.min(espera * 2, 8000);
+  };
+}
+
+$("kSim").onclick = () => mandar({ t: "confirmar", sim: true });
+$("kNao").onclick = () => mandar({ t: "confirmar", sim: false });
+$("sIr").onclick = () => { mandar({ t: "senha", s: $("sTxt").value }); $("sTxt").value = ""; abrirCaixa("senha", false); };
+$("sTxt").addEventListener("keydown", (e) => { if (e.key === "Enter") $("sIr").onclick(); });
+$("sCancelar").onclick = () => mandar({ t: "fechar" });
+$("fecharBt").onclick = () => { if (confirm("Encerrar a sessão SSH (no Tab5 também)?")) mandar({ t: "fechar" }); };
+
+// O RITMO: 300 ms enquanto um comando roda ou a saida acabou de mudar (ela
+// aparece andando); parado ha 3 s, 1 s; com o SSH na frente ou a aba
+// escondida, 2 s. Cada pergunta e um pedido ao Tab5 - parado, nao ha pressa.
+(function volta() {
+  const ativo = con.ocupado || con.lendo || Date.now() - mudou_em < 3000;
+  if (!document.hidden) lerConsole();
+  setTimeout(volta, document.hidden || vendoSsh() ? 2000 : ativo ? 300 : 1000);
+})();
+conectar();
+$("entrada").focus();
+</script>
+</body>
+</html>

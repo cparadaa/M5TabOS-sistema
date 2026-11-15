@@ -24,7 +24,7 @@
 //   }
 //
 //   ao_abrir():   tarefa_app_criar(&s_t, meu_laco, "gps", 4096, 3);
-//   ao_fechar():  tarefa_app_encerrar(&s_t, 200);   // so entao destrua queues
+//   ao_fechar():  if (tarefa_app_encerrar(&s_t, 200)) { /* so entao destrua queues */ }
 //
 // Quando o loop RETORNA, a moldura avisa quem espera e a vaga do pool de
 // tarefas (kernel/pool_tarefas.h) volta a dormir - o app NUNCA chama
@@ -58,5 +58,8 @@ bool tarefa_app_criar(tarefa_app_t* t, tarefa_app_corpo_t corpo,
 static inline bool tarefa_app_ativa(const tarefa_app_t* t) { return !t->parar; }
 
 // Pede a saida, desbloqueia a tarefa e ESPERA ela confirmar, ate ms.
-// Depois que esta funcao volta, e seguro destruir queues, drivers e buffers.
-void tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms);
+// Devolve true se a tarefa confirmou a saida (ou se nao havia tarefa): ai e
+// seguro destruir queues, drivers e buffers. Devolve false se o prazo estourou:
+// a tarefa foi ABANDONADA e pode estar usando o que o chamador criou - quem
+// recebe false NAO deve destruir nada disso (vazar e ruim; corromper e pior).
+bool tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms);

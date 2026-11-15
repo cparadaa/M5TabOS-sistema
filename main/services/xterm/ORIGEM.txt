@@ -1,0 +1,7 @@
+xterm.js 5.5.0 (@xterm/xterm) e @xterm/addon-fit 0.10.0, do registro npm
+(registry.npmjs.org). Licenca MIT: LICENSE. Os pacotes originais ficam em
+../../../../terceiros/xterm (fora do repositorio).
+
+Comprimidos com gzip -9 (sem o comentario do sourceMappingURL) e servidos da
+flash com Content-Encoding: gzip pela pagina do terminal (services/tab5_terminal_web):
+o navegador do PC nao precisa de internet.

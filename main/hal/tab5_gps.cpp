@@ -4,6 +4,7 @@
 #include "pool_tarefas.h"
 #include "parada.hpp"      // parada cooperativa da tarefa (kernel)
 #include "tab5_grove.hpp"
+#include "recursos.h"      // sistema_recurso: segura o sono leve enquanto a UART recebe
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -46,14 +47,11 @@ static QueueHandle_t s_assinante = nullptr;   // quem quiser sentenca crua (Azim
 // destruida, MESMO MOLDE de services/notificacao.cpp - o primeiro uso e
 // sempre antes de qualquer disputa de verdade (o boot chama tab5_gps_iniciar
 // antes de qualquer app poder ler), entao criar aqui e seguro.
-static SemaphoreHandle_t s_trava = nullptr;
+static Trava s_trava;
 
 
-static inline void travar(void)
-{
-  tab5_mutex_travar(&s_trava);   // criado sem corrida na primeira vez
-}
-static inline void destravar(void) { if (s_trava) { xSemaphoreGive(s_trava); } }
+static inline void travar(void)   { s_trava.travar(); }
+static inline void destravar(void) { s_trava.destravar(); }
 
 nmea_posicao_t tab5_gps_posicao(void)
 {
@@ -142,7 +140,9 @@ static void vTaskGPS_corpo(void*)
 
   while (!parada_pedida(&s_parada)) {
     uart_event_t ev;
-    if (xQueueReceive(s_uart_ev, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) { continue; }
+    // Sem prazo: dado novo ou o pedido de parada (gps_cutucar) chegam pela
+    // propria fila - acordar de segundo em segundo para nada nao serve.
+    if (xQueueReceive(s_uart_ev, &ev, portMAX_DELAY) != pdTRUE) { continue; }
     if (ev.type == UART_FIFO_OVF || ev.type == UART_BUFFER_FULL) {
       // Ninguem leu a tempo: o que esta no buffer e uma sentenca cortada.
       uart_flush_input(GPS_UART);
@@ -222,6 +222,7 @@ bool tab5_gps_parar(void)
   uart_driver_delete(GPS_UART);
   s_uart_ev = nullptr;   // a fila de eventos vai junto com o driver
   tab5_grove_soltar(GROVE_DONO_GPS);
+  sistema_recurso(RECURSO_SERIAL_GROVE, "GPS", false);   // solta so a parte do GPS (a contagem e por nome)
 
   s_ultima_sentenca_ms = 0;
   travar();
@@ -300,6 +301,10 @@ bool tab5_gps_iniciar(void)
     ESP_LOGE(TAG, "sem memoria para a tarefa do GPS");
     return false;
   }
+  // A UART NAO RECEBE COM O P4 EM SONO LEVE (mesmo motivo do Mesh em
+  // services/tab5_mesh.cpp): segura o sono leve enquanto o GPS roda. So aqui,
+  // com a tarefa de pe: as falhas acima nunca seguraram nada.
+  sistema_recurso(RECURSO_SERIAL_GROVE, "GPS", true);
   ESP_LOGI(TAG, "servico no ar (Grove %d baud, RX=%d TX=%d)",
            GPS_BAUD, GPS_RX_PIN, GPS_TX_PIN);
   return true;

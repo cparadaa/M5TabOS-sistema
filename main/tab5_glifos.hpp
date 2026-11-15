@@ -15,6 +15,9 @@
 // So entra no cache o que da para reproduzir exatamente:
 //   - texto com FUNDO (cor de fundo diferente da de frente): o bloco da letra
 //     e todo escrito, fundo incluso, e nao depende do que havia embaixo;
+//   - texto TRANSPARENTE: guarda a mascara de cinza (vale para toda cor); o
+//     bloco e lido UMA vez, misturado com a mesma conta do original e escrito
+//     UMA vez - o original le e escreve linha por linha;
 //   - tamanho 1 (fontes no tamanho nativo, que e o padrao do sistema);
 //   - letra que nao invade a anterior (o M5GFX nao repinta o fundo onde a
 //     letra de antes ja pintou - ali ele cai no caminho original).
@@ -32,6 +35,10 @@ struct FonteRapida : public lgfx::VLWfont
   size_t drawChar(lgfx::LGFXBase* gfx, int32_t x, int32_t y, uint16_t c,
                   const lgfx::TextStyle* style, lgfx::FontMetrics* metrics,
                   int32_t& filled_x) const override;
+private:
+  bool letra_transparente(lgfx::LGFXBase* gfx, int32_t x, int32_t y, uint16_t c, uint16_t g,
+                          const lgfx::TextStyle* style, lgfx::FontMetrics* metrics,
+                          size_t* avanco) const;
 };
 
 typedef struct {
@@ -39,7 +46,7 @@ typedef struct {
   uint32_t faltas;     // letras desenhadas pela 1a vez (e guardadas)
   uint32_t recusas;    // letras que seguiram o caminho original
   uint32_t rec_espaco;     // ...espaco (so fundo: ja e barato)
-  uint32_t rec_sem_fundo;  // ...texto transparente (le o que ha embaixo)
+  uint32_t rec_sem_fundo;  // ...texto transparente num canvas que nao se le
   uint32_t rec_invade;     // ...a letra de antes invade esta
   uint32_t rec_destino;    // ...canvas que nao e de 16 bits, ou com paleta
   uint32_t rec_escala;     // ...tamanho escalado (setTextSize != 1)
@@ -50,3 +57,9 @@ typedef struct {
 } glifos_estat_t;
 
 void tab5_glifos_estat(glifos_estat_t* out);
+
+// UM CANVAS RGB565 SEM GIRO cuja memoria o texto transparente pode tocar
+// direto (uma camada de app Berry): quem desenha nele avisa aqui, e desliga
+// (nullptr) ao parar. Sem isto, texto num canvas que nao e a tela vai pelo
+// readRect do M5GFX, que copia pixel a pixel (~40 us por letra).
+void tab5_glifos_canvas_direto(const lgfx::LGFXBase* gfx, uint16_t* buf, int largura, int altura);

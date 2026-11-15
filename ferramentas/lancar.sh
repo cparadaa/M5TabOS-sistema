@@ -1,6 +1,6 @@
 #!/bin/bash
 # Lanca uma versao nova do M5tabOS. As regras de qual numero subir estao em
-# VERSIONAMENTO.md.
+# docs/VERSIONAMENTO.md.
 #
 #   ferramentas/lancar.sh patch     0.7.0 -> 0.7.1  (so correcoes)
 #   ferramentas/lancar.sh minor     0.7.0 -> 0.8.0  (algo novo, ou que exige regravar)

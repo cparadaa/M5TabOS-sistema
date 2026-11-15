@@ -16,7 +16,6 @@ static const char *TAG = "teclado";
 #define REG_INT_CFG            0x00
 #define REG_INT_STAT           0x01
 #define REG_EVENT_NUM          0x02
-#define REG_BRIGHTNESS         0x03
 #define REG_MODE_KEYBOARD      0x10
 #define REG_HID_EVENT          0x30   // 2 bytes: modificador + codigo HID
 #define REG_FIRMWARE_VERSION   0xFE
@@ -50,17 +49,14 @@ static const char *TAG = "teclado";
 static bool     s_presente = false;
 static uint8_t  s_versao   = 0;
 static bool     s_bus_ok   = false;   // o barramento externo ja aponta para o ExtPort1
-static uint32_t s_proxima_busca = 0;  // ms; quando tentar achar o teclado de novo
+static uint32_t s_ultima_busca = 0;   // ms; a ultima procura por um teclado ausente
 
-// SE O TECLADO ESTA HABILITADO - vontade do usuario, empurrada de fora (o
-// kernel no boot, o app Ajustes quando muda), nunca lida daqui.
-// este arquivo chamava ajustes_teclado() direto, o que e HAL (a camada mais
-// baixa) perguntando a um servico - o sentido errado da dependencia. Nasce
-// FALSO, igual ao padrao de ajustes.cpp: o sistema nega por padrao, e quem
-// liga primeiro e quem chama tab5_teclado_habilitar() com o valor real.
-static bool s_habilitado = false;
-
-void tab5_teclado_habilitar(bool ligado) { s_habilitado = ligado; }
+// SEM AJUSTE DE LIGAR/DESLIGAR: o teclado e achado sozinho. Ausente, custa uma
+// transacao I2C a cada BUSCA_MS com a tela acesa (nenhuma em repouso), e a
+// primeira tecla de um teclado recem-encaixado e achada na hora pelo G50 - o
+// INT desce com a fila cheia e o pull-up o segura em cima sem teclado (ver
+// int_em_baixo e tab5_teclado_pendente). O ajuste antigo ("teclado" na NVS)
+// ficou sem uso.
 
 // De quanto em quanto tempo procurar um teclado ausente.
 //
@@ -70,6 +66,10 @@ void tab5_teclado_habilitar(bool ligado) { s_habilitado = ligado; }
 // ciclo (20ms) seria desperdicio puro num aparelho que passa a maior parte da
 // vida sem teclado encaixado.
 #define BUSCA_MS  2000
+// Com o G50 em baixo e nenhum teclado conhecido, procura bem mais cedo - mas
+// nao a cada volta: outro acessorio segurando o pino em baixo nao pode virar
+// um scan I2C por quadro.
+#define BUSCA_INT_MS  250
 
 
 bool tab5_teclado_presente(void) { return s_presente; }
@@ -208,6 +208,8 @@ static uint32_t s_conferido_ms  = 0;
 
 // ---------------------------------------------------------------------------
 
+static bool int_em_baixo(void);
+
 // Tenta encontrar e configurar o teclado. Chamada no boot E periodicamente
 // enquanto ele estiver ausente - e o que permite encaixar com o aparelho ligado.
 static bool procurar(bool falar)
@@ -242,6 +244,11 @@ static bool procurar(bool falar)
   s_soltura_vista = false;
   s_fw_repete = false;
   s_pode_ter_mais = true;   // primeira leitura depois de encaixar: sem olhar o pino
+  // O pino e reaprendido a cada encaixe: um evento lido com o INT em cima logo
+  // depois de encaixar (o pino ainda assentando) desligava a confianca ate o
+  // proximo boot - visto num reencaixe, com o teclado avisando direito.
+  s_int_confiavel = false;
+  s_int_traiu = false;
 
   ESP_LOGI(TAG, "teclado ENCAIXADO em 0x%02X (firmware %u), modo HID",
            TAB5_TECLADO_ENDERECO, (unsigned)s_versao);
@@ -250,8 +257,8 @@ static bool procurar(bool falar)
 
 bool tab5_teclado_iniciar(void)
 {
-  // O barramento e reapontado SEMPRE, mesmo com o teclado desativado: e ele que
-  // tira o Ex_I2C de cima dos pinos do Grove, e o Azimutal conta com isso.
+  // O barramento e reapontado SEMPRE, com ou sem teclado: e ele que tira o
+  // Ex_I2C de cima dos pinos do Grove, e o Azimutal conta com isso.
 
   // Reaponta o barramento externo para o ExtPort1. Ver o porque no cabecalho.
   // Isto e feito UMA vez; so a procura pelo teclado e que se repete.
@@ -263,18 +270,13 @@ bool tab5_teclado_iniciar(void)
     return false;
   }
   s_bus_ok = true;
-  s_proxima_busca = tab5_agora_ms() + BUSCA_MS;
+  s_ultima_busca = tab5_agora_ms();
   // O G50 como entrada com pull-up (o kernel ja o configura com a
   // interrupcao; isto so garante o nivel legivel se aquilo falhar). Nao mexe
   // no tipo de interrupcao.
   gpio_set_direction((gpio_num_t)TAB5_TECLADO_INT, GPIO_MODE_INPUT);
   gpio_pullup_en((gpio_num_t)TAB5_TECLADO_INT);
 
-  if (!s_habilitado)
-  {
-    ESP_LOGI(TAG, "teclado desativado em Ajustes - nao vou procurar");
-    return false;
-  }
   return procurar(true);
 }
 
@@ -316,7 +318,7 @@ static bool ler_hid(uint8_t* mod, uint8_t* hid)
   {
     ESP_LOGW(TAG, "teclado RETIRADO (parou de responder)");
     s_presente = false;
-    s_proxima_busca = t + BUSCA_MS;
+    s_ultima_busca = t;
     return false;
   }
   if (n == 0) { s_pode_ter_mais = false; return false; }
@@ -354,26 +356,14 @@ bool tab5_teclado_ler(tab5_tecla_t* ev)
   memset(ev, 0, sizeof(*ev));
   if (!s_bus_ok) { return false; }
 
-  // Desligado em Ajustes: nem procura. Custo exato do que a gente evita: uma
-  // transacao I2C a cada 2s, ~200us de barramento a 400kHz - desprezivel perto
-  // das ~50 leituras por segundo que a interface ja faz. Mas o principio deste
-  // sistema e negar por padrao, e quem decide o que fica ativo e o usuario.
-  if (!s_habilitado)
-  {
-    if (s_presente) {
-      ESP_LOGI(TAG, "teclado desativado em Ajustes");
-      s_presente = false;
-    }
-    return false;
-  }
-
   if (!s_presente)
   {
-    // Ausente: procura de tempos em tempos. E isto que faz o teclado funcionar
-    // ao ser encaixado com o aparelho ligado, sem reiniciar.
+    // Ausente: procura de tempos em tempos, ou JA se o G50 desceu (alguem
+    // encaixou e apertou uma tecla). E isto que faz o teclado funcionar ao ser
+    // encaixado com o aparelho ligado, sem reiniciar.
     const uint32_t t = tab5_agora_ms();
-    if ((int32_t)(t - s_proxima_busca) < 0) { return false; }
-    s_proxima_busca = t + BUSCA_MS;
+    if (t - s_ultima_busca < (int_em_baixo() ? BUSCA_INT_MS : BUSCA_MS)) { return false; }
+    s_ultima_busca = t;
     if (!procurar(false)) { return false; }
   }
 
@@ -468,7 +458,17 @@ bool tab5_teclado_ler(tab5_tecla_t* ev)
 
 bool tab5_teclado_pendente(void)
 {
-  if (!s_bus_ok || !s_habilitado || !s_presente) { return false; }
+  if (!s_bus_ok) { return false; }
+  // Ausente com o G50 em baixo: um teclado encaixado no repouso, com tecla
+  // na fila. Procura agora - e a tecla acorda a tela como qualquer outra.
+  // A procura esvazia a fila (troca de modo), entao a tecla que desceu o
+  // pino nao chega a ser lida: achar o teclado ja e o "ha tecla".
+  if (!s_presente) {
+    const uint32_t t = tab5_agora_ms();
+    if (!int_em_baixo() || t - s_ultima_busca < BUSCA_INT_MS) { return false; }
+    s_ultima_busca = t;
+    return procurar(false);
+  }
   // Em repouso tambem: pino em cima e nada pendente = sem tecla, sem I2C.
   if (s_int_confiavel && !int_em_baixo() && !s_pode_ter_mais) { return false; }
   uint8_t n = 0;
@@ -485,10 +485,4 @@ void tab5_teclado_descartar(void)
   // Escrever 0 no contador limpa a fila e solta o INT (datasheet).
   M5.Ex_I2C.writeRegister8(TAB5_TECLADO_ENDERECO, REG_EVENT_NUM, 0x00, FREQ);
   M5.Ex_I2C.writeRegister8(TAB5_TECLADO_ENDERECO, REG_INT_STAT, 0x00, FREQ);
-}
-
-void tab5_teclado_brilho(uint8_t v)
-{
-  if (!s_presente) { return; }
-  M5.Ex_I2C.writeRegister8(TAB5_TECLADO_ENDERECO, REG_BRIGHTNESS, v, FREQ);
 }

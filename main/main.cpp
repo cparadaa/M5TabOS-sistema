@@ -12,14 +12,18 @@
 
 #include "app.h"
 #include "tab5_power.hpp"
+#include "tab5_toque_gt911.hpp"
 #include "ajustes.h"
 #include "tab5_emoji.hpp"
 #include "tab5_ui.hpp"
 #include "tab5_monitor.hpp"   // tab5_mem_marco - o extrato da RAM interna
 #include "tab5_pendrive.hpp"
+#include "tab5_usb.hpp"
+#include "tab5_arquivos.hpp"
+#include "tab5_c6_sono.hpp"
+#include "tab5_heap_psram.hpp"
 
 static const char *TAG = "main";
-
 
 // extern "C" e OBRIGATORIO: o startup do IDF e C e procura o simbolo "app_main"
 // cru. Sem isso o C++ decora para _Z8app_mainv e o link falha.
@@ -45,10 +49,12 @@ extern "C" void app_main(void)
 
     auto cfg = M5.config();
     tab5_power_config(cfg, boot);     // fase 1: antes do begin
+    tab5_heap_psram_conferir();       // heap da PSRAM inteiro? se nao, reinicia limpo (tab5_heap_psram.hpp)
     M5.begin(cfg);                    // trilhos, painel MIPI-DSI, touch
     tab5_power_aplicar(boot);         // fase 2: depois do begin
     tab5_mem_marco("M5.begin (painel, toque)");
     tab5_painel();                    // qual das tres telas (tab5_power.hpp) - antes de mexer no relogio
+    tab5_toque_gt911_instalar();      // toque GT911 que nao inventa dedo se o I2C falhar
 
     // VOLUME salvo, aplicado JA - antes que qualquer app toque o primeiro som
     // (M5.Speaker.tone()/playWav() sobe o ES8388 sozinho, na hora, ver o
@@ -99,6 +105,13 @@ extern "C" void app_main(void)
     // conectar num computador, so com o ajuste ligado). Depois do sistema: ela
     // consulta o app aberto e a tela de bloqueio.
     tab5_pendrive_servico_iniciar();
+
+    // USB-A: o pendrive que alguem espetar aparece em /usb (e na Musica).
+    // Os 5V do conector ja vieram do perfil de boot (ajustes_usb_a).
+    tab5_usb_iniciar();
+    // O C6 dormindo associado no repouso, se o ajuste estiver ligado.
+    tab5_c6_sono_iniciar();
+    tab5_mem_marco("USB-A");
 
     tab5_mem_marco("sistema_iniciar (fim)");
     ESP_LOGI(TAG, "M5tabOS %s iniciado - boot concluido", esp_app_get_description()->version);

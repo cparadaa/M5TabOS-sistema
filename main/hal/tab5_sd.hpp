@@ -21,7 +21,20 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-#include "sd_protocol_types.h"   // sdmmc_card_t (o cartao cru do pendrive)
+#include "esp_err.h"
+
+// O CONTROLADOR SDMMC E DIVIDIDO: o cartao usa o slot 0 e o ESP32-C6 (Wi-Fi,
+// pelo esp_hosted) usa o slot 1 do MESMO controlador do P4. O IDF so serializa
+// as TRANSACOES; montar ou desmontar um slot (sdmmc_host_init, init_slot,
+// deinit_slot, card_init) mexe em clock, timeouts, contagem de slots, fila e
+// mutex do controlador sem trava nenhuma contra o outro slot. Duas montagens
+// ao mesmo tempo (o cartao e a volta do C6 dormindo) davam abort no driver
+// (2026-11-13). Quem monta ou desmonta QUALQUER slot segura esta trava:
+// o tab5_sd (cartao e pendrive), o tab5_wifi (subida do esp_hosted) e o
+// tab5_c6_sono (descida e volta do enlace). Nao e recursiva.
+// Ordem das travas: a do chamador (cartao, sono do C6) primeiro, esta depois.
+void tab5_sd_controlador_travar(void);
+void tab5_sd_controlador_soltar(void);
 
 // Onde o cartao aparece no sistema de arquivos.
 #define TAB5_SD_RAIZ   "/sdcard"
@@ -47,6 +60,10 @@ void tab5_sd_ultimas_transicoes(int64_t* montou_us, int64_t* desmontou_us);
 //   tab5_sd_pasta("Azimutal", buf, sizeof buf) -> "/sdcard/apps/Azimutal"
 // Caracteres problematicos no nome (espaco, barra, acento) viram '_'.
 bool tab5_sd_pasta(const char* app, char* out, size_t out_tam);
+
+// O MESMO caminho de tab5_sd_pasta, sem criar nada (para saber onde estao os
+// dados de um app sem fazer a pasta nascer).
+bool tab5_sd_pasta_caminho(const char* app, char* out, size_t out_tam);
 
 // Abre um arquivo DENTRO da pasta do app, criando a pasta se preciso.
 // modo e o do fopen ("w", "a", "r"...). Devolve NULL em qualquer falha.
@@ -92,7 +109,8 @@ FILE* tab5_sd_abrir(const char* app, const char* arquivo, const char* modo);
 // na PSRAM e volta na hora, sem tocar no cartao. Uma tarefa so ("cartao")
 // grava em lote: monta UMA vez, abre cada arquivo UMA vez, escreve tudo o que
 // ele tem pendente, na ordem em que chegou. Grava:
-//   - a cada 5 s, se houver algo pendente;
+//   - a cada 5 s, se houver algo pendente (com a tela apagada, ate ~10 s:
+//     a tarefa da uma volta a cada 5 s no repouso);
 //   - na hora, para o que foi pedido com 'urgente' (mensagem de conversa);
 //   - quando o buffer passa da metade.
 //
@@ -121,13 +139,20 @@ bool tab5_sd_acrescentar(const char* app, const char* arquivo, const void* dados
 bool tab5_sd_substituir(const char* app, const char* arquivo, const void* dados, size_t n,
                         uint8_t flags = 0);
 
+// APAGAR um arquivo da pasta do app, pela mesma trava das portas acima (o que
+// estava para acrescentar vai antes). Bloqueia como elas. Com o cartao
+// emprestado ao computador (ou o diario ainda por aplicar) RECUSA: apagar nao
+// vai para o diario. false = nao apagou.
+bool tab5_sd_apagar(const char* app, const char* arquivo);
+
 // Diagnostico: bytes esperando, linhas gravadas e perdidas desde o boot.
 void tab5_sd_anexos_estado(uint32_t* pendentes, uint32_t* gravadas, uint32_t* perdidas);
 
 // CARONA NA TAREFA "cartao". Um servico que so precisa, de tempos em tempos,
 // esvaziar algo seu no cartao (o log) nao ganha tarefa propria: registra uma
 // funcao, e a tarefa "cartao" a chama a cada volta - no maximo 1 s entre
-// voltas, as vezes menos (quando um anexo urgente a acorda). Quem pega carona
+// voltas com a tela acesa e 5 s em repouso, as vezes menos (quando um anexo
+// urgente a acorda). Quem pega carona
 // mede o proprio tempo (esp_timer), sem contar voltas.
 // A funcao roda na pilha do "cartao" (6 KB): pode montar e abrir arquivo, nao
 // pode esperar muito (as gravacoes de todos esperam junto). Ate 8 (CARONAS_MAX).
@@ -136,6 +161,10 @@ bool tab5_sd_carona(tab5_sd_carona_t fn);
 
 // Espaco do cartao, em bytes. Qualquer ponteiro pode ser NULL.
 bool tab5_sd_espaco(uint64_t* total, uint64_t* livre);
+
+// Tamanho de um arquivo ja aberto, em bytes; o ponteiro volta ao comeco.
+// -1 = erro. (Troca o trio fseek END / ftell / fseek SET repetido por a.)
+long tab5_sd_tamanho(FILE* f);
 
 // Descricao curta do cartao para mostrar na tela ("SDHC 29.7GB"), ou
 // "sem cartao". Nunca devolve NULL.
@@ -179,9 +208,23 @@ typedef enum {
 } tab5_sd_emprestimo_t;
 tab5_sd_emprestimo_t tab5_sd_emprestar(uint32_t espera_ms);
 
-// O cartao cru (sdmmc_read_sectors/sdmmc_write_sectors), ou NULL se nao
-// estiver emprestado. So para quem pediu o emprestimo.
-sdmmc_card_t* tab5_sd_cru(void);
+// SETORES DO CARTAO EMPRESTADO. So o dono do emprestimo (o pendrive); ninguem
+// fora do hal segura o cartao. Todas pela trava propria do cartao cru.
+//
+// RECUPERACAO: se a leitura/gravacao falhar, a porta reinicia o controlador
+// SDMMC, espera o cartao sair de ocupado (ate 10 s), reinicia o cartao se ele
+// nao responder e repete - no maximo 2 vezes por operacao. Pode demorar
+// (dezenas de segundos no pior caso). NAO escreve no log (quem chama pode estar
+// num retorno do USB): so conta, em tab5_sd_cru_estat.
+bool      tab5_sd_cru_info(uint32_t* setores, uint32_t* tam_setor);   // false = nao emprestado
+esp_err_t tab5_sd_cru_ler(uint32_t setor, void* buf, uint32_t n);
+esp_err_t tab5_sd_cru_gravar(uint32_t setor, const void* buf, uint32_t n);
+typedef struct {
+  uint32_t recuperacoes;   // vezes que uma operacao precisou de recuperacao
+  uint32_t falhas;         // operacoes que falharam mesmo depois delas
+  uint32_t max_ms;         // a operacao mais lenta (com as recuperacoes)
+} tab5_sd_cru_estat_t;
+void      tab5_sd_cru_estat(tab5_sd_cru_estat_t* e);
 
 // Devolve: solta o cartao cru, montar() volta a funcionar e o que ficou
 // esperando e gravado. Chamar SO depois de o computador ter parado de usar o

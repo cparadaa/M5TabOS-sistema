@@ -1,4 +1,5 @@
 #include "tab5_ble.hpp"
+#include "idioma.h"
 #include "tab5_ouvinte.hpp"
 #include "tab5_sinal.hpp"
 #include "tab5_wifi.hpp"
@@ -22,6 +23,7 @@
 #include "tab5_monitor.hpp"   // tab5_mem_marco
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 static const char* TAG = "ble";
 
@@ -55,7 +57,7 @@ static SemaphoreHandle_t      s_pilha = nullptr;
 static volatile bool          s_ressincronizar = false; // a pilha reiniciou sozinha
 static volatile tab5_ble_estado_t s_estado = TAB5_BLE_DESLIGADO;
 static volatile bool          s_varrendo = false;
-static volatile uint32_t      s_versao = 1;
+static std::atomic<uint32_t>      s_versao = 1;
 static bool                   s_pilha_nimble = false;  // nimble_port_init feito
 static ble_uuid_any_t         s_uuid_mesh;
 
@@ -63,7 +65,7 @@ static tab5_ble_visto_t s_vistos[TAB5_BLE_VISTOS];
 static int              s_n_vistos = 0;
 static int8_t           s_rssi_publicado[TAB5_BLE_VISTOS];   // o que a tela ja mostrou
 
-static void mudou(void) { s_versao = s_versao + 1; }
+static void mudou(void) { ++s_versao; }
 
 // ---------------------------------------------------------------------------
 // STACK
@@ -216,16 +218,42 @@ static void execucao(void*)
   if (s_atendido != s_pedido) { disparar(); }
 }
 
+// Sem vaga no pool: tenta de novo daqui a pouco (as vagas liberam rapido), ate
+// dar certo. Senao o pedido some e o estado fica parado (ex.: DESLIGANDO).
+// O timer e de disparo unico e criado uma vez; o callback roda na tarefa do
+// esp_timer, o que serve: disparar() so faz atomic + pool_criar, e pool_criar
+// nao exige tarefa especifica.
+#define BLE_REPETE_MS 500
+static esp_timer_handle_t s_timer_repete = nullptr;
+static bool               s_falha_logada = false;   // loga so a primeira falha da sequencia
+
+static void repetir_disparo(void*) { disparar(); }
+
 static void disparar(void)
 {
   bool livre = false;
   if (!__atomic_compare_exchange_n(&s_rodando, &livre, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
     return;   // ja ha uma execucao: ela atende este pedido tambem
   }
-  if (!pool_criar(nullptr, execucao, nullptr, "ble", 4096, 3, DONO_SERVICO, "Bluetooth")) {
-    s_rodando = false;
-    ESP_LOGE(TAG, "sem vaga para ligar/desligar o Bluetooth");
+  if (pool_criar(nullptr, execucao, nullptr, "ble", 4096, 3, DONO_SERVICO, "Bluetooth")) {
+    s_falha_logada = false;
+    return;
   }
+  s_rodando = false;
+  if (!s_falha_logada) {
+    s_falha_logada = true;
+    ESP_LOGE(TAG, "sem vaga para ligar/desligar o Bluetooth - tentando de novo em %d ms", BLE_REPETE_MS);
+  }
+  if (!s_timer_repete) {
+    const esp_timer_create_args_t args = { .callback = repetir_disparo, .arg = nullptr,
+                                           .dispatch_method = ESP_TIMER_TASK, .name = "ble_repete" };
+    if (esp_timer_create(&args, &s_timer_repete) != ESP_OK) {
+      s_timer_repete = nullptr;
+      ESP_LOGE(TAG, "sem timer para repetir o pedido do Bluetooth");
+      return;
+    }
+  }
+  esp_timer_start_once(s_timer_repete, (uint64_t)BLE_REPETE_MS * 1000);
 }
 
 static void pedir(bool ligar)
@@ -397,11 +425,11 @@ bool tab5_ble_pronto(void) { return s_estado == TAB5_BLE_PRONTO; }
 const char* tab5_ble_descricao(void)
 {
   switch (s_estado) {
-    case TAB5_BLE_DESLIGADO: return "desligado";
-    case TAB5_BLE_SUBINDO:   return "ligando";
+    case TAB5_BLE_DESLIGADO: return N_("desligado");
+    case TAB5_BLE_SUBINDO:   return N_("ligando");
     case TAB5_BLE_PRONTO:    return s_varrendo ? "procurando aparelhos" : "ligado";
-    case TAB5_BLE_FALHOU:    return "falhou (o C6 não deu o Bluetooth)";
-    case TAB5_BLE_DESLIGANDO: return "desligando";
+    case TAB5_BLE_FALHOU:    return N_("falhou (o C6 não deu o Bluetooth)");
+    case TAB5_BLE_DESLIGANDO: return N_("desligando");
   }
   return "?";
 }

@@ -8,12 +8,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "sdmmc_cmd.h"
+#include "esp_heap_caps.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_private/usb_phy.h"
 #include "esp_private/periph_ctrl.h"
 #include "hal/usb_wrap_ll.h"
 #include "hal/usb_serial_jtag_ll.h"
+#include "soc/lp_system_struct.h"
+#include "soc/usb_serial_jtag_struct.h"
 #include "soc/usb_wrap_struct.h"
 #include "tusb.h"
 #include "tab5_donos.hpp"
@@ -23,10 +25,15 @@
 #include "ajustes.h"
 #include "notificacao.h"
 #include "tab5_log.hpp"
+#include "pool_tarefas.h"
+#include <atomic>
 
 static const char* TAG = "pendrive";
 
-static sdmmc_card_t*      s_cartao  = nullptr;
+// O cartao emprestado, visto so pelas portas de setor do hal (tab5_sd_cru_*):
+// aqui ficam apenas "temos cartao" e o tamanho.
+static bool               s_tem_cartao = false;
+static uint32_t           s_setores = 0, s_tam = 512;
 static usb_phy_handle_t   s_phy     = nullptr;
 static TaskHandle_t       s_tarefa  = nullptr;
 static SemaphoreHandle_t  s_parou   = nullptr;
@@ -38,35 +45,50 @@ static esp_pm_lock_handle_t s_pm = nullptr;
 
 // DIAGNOSTICO POR ETAPA - onde o computador parou (ver tab5_pendrive_usb_t):
 // reconheceu o aparelho? perguntou o que ele e? o tamanho? leu?
-static volatile uint32_t s_n_config = 0;      // SET_CONFIGURATION (tud_mount_cb)
-static volatile uint32_t s_n_inquiry = 0;     // INQUIRY
-static volatile uint32_t s_n_capacidade = 0;  // READ CAPACITY / READ FORMAT CAPACITIES
-static volatile uint32_t s_n_leituras = 0;    // pedacos de READ10 lidos do cartao (ate 4 KB cada)
+static std::atomic<uint32_t> s_n_config = 0;      // SET_CONFIGURATION (tud_mount_cb)
+static std::atomic<uint32_t> s_n_inquiry = 0;     // INQUIRY
+static std::atomic<uint32_t> s_n_capacidade = 0;  // READ CAPACITY / READ FORMAT CAPACITIES
+static std::atomic<uint32_t> s_n_leituras = 0;    // pedacos de READ10 lidos do cartao (ate 4 KB cada)
 static volatile uint8_t  s_op_recusado = 0;   // ultimo comando SCSI nao suportado (0 = nenhum)
 static volatile uint32_t s_leitura_max_us = 0;// leitura do cartao mais lenta
 static uint32_t          s_ops_logados[8];    // comandos recusados (bit por codigo)
-static volatile uint32_t s_n_tur = 0;         // TEST UNIT READY
-static volatile uint32_t s_n_sense = 0;       // REQUEST SENSE (o computador quer saber de um erro)
-static volatile uint32_t s_n_respostas = 0;   // comandos (fora leitura/escrita) com o status entregue
+static std::atomic<uint32_t> s_n_tur = 0;         // TEST UNIT READY
+static std::atomic<uint32_t> s_n_sense = 0;       // REQUEST SENSE (o computador quer saber de um erro)
+static std::atomic<uint32_t> s_n_respostas = 0;   // comandos (fora leitura/escrita) com o status entregue
 static volatile uint8_t  s_op_respondido = 0; // o ultimo deles
-static volatile uint32_t s_n_soltou = 0;      // desconfigurou (reset do barramento, cabo)
+static std::atomic<uint32_t> s_n_soltou = 0;      // desconfigurou (reset do barramento, cabo)
 static uint32_t          s_ops_respondidos[8];// comandos ja respondidos (bit por codigo)
-static volatile uint32_t s_n_leituras_ok = 0; // comandos READ10 com dados e status entregues
+static std::atomic<uint32_t> s_n_leituras_ok = 0; // comandos READ10 com dados e status entregues
 // ONDE PAROU, quando para: os tres estados que um comando de leitura atravessa.
-static volatile uint32_t s_n_cmd_leitura = 0; // comandos READ10 recebidos
+static std::atomic<uint32_t> s_n_cmd_leitura = 0; // comandos READ10 recebidos
 static volatile bool     s_lendo = false;     // um READ10 comecou e o status ainda nao saiu
-static volatile bool     s_no_cartao = false; // dentro do sdmmc_read/write_sectors agora
+static volatile bool     s_no_cartao = false; // dentro de uma leitura/escrita do cartao agora
 static volatile bool     s_gravando = false;  // ...e e uma escrita (para o log dizer qual)
 static volatile uint32_t s_escrita_max_us = 0;// escrita do cartao mais lenta
-static volatile uint32_t s_n_escritas_lentas = 0; // escritas de mais de 100 ms
+static std::atomic<uint32_t> s_n_escritas_lentas = 0; // escritas de mais de 100 ms
 static volatile uint32_t s_cmd_setor = 0;     // primeiro setor do READ10 em curso
 static volatile uint32_t s_ultimo_setor = 0;  // ultimo pedaco pedido ao cartao
 static volatile int64_t  s_evento_us = 0;     // ultimo sinal de vida do computador ou do cartao
 static volatile uint32_t s_erro_setor = 0;    // a ultima falha do cartao (para o log)
 static volatile int      s_erro_cod = 0;
 static volatile uint64_t  s_lidos = 0, s_gravados = 0;
-static volatile uint32_t  s_erros = 0;
+static std::atomic<uint32_t>  s_erros = 0;
 static volatile int64_t   s_ultimo_io_us = 0, s_ultima_escrita_us = 0;
+
+// JUNTAR ESCRITAS e LER ADIANTADO (ver a secao "MSC"). Tudo isto so e mexido
+// pela tarefa "pendrive" (tud_task), entao sem trava; os contadores sao lidos
+// pela tarefa da sessao so para o log.
+#define BUF_BYTES 65536                      // 64 KB: 128 setores de 512
+#define OCIOSO_US 30000                      // buffer parado ha tanto: vai para o cartao
+static uint8_t*  s_buf_esc = nullptr;        // escritas juntadas (PSRAM)
+static uint32_t  s_esc_ini = 0, s_esc_n = 0; // primeiro setor e quantos ha no buffer
+static uint8_t*  s_buf_ler = nullptr;        // leitura antecipada (PSRAM)
+static uint32_t  s_ler_ini = 0, s_ler_n = 0; // idem; s_ler_n = 0 = cache vazio
+static volatile bool s_cartao_falhou = false;// o cartao falhou de vez: sem midia, sessao termina
+static std::atomic<uint32_t> s_n_descargas = 0;      // escritas ao cartao (cada uma junta varios pedacos)
+static std::atomic<uint32_t> s_kb_descargas = 0;     // KB gravados por elas
+static std::atomic<uint32_t> s_n_cache_ok = 0;       // pedacos de leitura servidos do cache
+static std::atomic<uint32_t> s_n_cache_falta = 0;    // leituras do cartao (cache vazio ou outra faixa)
 
 // ---------------------------------------------------------------------------
 // O PHY: do console para o OTG, e de volta
@@ -84,13 +106,43 @@ static void phy_para_o_otg(void)
   usb_wrap_ll_phy_select(&USB_WRAP, 0);       // OTG -> PHY 0 (USB-C), JTAG -> PHY 1
 }
 
+// O estado dos registradores que decidem se o computador ve o console - no
+// LOG DO CARTAO, porque e justamente quando o console nao volta que o cabo
+// nao mostra nada.
+static void registro_usb(const char* quando)
+{
+  ESP_LOGI(TAG, "usb %s: seletor sw=%u phy=%u | jtag conf0=%08lx (pad %u, override %u, pullup %u) "
+                "int_ena=%08lx, computador ve: %s",
+           quando, (unsigned)LP_SYS.usb_ctrl.sw_hw_usb_phy_sel, (unsigned)LP_SYS.usb_ctrl.sw_usb_phy_sel,
+           (unsigned long)USB_SERIAL_JTAG.conf0.val, (unsigned)USB_SERIAL_JTAG.conf0.usb_pad_enable,
+           (unsigned)USB_SERIAL_JTAG.conf0.pad_pull_override, (unsigned)USB_SERIAL_JTAG.conf0.dp_pullup,
+           (unsigned long)USB_SERIAL_JTAG.int_ena.val, usb_serial_jtag_is_connected() ? "sim" : "nao");
+}
+
 // O pad do OTG ja tem que estar desligado (antes do usb_del_phy, que corta
 // o clock do USB_WRAP - registrador de periferico sem clock nao se escreve).
+//
+// DE VOLTA AO ESTADO DO BOOT, nao so "o JTAG no PHY 0". Depois do pendrive o
+// Mac nao via mais a serial - nem tirando e pondo o cabo; so reiniciando.
+// Duas coisas ficavam diferentes do boot:
+//   - o seletor continuava em modo SOFTWARE (sw_hw_usb_phy_sel = 1); no boot
+//     ele esta no mapeamento de fabrica;
+//   - o controlador do console passou a sessao inteira ligado no outro PHY
+//     (os pinos do alto-falante), sem computador, e nunca era reiniciado.
+// Agora ele e reiniciado (cabo novo para ele), com as interrupcoes que o
+// driver do console armou devolvidas - o driver continua o mesmo.
 static void phy_para_o_console(void)
 {
+  registro_usb("antes de voltar");
   usb_serial_jtag_ll_phy_select(0);           // JTAG -> PHY 0 de novo
-  usb_serial_jtag_ll_phy_set_defaults();      // e com o pad (pull-up) ligado
+  LP_SYS.usb_ctrl.sw_hw_usb_phy_sel = 0;      // e o seletor no mapeamento de fabrica, como no boot
+  const uint32_t ints = USB_SERIAL_JTAG.int_ena.val;
+  PERIPH_RCC_ATOMIC() { usb_serial_jtag_ll_reset_register(); }
+  usb_serial_jtag_ll_phy_set_defaults();      // PHY interno, pad ligado
+  USB_SERIAL_JTAG.conf0.pad_pull_override = 0;   // o pull-up do D+ e do controlador
   usb_serial_jtag_ll_phy_enable_pad(true);
+  USB_SERIAL_JTAG.int_ena.val = ints;
+  registro_usb("console de volta");
 }
 
 // SENTINELA DO PAD. O ESP-IDF supoe que o PHY dos GPIO 26/27 e sempre do OTG
@@ -100,7 +152,7 @@ static void phy_para_o_console(void)
 // saiu (sem reset nenhum), e o Tab5 seguia esperando o proximo comando. O
 // alto-falante e calado antes de o USB subir (sistema_som_ceder_pinos); isto
 // pega qualquer outro que ainda mexer nesses pinos: religa e conta.
-static volatile uint32_t s_n_pad_religado = 0;
+static std::atomic<uint32_t> s_n_pad_religado = 0;
 static bool pad_conferir(void)
 {
   usb_wrap_otg_conf_reg_t c;
@@ -109,7 +161,7 @@ static bool pad_conferir(void)
   c.usb_pad_enable = 1;
   c.pad_pull_override = 0;   // o pull-up volta a ser do controlador
   USB_WRAP.otg_conf.val = c.val;
-  s_n_pad_religado = s_n_pad_religado + 1;
+  ++s_n_pad_religado;
   return true;
 }
 
@@ -176,7 +228,100 @@ extern "C" const uint16_t* tud_descriptor_string_cb(uint8_t indice, uint16_t)
 // ---------------------------------------------------------------------------
 // Tudo aqui roda na tarefa "pendrive" (tud_task), uma chamada por vez - o
 // cartao cru so tem esse usuario enquanto esta emprestado.
-static uint32_t setor_tam(void) { return s_cartao ? (uint32_t)s_cartao->csd.sector_size : 512; }
+static uint32_t setor_tam(void) { return s_tam; }
+
+// Cartao fora do ar para o computador: ejetado, sem cartao ou falhou de vez.
+static bool sem_midia(void) { return s_ejetado || !s_tem_cartao || s_cartao_falhou; }
+
+// ---------------------------------------------------------------------------
+// ESCRITAS JUNTADAS E LEITURA ANTECIPADA
+// ---------------------------------------------------------------------------
+// O TinyUSB entrega cada comando em pedacos de 4 KB (CFG_TUD_MSC_EP_BUFSIZE).
+// Gravar cada pedaco como uma escrita de 8 setores deixava o cartao lento
+// (escritas de 1,5 s) ate uma passar de 5 s e travar o controlador. Agora os
+// pedacos CONTIGUOS vao para um buffer de 64 KB e saem numa escrita so.
+//
+// QUANDO DESCARREGA (tudo na mesma tarefa, sem corrida):
+//   - o buffer encheu;
+//   - chegou escrita nao contigua (descarrega e comeca outra);
+//   - chegou READ10 (coerencia: o computador le o que acabou de gravar);
+//   - SYNCHRONIZE CACHE, TEST UNIT READY, START STOP (ejetar);
+//   - ociosidade: nada novo ha OCIOSO_US (laco da vTaskPendrive);
+//   - antes de desligar o TinyUSB.
+//
+// A JANELA: o TinyUSB 0.21 so avisa cada pedaco (nao diz qual e o ultimo de um
+// WRITE10), entao o status do comando pode sair antes de o dado chegar ao
+// cartao - no maximo OCIOSO_US + uma volta de 20 ms. E o cache de escrita de
+// qualquer pendrive; o computador cobre isso com SYNCHRONIZE CACHE e ejecao.
+//
+// Sem ESP_LOG aqui: roda nos retornos do USB (ver tud_msc_scsi_complete_cb).
+static void cartao_falhou(uint32_t setor, esp_err_t err)
+{
+  s_erro_setor = setor;
+  s_erro_cod = err;
+  ++s_erros;
+  s_cartao_falhou = true;   // a sessao ve e termina (vTaskSessao)
+}
+
+// Grava o buffer de escrita no cartao, numa escrita so. false = falhou de vez.
+static bool descarregar(void)
+{
+  // So uma descarga DE VERDADE invalida o cache de leitura. Buffer vazio nao
+  // muda nada no cartao: invalidar aqui (como era) apagava o cache a cada
+  // pedaco lido - o READ10 chama esta funcao antes de ler - e cada 4 KB pedidos
+  // viravam 64 KB lidos do cartao.
+  if (!s_esc_n) { return true; }
+  s_ler_n = 0;   // o cartao vai mudar: o que estava no cache pode estar velho
+  if (s_cartao_falhou) { s_esc_n = 0; return false; }
+  const uint32_t n = s_esc_n;
+  const int64_t t0 = esp_timer_get_time();
+  s_evento_us = t0;
+  s_ultimo_setor = s_esc_ini;
+  s_gravando = true;
+  s_no_cartao = true;
+  const esp_err_t err = tab5_sd_cru_gravar(s_esc_ini, s_buf_esc, n);
+  s_no_cartao = false;
+  s_gravando = false;
+  s_esc_n = 0;
+  s_evento_us = esp_timer_get_time();
+  const uint32_t dt = (uint32_t)(s_evento_us - t0);
+  if (dt > s_escrita_max_us) { s_escrita_max_us = dt; }
+  if (dt > 100000) { ++s_n_escritas_lentas; }
+  if (err != ESP_OK) { cartao_falhou(s_esc_ini, err); return false; }
+  ++s_n_descargas;
+  s_kb_descargas += n * s_tam / 1024;
+  s_gravados = s_gravados + (uint64_t)n * s_tam;
+  s_ultimo_io_us = s_evento_us;
+  return true;
+}
+
+// Chamada pelo laco da tarefa: o que ficou no buffer sai depois de OCIOSO_US.
+static void descarregar_se_ocioso(void)
+{
+  if (s_esc_n && esp_timer_get_time() - s_ultima_escrita_us >= OCIOSO_US) { descarregar(); }
+}
+
+// O SENSE de uma descarga que falhou ou do cartao fora do ar.
+static void sense_sem_midia(uint8_t lun) { tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); }
+
+static void log_cartao(void);   // definida junto do log da sessao
+
+static void buffers_soltar(void)
+{
+  heap_caps_free(s_buf_esc); s_buf_esc = nullptr;
+  heap_caps_free(s_buf_ler); s_buf_ler = nullptr;
+  s_esc_n = 0; s_ler_n = 0;
+}
+
+// Alinhado a linha de cache (128 no P4): o DMA do cartao le e escreve direto.
+static bool buffers_alocar(void)
+{
+  s_buf_esc = (uint8_t*)heap_caps_aligned_alloc(128, BUF_BYTES, MALLOC_CAP_SPIRAM);
+  s_buf_ler = (uint8_t*)heap_caps_aligned_alloc(128, BUF_BYTES, MALLOC_CAP_SPIRAM);
+  if (!s_buf_esc || !s_buf_ler) { buffers_soltar(); return false; }
+  s_esc_n = 0; s_ler_n = 0;
+  return true;
+}
 
 // O QUE O DISCO E, e o tamanho da resposta. O TinyUSB responde o INQUIRY com
 // 36 bytes; se o computador pediu mais (ha sistemas que pedem 255), ela manda
@@ -188,7 +333,7 @@ static uint32_t setor_tam(void) { return s_cartao ? (uint32_t)s_cartao->csd.sect
 // O comprimento verdadeiro vai no proprio cabecalho (additional_length), entao
 // os zeros sao so enchimento. Pedido de 36, resposta de 36 - nada muda.
 #define RESPOSTA_CHEIA 255
-static void inquiry_contar(void) { s_n_inquiry = s_n_inquiry + 1; }
+static void inquiry_contar(void) { ++s_n_inquiry; }
 
 static void inquiry_textos(uint8_t vendor[8], uint8_t produto[16], uint8_t rev[4])
 {
@@ -218,7 +363,7 @@ extern "C" void tud_msc_inquiry_cb(uint8_t, uint8_t vendor[8], uint8_t produto[1
 // pede 96). O TinyUSB ja montou os 18 em 'buf'; o resto e zero.
 extern "C" int32_t tud_msc_request_sense_cb(uint8_t, void* buf, uint16_t bufsize)
 {
-  s_n_sense = s_n_sense + 1;
+  ++s_n_sense;
   const uint16_t n = bufsize < RESPOSTA_CHEIA ? bufsize : RESPOSTA_CHEIA;
   if (n <= sizeof(scsi_sense_fixed_resp_t)) { return sizeof(scsi_sense_fixed_resp_t); }
   memset((uint8_t*)buf + sizeof(scsi_sense_fixed_resp_t), 0, n - sizeof(scsi_sense_fixed_resp_t));
@@ -237,7 +382,7 @@ extern "C" int32_t tud_msc_request_sense_cb(uint8_t, void* buf, uint16_t bufsize
 extern "C" void tud_msc_scsi_complete_cb(uint8_t, const uint8_t cmd[16])
 {
   const uint8_t op = cmd[0];
-  s_n_respostas = s_n_respostas + 1;
+  ++s_n_respostas;
   s_op_respondido = op;
   s_ops_respondidos[op >> 5] |= 1u << (op & 31);
   s_evento_us = esp_timer_get_time();
@@ -245,18 +390,21 @@ extern "C" void tud_msc_scsi_complete_cb(uint8_t, const uint8_t cmd[16])
 
 extern "C" void tud_msc_read10_complete_cb(uint8_t)
 {
-  s_n_leituras_ok = s_n_leituras_ok + 1;
+  ++s_n_leituras_ok;
   s_lendo = false;
   s_evento_us = esp_timer_get_time();
 }
 
 extern "C" bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
-  s_n_tur = s_n_tur + 1;
+  ++s_n_tur;
   s_evento_us = esp_timer_get_time();
   // Ejetado: "sem midia" - o computador para de mandar comandos ao disco.
-  if (s_ejetado || !s_cartao) {
-    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+  // Aproveita para esvaziar o buffer de escrita (o computador pergunta isto
+  // sempre que fica ocioso).
+  if (!sem_midia()) { descarregar(); }
+  if (sem_midia()) {
+    sense_sem_midia(lun);
     return false;
   }
   return true;
@@ -264,8 +412,8 @@ extern "C" bool tud_msc_test_unit_ready_cb(uint8_t lun)
 
 extern "C" void tud_msc_capacity_cb(uint8_t, uint32_t* n_blocos, uint16_t* bloco)
 {
-  s_n_capacidade = s_n_capacidade + 1;
-  *n_blocos = s_cartao ? (uint32_t)s_cartao->csd.capacity : 0;
+  ++s_n_capacidade;
+  *n_blocos = s_tem_cartao ? s_setores : 0;
   *bloco    = (uint16_t)setor_tam();
 }
 
@@ -274,6 +422,11 @@ extern "C" bool tud_msc_start_stop_cb(uint8_t, uint8_t, bool start, bool ejetar)
   // "Ejetar" no Finder/Explorer/Linux chega aqui como STOP + eject - o sinal
   // de que o computador terminou e nao tem mais nada em cache para o disco.
   if (ejetar) {
+    // Descarrega ANTES de aceitar: depois de ejetado nada mais sai do buffer.
+    if (!start && !descarregar()) {
+      tud_msc_set_sense(0, SCSI_SENSE_MEDIUM_ERROR, 0x03, 0x00);
+      return false;
+    }
     s_ejetado = !start;
   }
   return true;
@@ -286,34 +439,55 @@ extern "C" bool tud_msc_is_writable_cb(uint8_t) { return !s_ejetado; }
 extern "C" int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf, uint32_t tam)
 {
   const uint32_t st = setor_tam();
-  if (!s_cartao || s_ejetado || offset % st || tam < st) {
-    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+  if (sem_midia() || offset % st || tam < st) {
+    sense_sem_midia(lun);
     return -1;
   }
   const uint32_t n = tam / st;
-  if (!s_lendo) {   // primeiro pedaco de um comando novo
-    s_lendo = true;
-    s_n_cmd_leitura = s_n_cmd_leitura + 1;
-    s_cmd_setor = lba;
-  }
-  s_n_leituras = s_n_leituras + 1;
-  s_ultimo_setor = lba + offset / st;
-  const int64_t t0 = esp_timer_get_time();
-  s_evento_us = t0;
-  s_no_cartao = true;
-  const esp_err_t lido = sdmmc_read_sectors(s_cartao, buf, lba + offset / st, n);
-  s_no_cartao = false;
-  const uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
-  s_evento_us = esp_timer_get_time();
-  if (dt > s_leitura_max_us) { s_leitura_max_us = dt; }
-  if (lido != ESP_OK) {
-    s_erro_setor = lba + offset / st;
-    s_erro_cod = lido;
-    s_erros = s_erros + 1;
-    tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // erro de leitura
+  const uint32_t setor = lba + offset / st;
+  if (setor + n > s_setores) {   // alem do fim do cartao
+    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00);
     return -1;
   }
-  s_lidos = s_lidos + (uint64_t)n * st;
+  if (!s_lendo) {   // primeiro pedaco de um comando novo
+    s_lendo = true;
+    ++s_n_cmd_leitura;
+    s_cmd_setor = lba;
+  }
+  ++s_n_leituras;
+  s_ultimo_setor = setor;
+  // Coerencia: o que o computador gravou e ainda esta no buffer vai antes.
+  if (!descarregar()) {
+    sense_sem_midia(lun);
+    return -1;
+  }
+  // LEITURA ANTECIPADA: fora do cache, le 64 KB a partir do setor pedido (ate o
+  // fim do cartao) numa leitura so; os proximos pedacos saem dali.
+  if (!(s_ler_n && setor >= s_ler_ini && setor + n <= s_ler_ini + s_ler_n)) {
+    uint32_t cnt = BUF_BYTES / st;
+    if (cnt > s_setores - setor) { cnt = s_setores - setor; }
+    const int64_t t0 = esp_timer_get_time();
+    s_evento_us = t0;
+    s_no_cartao = true;
+    const esp_err_t lido = tab5_sd_cru_ler(setor, s_buf_ler, cnt);
+    s_no_cartao = false;
+    const uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+    s_evento_us = esp_timer_get_time();
+    if (dt > s_leitura_max_us) { s_leitura_max_us = dt; }
+    if (lido != ESP_OK) {
+      s_ler_n = 0;
+      cartao_falhou(setor, lido);
+      tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x11, 0x00);   // erro de leitura
+      return -1;
+    }
+    s_ler_ini = setor;
+    s_ler_n = cnt;
+    s_lidos = s_lidos + (uint64_t)cnt * st;
+    ++s_n_cache_falta;
+  } else {
+    ++s_n_cache_ok;
+  }
+  memcpy(buf, s_buf_ler + (size_t)(setor - s_ler_ini) * st, (size_t)n * st);
   s_ultimo_io_us = esp_timer_get_time();
   return (int32_t)(n * st);
 }
@@ -321,43 +495,46 @@ extern "C" int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
 extern "C" int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buf, uint32_t tam)
 {
   const uint32_t st = setor_tam();
-  if (!s_cartao || s_ejetado || offset % st || tam < st) {
-    tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+  if (sem_midia() || offset % st || tam < st) {
+    sense_sem_midia(lun);
     return -1;
   }
   // So setores inteiros: o que sobrar (nunca, com o buffer em multiplo de
   // 512) o TinyUSB entrega de novo na proxima chamada.
   const uint32_t n = tam / st;
-  const int64_t t0 = esp_timer_get_time();
-  s_evento_us = t0;
-  s_ultimo_setor = lba + offset / st;
-  s_gravando = true;
-  s_no_cartao = true;
-  const esp_err_t gravado = sdmmc_write_sectors(s_cartao, buf, lba + offset / st, n);
-  s_no_cartao = false;
-  s_gravando = false;
-  s_evento_us = esp_timer_get_time();
-  const uint32_t dt = (uint32_t)(s_evento_us - t0);
-  if (dt > s_escrita_max_us) { s_escrita_max_us = dt; }
-  if (dt > 100000) { s_n_escritas_lentas = s_n_escritas_lentas + 1; }
-  if (gravado != ESP_OK) {
-    s_erro_setor = lba + offset / st;
-    s_erro_cod = gravado;
-    s_erros = s_erros + 1;
+  const uint32_t setor = lba + offset / st;
+  if (setor + n > s_setores) {   // alem do fim do cartao
+    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x21, 0x00);
+    return -1;
+  }
+  const uint32_t cap = BUF_BYTES / st;
+  // Nao contiguo com o que ja esta no buffer, ou nao cabe: descarrega primeiro.
+  if (s_esc_n && (setor != s_esc_ini + s_esc_n || s_esc_n + n > cap) && !descarregar()) {
     tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x03, 0x00);   // erro de escrita
     return -1;
   }
-  s_gravados = s_gravados + (uint64_t)n * st;
+  if (!s_esc_n) { s_esc_ini = setor; }
+  memcpy(s_buf_esc + (size_t)s_esc_n * st, buf, (size_t)n * st);
+  s_esc_n += n;
   const int64_t agora = esp_timer_get_time();
+  s_evento_us = agora;
   s_ultimo_io_us = agora;
   s_ultima_escrita_us = agora;
+  if (s_esc_n >= cap && !descarregar()) {   // encheu
+    tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x03, 0x00);
+    return -1;
+  }
   return (int32_t)(n * st);
 }
 
 extern "C" int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t cmd[16], void* buf, uint16_t tam)
 {
   switch (cmd[0]) {
-    case 0x35:   // SYNCHRONIZE CACHE (10): nao ha cache do lado de ca
+    case 0x35:   // SYNCHRONIZE CACHE (10): o computador quer o que gravou no cartao
+      if (!descarregar()) {
+        tud_msc_set_sense(lun, SCSI_SENSE_MEDIUM_ERROR, 0x03, 0x00);
+        return -1;
+      }
       return 0;
     case 0x5A: { // MODE SENSE (10). O macOS pergunta por ele (o TinyUSB so traz
                  // o de 6 bytes) para saber se o disco aceita escrita. Cabecalho
@@ -385,7 +562,7 @@ extern "C" int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t cmd[16], void* buf
 extern "C" void tud_mount_cb(void)
 {
   s_suspenso = false;
-  s_n_config = s_n_config + 1;
+  ++s_n_config;
   s_lendo = false;
   s_evento_us = esp_timer_get_time();
 }
@@ -395,7 +572,7 @@ extern "C" void tud_mount_cb(void)
 // de baixo dele. Sem montagem, a tela so deixa de pedir confirmacao para sair.
 extern "C" void tud_umount_cb(void)
 {
-  s_n_soltou = s_n_soltou + 1;
+  ++s_n_soltou;
   s_lendo = false;   // reset do barramento: o comando em curso morreu com ele
 }
 extern "C" void tud_suspend_cb(bool)  { s_suspenso = true; }
@@ -429,7 +606,9 @@ static void vTaskPendrive(void*)
   if (s_init_ok) {
     while (!s_parar) {
       tud_task_ext(20, false);   // acorda a cada 20 ms para ver o pedido de parar
+      descarregar_se_ocioso();   // escrita juntada que ficou parada vai ao cartao
     }
+    descarregar();               // por qualquer motivo que saiu: nada fica no buffer
     tusb_deinit(0);              // no mesmo nucleo em que a interrupcao nasceu
   }
   tab5_dono_esquecer(xTaskGetCurrentTaskHandle());
@@ -460,15 +639,19 @@ static void clock_maximo(bool sim)
   s_clock_max = sim;
 }
 
-static bool usb_ligar(sdmmc_card_t* cartao)
+static bool usb_ligar(void)
 {
   if (s_ligado) { return true; }
-  if (!cartao) { return false; }
   if (!s_parou) { s_parou = xSemaphoreCreateBinary(); }
   if (!s_iniciou) { s_iniciou = xSemaphoreCreateBinary(); }
   if (!s_parou || !s_iniciou) { return false; }
 
-  s_cartao = cartao;
+  // O cartao pelas portas do hal; os buffers de 64 KB (escrita e leitura) na PSRAM.
+  if (!tab5_sd_cru_info(&s_setores, &s_tam) || !s_tam) { return false; }
+  if (!buffers_alocar()) { ESP_LOGE(TAG, "sem memoria para os buffers do pendrive"); return false; }
+  s_tem_cartao = true;
+  s_cartao_falhou = false;
+  s_n_descargas = 0; s_kb_descargas = 0; s_n_cache_ok = 0; s_n_cache_falta = 0;
   s_ejetado = false; s_suspenso = false; s_parar = false;
   s_lidos = 0; s_gravados = 0; s_erros = 0;
   s_n_config = 0; s_n_inquiry = 0; s_n_capacidade = 0; s_n_leituras = 0; s_n_leituras_ok = 0;
@@ -501,7 +684,7 @@ static bool usb_ligar(sdmmc_card_t* cartao)
     ESP_LOGE(TAG, "PHY do OTG recusado");
     s_phy = nullptr;
     phy_para_o_console();
-    s_cartao = nullptr;
+    s_tem_cartao = false; buffers_soltar();
     return false;
   }
 
@@ -516,7 +699,7 @@ static bool usb_ligar(sdmmc_card_t* cartao)
     usb_wrap_ll_phy_enable_pad(&USB_WRAP, false);
     usb_del_phy(s_phy); s_phy = nullptr;
     phy_para_o_console();
-    s_cartao = nullptr;
+    s_tem_cartao = false; buffers_soltar();
     return false;
   }
   xSemaphoreTake(s_iniciou, portMAX_DELAY);
@@ -527,7 +710,7 @@ static bool usb_ligar(sdmmc_card_t* cartao)
     usb_wrap_ll_phy_enable_pad(&USB_WRAP, false);
     usb_del_phy(s_phy); s_phy = nullptr;
     phy_para_o_console();
-    s_cartao = nullptr;
+    s_tem_cartao = false; buffers_soltar();
     return false;
   }
   tab5_dono_registrar(s_tarefa, DONO_SERVICO, "Pendrive");
@@ -562,11 +745,13 @@ static void usb_desligar(void)
   usb_wrap_ll_phy_enable_pad(&USB_WRAP, false);   // ainda com o clock do USB_WRAP
   if (s_phy) { usb_del_phy(s_phy); s_phy = nullptr; }
   phy_para_o_console();
-  s_cartao = nullptr;
+  s_tem_cartao = false;
+  buffers_soltar();
   s_ligado = false;
   clock_maximo(false);
   vTaskDelay(pdMS_TO_TICKS(50));
-  ESP_LOGI(TAG, "desligado: console de volta (%llu KB lidos, %llu KB gravados, %u erros)",
+  log_cartao();
+  ESP_LOGI(TAG, "desligado: console de volta (%llu KB lidos do cartao, %llu KB gravados, %u erros)",
            (unsigned long long)(s_lidos / 1024), (unsigned long long)(s_gravados / 1024),
            (unsigned)s_erros);
 }
@@ -611,6 +796,16 @@ bool tab5_pendrive_pc_presente(void)
   return usb_serial_jtag_is_connected();
 }
 
+void tab5_pendrive_console_reanunciar(void)
+{
+  if (s_ligado || usb_serial_jtag_is_connected()) { return; }
+  const usb_serial_jtag_pull_override_vals_t solto = { .dp_pu = false, .dm_pu = false, .dp_pd = false, .dm_pd = false };
+  usb_serial_jtag_ll_phy_enable_pull_override(&solto);   // D+ sem pull-up: "cabo fora"
+  vTaskDelay(pdMS_TO_TICKS(150));
+  usb_serial_jtag_ll_phy_disable_pull_override();        // o controlador religa: "cabo de volta"
+  ESP_LOGI(TAG, "console reanunciado ao computador (o cabo chegou com o chip dormindo)");
+}
+
 // ===========================================================================
 // A SESSAO - emprestar, USB, devolver (ver o .hpp)
 // ===========================================================================
@@ -633,9 +828,35 @@ static void avisar(int quantidade, notif_nivel_t nivel, const char* txt)
   if (s_notif >= 0) { notif_publicar(s_notif, quantidade, nivel, txt); }
 }
 
-// Termina a sessao com o motivo dado (o pendrive nao chegou a ligar).
+// O motivo em palavras, para o log e o console (a tela tem os textos dela em
+// Ajustes > USB). Declarada no .hpp.
+const char* tab5_pendrive_motivo_texto(tab5_pendrive_motivo_t m)
+{
+  switch (m) {
+    case PENDRIVE_RECUSA_APP:        return "um app aberto esta usando o cartao";
+    case PENDRIVE_RECUSA_EM_USO:     return "cartao em uso por um servico alem do prazo";
+    case PENDRIVE_RECUSA_SEM_CARTAO: return "sem cartao, ou ele nao respondeu";
+    case PENDRIVE_RECUSA_SEM_DIARIO: return "falta a particao reserva (diario)";
+    case PENDRIVE_RECUSA_USB:        return "o USB nao subiu";
+    case PENDRIVE_OK:                return "nenhum (ligou, ou nunca tentou)";
+    default:                         return "?";
+  }
+}
+
+// Um app aberto exige o cartao, ou o tem montado para ele: o sistema nao tira
+// o cartao de baixo de quem o segura (app.h, usa_sd/exige_sd).
+static bool app_com_cartao(void) { return sistema_app_exige_sd() || sistema_app_segura_sd(); }
+
+// Termina a sessao com o motivo dado (o pendrive nao chegou a ligar). Fica no
+// log: sem isto, uma recusa so aparecia perguntando ao console.
 static void recusou(tab5_pendrive_motivo_t m)
 {
+  const char* app = sistema_app_atual();
+  if (m == PENDRIVE_RECUSA_APP && app) {
+    ESP_LOGW(TAG, "pendrive recusado: %s ('%s')", tab5_pendrive_motivo_texto(m), app);
+  } else {
+    ESP_LOGW(TAG, "pendrive recusado: %s", tab5_pendrive_motivo_texto(m));
+  }
   s_motivo = m;
   s_fase = PENDRIVE_PARADO;
   avisar(0, NOTIF_INFO, nullptr);
@@ -656,6 +877,19 @@ typedef struct {
   bool     parada_contada;
 } passos_t;
 
+// Escritas juntadas, cache de leitura e recuperacoes do cartao (tab5_sd_cru_estat).
+static void log_cartao(void)
+{
+  tab5_sd_cru_estat_t c;
+  tab5_sd_cru_estat(&c);
+  const uint32_t nd = s_n_descargas;
+  ESP_LOGI(TAG, "cartao: %lu descargas (media %lu KB), leituras: %lu do cache / %lu do cartao, "
+           "recuperacoes %lu, falhas %lu, mais lenta %lu ms",
+           (unsigned long)nd, (unsigned long)(nd ? s_kb_descargas / nd : 0),
+           (unsigned long)s_n_cache_ok, (unsigned long)s_n_cache_falta,
+           (unsigned long)c.recuperacoes, (unsigned long)c.falhas, (unsigned long)c.max_ms);
+}
+
 static void registrar_eventos(passos_t* d, const tab5_pendrive_usb_t* u)
 {
   if (u->n_config > d->config) {
@@ -666,7 +900,7 @@ static void registrar_eventos(passos_t* d, const tab5_pendrive_usb_t* u)
   d->inquiry = u->n_inquiry;
   if (u->n_capacidade && !d->capacidade) {
     ESP_LOGI(TAG, "computador pediu o tamanho: %lu setores de %u",
-             s_cartao ? (unsigned long)s_cartao->csd.capacity : 0UL, (unsigned)setor_tam());
+             s_tem_cartao ? (unsigned long)s_setores : 0UL, (unsigned)setor_tam());
   }
   d->capacidade = u->n_capacidade;
   if (u->n_leituras && !d->leituras) { ESP_LOGI(TAG, "computador comecou a ler o disco"); }
@@ -715,6 +949,7 @@ static void registrar_eventos(passos_t* d, const tab5_pendrive_usb_t* u)
              (unsigned long)u->n_cmd_leitura, (unsigned long)u->n_leituras_ok, (unsigned long)(u->lidos / 1024),
              (unsigned long)(u->gravados / 1024), (unsigned long)u->erros, (unsigned long)u->leitura_max_ms,
              (unsigned long)(s_escrita_max_us / 1000), (unsigned long)s_n_escritas_lentas);
+    log_cartao();
   }
 
   // PAROU: nada do computador nem do cartao ha mais de 3 s, depois de o
@@ -768,14 +1003,18 @@ static void registrar_eventos(passos_t* d, const tab5_pendrive_usb_t* u)
 
 static void vTaskSessao(void*)
 {
-  // 1. O cartao. Quem EXIGE o cartao (Arquivos, Camera) nao pode estar aberto:
-  //    o sistema nao tira o cartao de baixo dele (app_t.exige_sd).
-  if (sistema_app_exige_sd()) { recusou(PENDRIVE_RECUSA_APP); vTaskDelete(nullptr); return; }
+  // 1. O cartao. Um app que o exige, ou que o tem montado para ele, nao pode
+  //    estar aberto: o sistema nao tira o cartao de baixo dele. Recusa na
+  //    hora, sem a espera do emprestimo.
+  if (app_com_cartao()) { recusou(PENDRIVE_RECUSA_APP); return; }
   switch (tab5_sd_emprestar(3000)) {
     case SD_EMPRESTADO:             break;
-    case SD_EMPRESTIMO_EM_USO:      recusou(PENDRIVE_RECUSA_EM_USO);     vTaskDelete(nullptr); return;
-    case SD_EMPRESTIMO_SEM_DIARIO:  recusou(PENDRIVE_RECUSA_SEM_DIARIO); vTaskDelete(nullptr); return;
-    default:                        recusou(PENDRIVE_RECUSA_SEM_CARTAO); vTaskDelete(nullptr); return;
+    // Um app pode ter aberto durante a espera: o motivo certo e o dele.
+    case SD_EMPRESTIMO_EM_USO:
+      recusou(app_com_cartao() ? PENDRIVE_RECUSA_APP : PENDRIVE_RECUSA_EM_USO);
+      return;
+    case SD_EMPRESTIMO_SEM_DIARIO:  recusou(PENDRIVE_RECUSA_SEM_DIARIO); return;
+    default:                        recusou(PENDRIVE_RECUSA_SEM_CARTAO); return;
   }
   // 2. O USB. Antes, o alto-falante sai dos pinos que o ESP-IDF confunde com
   //    os do OTG (ver pad_conferir) - desligado agora, ANTES do USB subir, e
@@ -783,11 +1022,10 @@ static void vTaskSessao(void*)
   if (!sistema_som_ceder_pinos(3000)) {
     ESP_LOGW(TAG, "a interface nao calou o alto-falante em 3 s - seguindo (a sentinela do pad cobre)");
   }
-  if (!usb_ligar(tab5_sd_cru())) {
+  if (!usb_ligar()) {
     sistema_som_devolver_pinos();
     tab5_sd_devolver();
     recusou(PENDRIVE_RECUSA_USB);
-    vTaskDelete(nullptr);
     return;
   }
   s_fase = PENDRIVE_ATIVO;
@@ -804,6 +1042,7 @@ static void vTaskSessao(void*)
   passos_t d = { };
   int64_t suspenso_desde_us = 0;
   bool    economia = false;
+  bool    cartao_falhou_sessao = false;
   const int64_t inicio_us = esp_timer_get_time();
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(200));
@@ -852,7 +1091,20 @@ static void vTaskSessao(void*)
     clock_maximo(!economia);
     // Disco montado: tela acesa - o repouso baixaria o clock no meio da copia,
     // e a pessoa precisa ver o aviso de que o cartao esta fora.
-    sistema_manter_acordado(SISTEMA_ACORDADO_PENDRIVE, u.montado && !u.ejetado && !parado);
+    sistema_recurso(RECURSO_TELA_ACESA, "pendrive", u.montado && !u.ejetado && !parado);
+    // O CARTAO FALHOU DE VEZ (mesmo depois das recuperacoes do hal): o
+    // computador ja recebe "sem midia" e a sessao acaba aqui, em vez de ficar
+    // presa para sempre. Vale tambem para uma descarga adiada que falhou: o
+    // comando ja tinha sido confirmado ao computador.
+    if (s_cartao_falhou) {
+      ESP_LOGE(TAG, "cartao falhou no pendrive (setor %lu: %s) - encerrando a sessao",
+               (unsigned long)s_erro_setor, esp_err_to_name(s_erro_cod));
+      log_cartao();
+      cartao_falhou_sessao = true;
+      s_devolvido_por_ejecao = false;
+      s_saiu_sem_ejetar = u.montado;
+      break;
+    }
     if (u.ejetado || s_pedido_devolver) {
       s_devolvido_por_ejecao = u.ejetado;
       s_saiu_sem_ejetar = !u.ejetado && u.montado;
@@ -867,13 +1119,16 @@ static void vTaskSessao(void*)
   avisar(1, NOTIF_INFO, "Devolvendo o cartão...");
   usb_desligar();
   sistema_som_devolver_pinos();
-  sistema_manter_acordado(SISTEMA_ACORDADO_PENDRIVE, false);
+  sistema_recurso(RECURSO_TELA_ACESA, "pendrive", false);
   tab5_sd_devolver();
   tab5_sd_gravar_pendentes();   // aplica o diario agora (e espera)
 
   tab5_sd_resumo_t r;
   tab5_sd_resumo(&r);
-  if (r.conflitos) {
+  if (cartao_falhou_sessao) {
+    avisar(1, NOTIF_ATENCAO, "Cartão falhou no pendrive");   // fica ate a pessoa ver em Ajustes > USB
+    s_resultado_aviso = true;
+  } else if (r.conflitos) {
     char t[NOTIF_RESUMO];
     snprintf(t, sizeof(t), "%u arquivo(s) em .tab5", (unsigned)r.conflitos);
     avisar((int)r.conflitos, NOTIF_ATENCAO, t);   // fica ate a pessoa ver em Ajustes > USB
@@ -890,8 +1145,12 @@ static void vTaskSessao(void*)
   ESP_LOGI(TAG, "pendrive encerrado (%s): %u gravacao(oes) do diario aplicadas, %u conflito(s)",
            s_devolvido_por_ejecao ? "ejetado no computador" : "devolvido no Tab5",
            (unsigned)r.aplicadas, (unsigned)r.conflitos);
+  // O computador pode ter posto ou tirado apps do cartao: a tela inicial acompanha.
+  sistema_apps_de_fora_reler();
+  // O computador ja deve ter visto o console de novo (vai para o log do cartao).
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  registro_usb("3 s depois");
   tab5_log_descarregar_logo();
-  vTaskDelete(nullptr);
 }
 
 bool tab5_pendrive_iniciar(void)
@@ -907,11 +1166,12 @@ bool tab5_pendrive_iniciar(void)
   s_devolvido_por_ejecao = false;
   s_oferta = false;
   s_resultado_aviso = false;
-  if (sistema_app_exige_sd()) { recusou(PENDRIVE_RECUSA_APP); return false; }
+  if (app_com_cartao()) { recusou(PENDRIVE_RECUSA_APP); return false; }
   avisar(1, NOTIF_INFO, "Preparando o pendrive...");
   // Pilha da tarefa "cartao": emprestar fotografa o cartao (varre as pastas)
-  // e o f_mount desce fundo. So existe enquanto durar a sessao.
-  if (xTaskCreatePinnedToCore(vTaskSessao, "pendrive_sessao", 6144, nullptr, 3, nullptr, tskNO_AFFINITY) != pdPASS) {
+  // e o f_mount desce fundo. Vaga G do pool (6 KB fixos): uma sessao por vez,
+  // sem criar e destruir 6 KB de SRAM a cada ida ao computador.
+  if (!pool_criar(nullptr, vTaskSessao, nullptr, "pendrive_sessao", 6144, 3)) {
     recusou(PENDRIVE_RECUSA_USB);
     return false;
   }
@@ -964,6 +1224,7 @@ void tab5_pendrive_resultado_visto(void)
 // Com o pendrive ligado o JTAG nao ve nada: a vigia nao olha.
 #define VIGIA_US          250000
 #define VIGIA_LENTA_US    1000000   // ajuste desligado (ver o fim de vigiar)
+#define VIGIA_SEM_CABO_US 5000000   // sem cabo no USB-C (ver o fim de vigiar)
 #define CARENCIA_BOOT_US  5000000
 #define CARENCIA_FIM_US   4000000
 static esp_timer_handle_t s_vigia = nullptr;
@@ -1011,7 +1272,13 @@ static void vigiar(void*)
   // borda nao liga nada - a vigia so acompanha o cabo para nao confundir um
   // computador que JA estava ligado com um que acabou de chegar quando o
   // ajuste for ligado. Para isso 1 s basta; 250 ms so quando a borda vale.
-  const uint64_t periodo = (ajustes_pendrive() || s_oferta) ? VIGIA_US : VIGIA_LENTA_US;
+  // SEM CABO (o servico da bateria ve pela corrente e declara RECURSO_ENERGIA_EXTERNA)
+  // nao ha computador para ver: 5 s, so para notar o cabo chegando - o
+  // pendrive que liga sozinho pode levar uns segundos a mais. Antes eram 1 a
+  // 4 acordadas por segundo, na bateria e com a tela apagada.
+  const bool cabo = sistema_recurso_em_uso(RECURSO_ENERGIA_EXTERNA);
+  const uint64_t periodo = !cabo && !s_oferta ? VIGIA_SEM_CABO_US
+                         : (ajustes_pendrive() || s_oferta) ? VIGIA_US : VIGIA_LENTA_US;
   if (periodo != s_vigia_periodo) {
     s_vigia_periodo = periodo;
     esp_timer_restart(s_vigia, periodo);

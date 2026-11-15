@@ -47,6 +47,7 @@ typedef struct {
   float       pct_pico;       // maior ja visto desde o boot (ou do zerar)
   uint32_t    pct_pico_em;    // segundos de uptime do pico
   uint32_t    pilha_livre;    // bytes - o minimo que ja sobrou (high water mark)
+  bool        pilha_psram;    // a pilha mora na PSRAM (false = SRAM interna)
   uint8_t     tipo;           // dono_tipo_t (hal/tab5_donos.hpp): sistema, servico, app, fundo
   char        dono[MON_NOME]; // quem ("WiFi", "Camera", "Trilha"); vazio = sistema
 } mon_tarefa_t;
@@ -94,6 +95,12 @@ uint32_t tab5_monitor_total_eventos(void);   // contador que so sobe
 
 // Recomeca a contagem dos picos (os minimos de memoria tambem).
 void tab5_monitor_zerar_picos(void);
+
+// A PARTICAO DO PROGRAMA que esta rodando: 'total' = o tamanho dela, 'usado' =
+// quanto o programa ocupa nela (le o cabecalho da imagem na flash; pode ser
+// nullptr se so o total interessa). Qualquer um dos dois pode ser nullptr.
+// false = nao achou a particao (ou a imagem nao abriu, se pediu 'usado').
+bool tab5_monitor_programa(uint32_t* usado, uint32_t* total);
 
 // EXTRATO DA RAM INTERNA - quem comeu quanto.
 //

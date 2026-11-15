@@ -1,0 +1,217 @@
+// BOAS-VINDAS - a configuracao inicial, so no primeiro uso.
+//
+// O boot abre este app quando ajustes_config_inicial() e false: aparelho que
+// nunca rodou o sistema, ou gravado pelo M5Burner (que apaga os ajustes).
+// Quem ja usava o sistema nunca o ve - gravar uma versao nova pelo VS Code nao
+// traz o assistente de volta (ver ajustes.h).
+//
+// Quatro passos rapidos, cada um ajustavel depois em Ajustes:
+//   1. idioma           (Ajustes > Idioma; vale na hora, ja para os passos seguintes)
+//   2. fuso horario     (Ajustes > Data e hora)
+//   3. malha pela internet: o servidor MQTT da regiao (Ajustes > Malha pela internet)
+//   4. Wi-Fi            (manda para Ajustes > Wi-Fi, ou conclui)
+//
+// NAO ESTA NA TELA INICIAL: nao mora numa pasta app_* (a lista de apps e
+// gerada delas). Fechar por qualquer caminho - CONCLUIR, ou o INICIO da barra -
+// conta como feito: quem pulou nao quer ver de novo.
+
+#include <cstdlib>
+#include "app.h"
+#include "ajustes.h"
+#include "idioma.h"
+#include "tab5_ui.hpp"
+#include "tab5_tela.hpp"
+#include "tab5_hora.hpp"
+#include "tab5_mesh_mqtt.hpp"
+
+extern const app_t APP_CONFIG;
+
+static int s_passo = 0;
+static const int N_PASSOS = 4;
+
+static const int M = 32;          // margem
+static const int BTN_A = 80;
+
+static void titulo(lgfx::LovyanGFX& d, const area_t& a, const char* t, const char* sub)
+{
+  tab5_titulo(d, 44);
+  d.setTextDatum(top_left);
+  d.setTextColor(TFT_WHITE);
+  d.drawString(tr(t), a.x + M, a.y + 48);
+  tab5_fonte_corpo(d);
+  tab5_texto(d, 2.6f);
+  d.setTextColor(TFT_LIGHTGREY);
+  d.drawString(tr(sub), a.x + M, a.y + 112);
+}
+
+static void passo_e_botoes(lgfx::LovyanGFX& d, const area_t& a)
+{
+  // Os pontinhos do progresso e os botoes VOLTAR / PROXIMO (ou CONCLUIR).
+  for (int i = 0; i < N_PASSOS; ++i) {
+    d.fillCircle(a.x + a.largura / 2 + (i - 1) * 32 - 16, a.y + a.altura - BTN_A - 64, 8,
+                 i == s_passo ? TFT_CYAN : TFT_DARKGREY);
+  }
+  const int y = a.y + a.altura - BTN_A - 24;
+  const int l = (a.largura - 3 * M) / 2;
+  if (s_passo > 0) { tab5_botao(d, a.x + M, y, l, BTN_A, tr("VOLTAR"), d.color565(50, 55, 65), TFT_LIGHTGREY); }
+  tab5_botao(d, a.x + 2 * M + l, y, l, BTN_A, s_passo == N_PASSOS - 1 ? tr("CONCLUIR") : tr("PRÓXIMO"), TFT_GREENYELLOW);
+}
+
+// ---- passo 2: fuso ------------------------------------------------------------
+static const int FUSO_Y = 260;
+static const int PM_L = 150;
+
+static void desenhar_fuso(lgfx::LovyanGFX& d, const area_t& a)
+{
+  titulo(d, a, tr("Fuso horário"), tr("A hora que a barra e os apps mostram."));
+  const int16_t m = ajustes_fuso_min();
+  char f[24];
+  snprintf(f, sizeof(f), "UTC%c%d:%02d", m < 0 ? '-' : '+', abs(m) / 60, abs(m) % 60);
+  const int y = a.y + FUSO_Y;
+  tab5_botao(d, a.x + M, y, PM_L, BTN_A, tr("-30 min"), TFT_ORANGE);
+  tab5_botao(d, a.x + a.largura - M - PM_L, y, PM_L, BTN_A, tr("+30 min"), TFT_GREENYELLOW);
+  d.setFont(tab5_fonte_suave(true, 44));
+  d.setTextSize(1);
+  d.setTextDatum(middle_center);
+  d.setTextColor(TFT_WHITE);
+  d.drawString(f, a.x + a.largura / 2, y + BTN_A / 2);
+  const uint32_t e = tab5_hora_epoch();
+  tab5_fonte_corpo(d);
+  tab5_texto(d, 2.6f);
+  d.setTextColor(TFT_LIGHTGREY);
+  if (e) {
+    struct tm t;
+    tab5_hora_local(e, &t);
+    char h[48];
+    snprintf(h, sizeof(h), tr("Agora: %02d:%02d"), t.tm_hour, t.tm_min);
+    d.drawString(h, a.x + a.largura / 2, y + BTN_A + 60);
+  } else {
+    d.drawString(tr("A hora certa chega pelo Wi-Fi, GPS ou malha."), a.x + a.largura / 2, y + BTN_A + 60);
+  }
+  d.setTextDatum(top_left);
+  d.drawString(tr("Brasília: UTC-3   Lisboa: UTC+0   Madri: UTC+1"), a.x + M, y + BTN_A + 130);
+  d.drawString(tr("Nova York: UTC-5   Tóquio: UTC+9"), a.x + M, y + BTN_A + 170);
+  d.drawString(tr("(sem horário de verão: ajuste na troca)"), a.x + M, y + BTN_A + 230);
+}
+
+// ---- passo 3: malha pela internet ------------------------------------------------
+static const int LISTA_Y = 200, PASSO = BTN_A + 14;
+static const int IDIOMA_Y = 220;
+// Os da lista que cabem acima dos botoes do rodape (a de fabrica tem 3; os
+// outros se adicionam depois, em Ajustes > Meshtastic).
+static const int MALHA_MAX = 6;
+static int malha_itens(void)
+{
+  const int n = mesh_mqtt_n_servidores();
+  return n < MALHA_MAX ? n : MALHA_MAX;
+}
+
+static void desenhar_malha(lgfx::LovyanGFX& d, const area_t& a)
+{
+  titulo(d, a, tr("Meshtastic pela internet"), tr("Sem um rádio, o Tab5 fala com a malha da sua região."));
+  const int n = malha_itens();
+  const uint8_t esc = ajustes_mqtt_servidor();
+  const bool ligada = ajustes_mesh_internet();
+  int y = a.y + LISTA_Y;
+  for (int i = 0; i <= n; ++i, y += PASSO) {
+    const bool desligar = (i == n);
+    const bool sel = desligar ? !ligada : (ligada && esc == i);
+    mesh_mqtt_servidor_t s;
+    if (!desligar && !mesh_mqtt_servidor(i, &s)) { continue; }
+    const char* nome = desligar ? tr("Não usar a internet") : s.nome;
+    tab5_botao(d, a.x + M, y, a.largura - 2 * M, BTN_A, nome,
+               sel ? TFT_GREENYELLOW : d.color565(50, 55, 65), sel ? TFT_BLACK : TFT_LIGHTGREY);
+  }
+}
+
+// ---- desenho e toque -------------------------------------------------------------
+static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
+{
+  // Cada mudanca pede passada completa: o quadro inteiro, sem piscar.
+  if (!sistema_area_foi_limpa()) { return; }
+  const lgfx::TextStyle estilo = d.getTextStyle();
+  switch (s_passo) {
+    case 0:
+      titulo(d, a, tr("Bem-vindo ao M5tabOS"), tr("Três ajustes rápidos e o Tab5 está pronto."));
+      // Cada idioma com o nome NELE MESMO: e como a pessoa acha o seu.
+      for (int i = 0; i < idioma_n(); ++i) {
+        const bool sel = (idioma_atual() == i);
+        tab5_botao(d, a.x + M, a.y + IDIOMA_Y + i * PASSO, a.largura - 2 * M, BTN_A, idioma_nome(i),
+                   sel ? TFT_GREENYELLOW : d.color565(50, 55, 65), sel ? TFT_BLACK : TFT_LIGHTGREY);
+      }
+      break;
+    case 1: desenhar_fuso(d, a); break;
+    case 2: desenhar_malha(d, a); break;
+    default:
+      titulo(d, a, tr("Wi-Fi"), tr("Para a internet, a hora certa e a malha pela internet."));
+      tab5_botao(d, a.x + M, a.y + 220, a.largura - 2 * M, BTN_A, tr("CONECTAR O WI-FI AGORA"), TFT_SKYBLUE);
+      tab5_fonte_corpo(d);
+      tab5_texto(d, 2.6f);
+      d.setTextDatum(top_left);
+      d.setTextColor(TFT_LIGHTGREY);
+      d.drawString(tr("Abre Ajustes. Também dá depois:"), a.x + M, a.y + 330);
+      d.drawString(tr("Ajustes > Wi-Fi > PROCURAR REDES."), a.x + M, a.y + 370);
+      break;
+  }
+  passo_e_botoes(d, a);
+  d.setTextStyle(estilo);
+}
+
+static void concluir(const app_t* abrir_depois)
+{
+  ajustes_definir_config_inicial(true);
+  sistema_simular_abrir(abrir_depois);   // nullptr = volta para o inicio
+}
+
+static void ao_tocar(int x, int y)
+{
+  const area_t a = sistema_area();
+  const int yb = a.altura - BTN_A - 24;
+  const int l = (a.largura - 3 * M) / 2;
+  if (tab5_dentro(x, y, 2 * M + l, yb, l, BTN_A)) {
+    if (s_passo == N_PASSOS - 1) { concluir(nullptr); return; }
+    ++s_passo;
+  } else if (s_passo > 0 && tab5_dentro(x, y, M, yb, l, BTN_A)) {
+    --s_passo;
+  } else if (s_passo == 0) {
+    for (int i = 0; i < idioma_n(); ++i) {
+      if (tab5_dentro(x, y, M, IDIOMA_Y + i * PASSO, a.largura - 2 * M, BTN_A)) { idioma_definir(i); }
+    }
+  } else if (s_passo == 1) {
+    const int yf = FUSO_Y;
+    int s = 0;
+    if (tab5_dentro(x, y, M, yf, PM_L, BTN_A)) { s = -1; }
+    if (tab5_dentro(x, y, a.largura - M - PM_L, yf, PM_L, BTN_A)) { s = +1; }
+    if (s) { ajustes_definir_fuso_min((int16_t)(ajustes_fuso_min() + s * 30)); }
+  } else if (s_passo == 2) {
+    const int n = malha_itens();
+    for (int i = 0; i <= n; ++i) {
+      if (!tab5_dentro(x, y, M, LISTA_Y + i * PASSO, a.largura - 2 * M, BTN_A)) { continue; }
+      if (i == n) { ajustes_definir_mesh_internet(false); }
+      else        { ajustes_definir_mesh_internet(true); ajustes_definir_mqtt_servidor((uint8_t)i); }
+    }
+  } else if (s_passo == 3 && tab5_dentro(x, y, M, 220, a.largura - 2 * M, BTN_A)) {
+    concluir(&APP_CONFIG);
+    return;
+  } else {
+    return;
+  }
+  sistema_pedir_redesenho_completo();
+}
+
+static bool ao_abrir(void) { s_passo = 0; return true; }
+
+// Fechar por qualquer caminho conta como feito (ver o topo). O servico do Mesh
+// pega o servidor escolhido quando subir pela internet.
+static void ao_fechar(void) { if (!ajustes_config_inicial()) { ajustes_definir_config_inicial(true); } }
+
+extern const app_t APP_BOAS_VINDAS = {
+  .nome  = N_("Boas-vindas"),
+  .cor   = TFT_CYAN,
+  .perfil = { },
+  .orientacao = ORI_EM_PE,
+  .ao_abrir  = ao_abrir,
+  .ao_fechar = ao_fechar,
+  .desenhar  = desenhar,
+  .ao_tocar  = ao_tocar,
+};

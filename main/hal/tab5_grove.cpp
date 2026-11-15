@@ -1,4 +1,5 @@
 #include "tab5_grove.hpp"
+#include "idioma.h"
 #include "tab5_marcos.hpp"
 
 #include <string.h>
@@ -42,9 +43,9 @@ static grove_dono_t s_dono = GROVE_DONO_NINGUEM;
 const char* grove_dono_nome(grove_dono_t d)
 {
   switch (d) {
-    case GROVE_DONO_MESH: return "servico Meshtastic";
+    case GROVE_DONO_MESH: return N_("servico Meshtastic");
     case GROVE_DONO_GPS:  return "GPS";
-    default:              return "ninguem";
+    default:              return N_("ninguem");
   }
 }
 
@@ -74,10 +75,10 @@ void tab5_grove_soltar(grove_dono_t quem)
 const char* grove_nome(grove_tipo_t t)
 {
   switch (t) {
-    case GROVE_GPS:          return "GPS (NMEA)";
-    case GROVE_MESHTASTIC:   return "Meshtastic (C6L)";
-    case GROVE_DESCONHECIDO: return "desconhecido";
-    default:                 return "nada";
+    case GROVE_GPS:          return N_("GPS (NMEA)");
+    case GROVE_MESHTASTIC:   return N_("Meshtastic (C6L)");
+    case GROVE_DESCONHECIDO: return N_("desconhecido");
+    default:                 return N_("nada");
   }
 }
 
@@ -302,7 +303,7 @@ grove_tipo_t tab5_grove_detectar(void)
   // costumavam coincidir, mas nao sao a mesma pergunta (o trilho pode estar
   // ligado agora por outro motivo mesmo com a preferencia desligada). Corrigido
   // junto com a auditoria de camadas - HAL pergunta a HAL, nunca
-  // a um servico (ver ESCREVENDO_APPS.md secao 8).
+  // a um servico (ver docs/ESCREVENDO_APPS.md secao 8).
   if (tab5_power_grove_ligado()) {
     ESP_LOGI(TAG, "trilho ja estava ligado - sondando sem esperar boot");
   } else {

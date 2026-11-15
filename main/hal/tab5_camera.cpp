@@ -3,11 +3,13 @@
 #include "tarefa_app.h"
 #include "tab5_power.hpp"
 #include "tab5_mutex.hpp"
+#include "recursos.h"   // a camera declara o que usa: o sistema decide a suspensao
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include <string.h>
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
@@ -35,6 +37,9 @@ static const char* TAG = "tab5_camera";
 extern "C" esp_cam_sensor_device_t* esp_video_get_csi_video_device_sensor(void);
 
 #define TAB5_CAM_NBUF 2
+// QUADROS SOB PEDIDO ao mesmo tempo (ver tab5_camera_pedir_quadro): a foto de
+// um app e o video do navegador nao disputam a vez.
+#define TAB5_CAM_PEDIDOS 2
 
 // O SENSOR ESTA MONTADO DE LADO na placa - o mesmo BSP_CAMERA_ROTATION=270 do
 // BSP oficial. Sem isto a imagem sairia deitada 90 graus.
@@ -49,13 +54,13 @@ typedef struct {
   ppa_client_handle_t ppa;
   SemaphoreHandle_t   ppa_fim;   // dado pela ISR do PPA ao fim de cada operacao (ver ppa_rodar)
 
-  int       alvo_largura, alvo_altura;   // tamanho do preview
-  // Preview com escala uniforme (ver o laco de captura): o pedaco central do
-  // quadro bruto que vai para a tela e a escala, em passos de 1/16 (a
-  // precisao do PPA). Calculados uma vez, quando o formato do sensor e lido.
+  // O PREVIEW: onde ele e escrito (buf nulo = nenhum) e, para o tamanho dele,
+  // a escala uniforme e o pedaco central do quadro bruto (ver encaixar).
+  // Calculados quando o destino e definido - o tamanho e do destino, nao da
+  // camera: quem liga a camera nao trava a resolucao de mais ninguem.
+  tab5_cam_destino_t destino;
   int       recorte_w, recorte_h;
   float     escala;
-  tab5_cam_destino_t destino;          // onde o preview e escrito (buf nulo = nenhum)
   bool      tem_novo;
   SemaphoreHandle_t trava;
 
@@ -63,13 +68,18 @@ typedef struct {
   bool ligado;
   bool video_iniciado;   // esp_video_init() teve sucesso - precisa de esp_video_deinit() no parar()
 
-  // PEDIDO DE FOTO - ver tab5_camera_pedir_foto(). Protegido por 'trava'.
-  uint16_t* foto_destino;      // != nullptr = pedido pendente
-  bool      foto_pronta;
-  bool      foto_ok;
+  // QUADROS PEDIDOS - ver tab5_camera_pedir_quadro(). Protegido por 'trava'.
+  // destino nulo = vaga livre; pronto = a tarefa ja escreveu (quem pediu
+  // recolhe com tab5_camera_quadro_pronto, que libera a vaga).
+  struct { uint16_t* destino; int l, a; bool em_pe, pronto, ok; } pedidos[TAB5_CAM_PEDIDOS];
 } tab5_camera_t;
 
 static tab5_camera_t s_cam = { .fd = -1 };
+
+// A tarefa de captura foi abandonada no desligamento (nao confirmou a saida):
+// os recursos dela ficam vazados de proposito e a camera nao abre mais ate
+// reiniciar. FORA de s_cam, que iniciar_hardware() zera a cada abertura.
+static bool s_abandonada = false;
 
 static inline void travar(void)    { if (s_cam.trava) { xSemaphoreTake(s_cam.trava, portMAX_DELAY); } }
 static inline void destravar(void) { if (s_cam.trava) { xSemaphoreGive(s_cam.trava); } }
@@ -93,11 +103,11 @@ static inline void destravar(void) { if (s_cam.trava) { xSemaphoreGive(s_cam.tra
 // contrato - nao proteger custaria quase nada hoje, mas remover e assumir
 // que ninguem nunca vai violar o contrato, e essa aposta ja perdeu uma vez
 // neste mesmo arquivo.
-static SemaphoreHandle_t s_ctrl = nullptr;
+static Trava s_ctrl;
 static int               s_refs = 0;
 
-static inline void travar_ctrl(void)    { tab5_mutex_travar(&s_ctrl); }
-static inline void destravar_ctrl(void) { tab5_mutex_destravar(&s_ctrl); }
+static inline void travar_ctrl(void)    { s_ctrl.travar(); }
+static inline void destravar_ctrl(void) { s_ctrl.destravar(); }
 
 bool tab5_camera_ativa(void) { return s_refs > 0; }
 
@@ -179,6 +189,25 @@ bool tab5_camera_reg(uint16_t reg, int valor, uint8_t* lido)
   return true;
 }
 
+// ESCALA UNIFORME, PREENCHENDO: a mesma escala nos dois eixos (a imagem nao
+// estica) e a menor, em passos de 1/16 (a precisao do PPA), que ainda cobre
+// l x a inteiro; o que sobra do quadro sai por igual dos dois lados. Girado
+// 270 (em pe), a largura de saida vem da ALTURA do quadro bruto e a altura,
+// da LARGURA; sem girar (do sensor), cada eixo do seu. Para o quadro inteiro
+// (1200x1600 em pe) a escala e 1 e nada sai.
+static void encaixar(int l, int a, bool em_pe, float* escala, int* rw, int* rh)
+{
+  const int W = (int)s_cam.bruto_largura, H = (int)s_cam.bruto_altura;
+  const int lw = em_pe ? a : l, lh = em_pe ? l : a;   // o que sai de cada eixo do bruto
+  int s16 = (lw * 16 + W - 1) / W;
+  const int s16h = (lh * 16 + H - 1) / H;
+  if (s16h > s16) { s16 = s16h; }
+  if (s16 < 1) { s16 = 1; }
+  *escala = (float)s16 / 16.0f;
+  *rw = (lw * 16) / s16; if (*rw > W) { *rw = W; }
+  *rh = (lh * 16) / s16; if (*rh > H) { *rh = H; }
+}
+
 // A TAREFA DE CAPTURA. DQBUF bloqueia ate o sensor entregar o proximo frame
 // (livre-rodante, ~30fps) - por isso mora em tarefa_app_t, e nao na tarefa de
 // interface: se o sensor travar, quem fica preso e SO esta tarefa (ver o
@@ -219,7 +248,13 @@ static void laco_captura(tarefa_app_t* t)
 
     travar();
     const tab5_cam_destino_t dst = s_cam.destino;
-    uint16_t* foto = s_cam.foto_destino;
+    const int rec_w = s_cam.recorte_w, rec_h = s_cam.recorte_h;
+    const float escala = s_cam.escala;
+    struct { uint16_t* destino; int l, a; bool em_pe; } ped[TAB5_CAM_PEDIDOS];
+    for (int i = 0; i < TAB5_CAM_PEDIDOS; ++i) {
+      const auto& p = s_cam.pedidos[i];
+      ped[i] = { p.destino && !p.pronto ? p.destino : nullptr, p.l, p.a, p.em_pe };
+    }
     destravar();
 
     // PREVIEW DIRETO NO DESTINO: o PPA escreve o frame ja
@@ -230,9 +265,7 @@ static void laco_captura(tarefa_app_t* t)
     // e a imagem chegava atrasada. Agora sao duas (PPA -> tela virtual ->
     // compositor).
     //
-    // ESCALA UNIFORME, PREENCHENDO: a mesma escala nos dois eixos (a imagem
-    // nao estica) e a menor que ainda cobre o retangulo inteiro; o que sobra
-    // do quadro sai por igual dos dois lados. No retrato do Tab5 isso corta
+    // Escala uniforme preenchendo (encaixar): no retrato do Tab5 isso corta
     // uns 4% da largura - o resto do quadro e o que a foto grava.
     esp_err_t err = ESP_OK;
     if (dst.buf) {
@@ -243,33 +276,60 @@ static void laco_captura(tarefa_app_t* t)
       cfg.out.pic_h          = dst.pic_a;
       cfg.out.block_offset_x = dst.x;
       cfg.out.block_offset_y = dst.y;
-      cfg.in.block_w         = s_cam.recorte_w;
-      cfg.in.block_h         = s_cam.recorte_h;
-      cfg.in.block_offset_x  = (s_cam.bruto_largura - s_cam.recorte_w) / 2;
-      cfg.in.block_offset_y  = (s_cam.bruto_altura  - s_cam.recorte_h) / 2;
-      cfg.scale_x = cfg.scale_y = s_cam.escala;
+      cfg.in.block_w         = rec_w;
+      cfg.in.block_h         = rec_h;
+      cfg.in.block_offset_x  = (s_cam.bruto_largura - rec_w) / 2;
+      cfg.in.block_offset_y  = (s_cam.bruto_altura  - rec_h) / 2;
+      cfg.scale_x = cfg.scale_y = escala;
       err = ppa_rodar(&cfg);
     }
 
-    // FOTO PEDIDA: o MESMO frame bruto, inteiro e sem escala - 1600x1200
-    // girado da exatamente 1200x1600, o campo de visao todo do sensor. Uma
-    // operacao de PPA (poucos ms): o preview nao para, e a gravacao fica com
-    // quem pediu.
-    if (foto) {
+    // QUADROS PEDIDOS (a foto, o video do navegador): o MESMO frame bruto, no
+    // tamanho de quem pediu, com a mesma regra de escala. Uma operacao de PPA
+    // cada (poucos ms): o preview nao para, e o que fazer com o quadro (gravar,
+    // comprimir) fica com quem pediu.
+    for (int i = 0; i < TAB5_CAM_PEDIDOS; ++i) {
+      if (!ped[i].destino) { continue; }
+      float e;
+      int rw, rh;
+      encaixar(ped[i].l, ped[i].a, ped[i].em_pe, &e, &rw, &rh);
       ppa_srm_oper_config_t fc = base;
-      fc.out.buffer      = foto;
-      fc.out.buffer_size = tab5_camera_foto_bytes();
-      fc.out.pic_w       = TAB5_CAM_FOTO_L;
-      fc.out.pic_h       = TAB5_CAM_FOTO_A;
-      fc.scale_x = (float)TAB5_CAM_FOTO_A / (float)s_cam.bruto_largura;
-      fc.scale_y = (float)TAB5_CAM_FOTO_L / (float)s_cam.bruto_altura;
+      if (!ped[i].em_pe) {   // como o sensor ve: sem girar nem espelhar (quem mostra faz)
+        fc.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+        fc.mirror_x = false;
+      }
+      fc.out.buffer      = ped[i].destino;
+      fc.out.buffer_size = tab5_camera_quadro_bytes(ped[i].l, ped[i].a);
+      fc.out.pic_w       = ped[i].l;
+      fc.out.pic_h       = ped[i].a;
+      fc.in.block_w        = rw;
+      fc.in.block_h        = rh;
+      fc.in.block_offset_x = (s_cam.bruto_largura - rw) / 2;
+      fc.in.block_offset_y = (s_cam.bruto_altura  - rh) / 2;
+      fc.scale_x = fc.scale_y = e;
+      // UMA LINHA EM CADA DUAS (so deitado, reduzindo a metade ou menos). O
+      // PPA custa o que ele LE: ~110 ms para os ~3 MB do recorte (medido
+      // 05/11/2026), muito acima dos ~32 ms entre frames. Declarado com o
+      // dobro da largura, o quadro bruto vira metade das linhas, cada uma com
+      // duas do sensor lado a lado - e o bloco, da largura de uma, le so a
+      // primeira de cada par. A escala vertical dobra para o resultado ter as
+      // mesmas linhas. Metade da PSRAM lida; num video de 480 linhas tiradas
+      // de ~1100, a diferenca nao se ve.
+      if (!ped[i].em_pe && e <= 0.5f) {
+        fc.in.pic_w          = s_cam.bruto_largura * 2;
+        fc.in.pic_h          = s_cam.bruto_altura / 2;
+        fc.in.block_h        = rh / 2;
+        fc.in.block_offset_y = (s_cam.bruto_altura - rh) / 4;
+        fc.scale_y           = e * 2;
+      }
       const esp_err_t ef = ppa_rodar(&fc);
       travar();
-      s_cam.foto_destino = nullptr;
-      s_cam.foto_ok      = (ef == ESP_OK);
-      s_cam.foto_pronta  = true;
+      if (s_cam.pedidos[i].destino == ped[i].destino) {
+        s_cam.pedidos[i].ok     = (ef == ESP_OK);
+        s_cam.pedidos[i].pronto = true;
+      }
       destravar();
-      if (ef != ESP_OK) { ESP_LOGW(TAG, "foto: PPA falhou (%s)", esp_err_to_name(ef)); }
+      if (ef != ESP_OK) { ESP_LOGW(TAG, "quadro %dx%d: PPA falhou (%s)", ped[i].l, ped[i].a, esp_err_to_name(ef)); }
     }
 
     // Devolve o buffer BRUTO ao driver JA - o sensor pode reusar o slot.
@@ -299,13 +359,17 @@ static void laco_captura(tarefa_app_t* t)
 // A INICIALIZACAO DE VERDADE - so roda na transicao 0->1 de s_refs (ver
 // tab5_camera_iniciar() mais abaixo, a funcao PUBLICA que decide quando
 // chamar esta aqui).
-static bool iniciar_hardware(int largura, int altura)
+static bool iniciar_hardware(void)
 {
-  if (largura <= 0 || altura <= 0) { return false; }
-
+  // A tarefa de captura de uma sessao anterior nao saiu e segue usando o
+  // esp_video, o PPA e os buffers (ver parar_hardware): subir tudo de novo por
+  // cima falharia ("/dev/video0 ja registrado") ou, pior, zeraria o s_cam que
+  // ela ainda usa. Recusa com mensagem clara; so reiniciar resolve.
+  if (s_abandonada) {
+    ESP_LOGE(TAG, "camera indisponivel: a tarefa de captura anterior nao saiu - reinicie o aparelho");
+    return false;
+  }
   s_cam = { .fd = -1 };
-  s_cam.alvo_largura = largura;
-  s_cam.alvo_altura  = altura;
   s_cam.trava = xSemaphoreCreateMutex();
   if (!s_cam.trava) { return false; }
 
@@ -417,23 +481,6 @@ static bool iniciar_hardware(int largura, int altura)
       goto erro;
     }
 
-    // ESCALA DO PREVIEW. Girado 270, a largura da tela vem da ALTURA do
-    // quadro bruto e a altura da tela, da LARGURA. A escala e a menor, em
-    // 1/16, que cobre os dois eixos; o recorte e o que cabe com ela.
-    {
-      const int L = s_cam.alvo_largura, A = s_cam.alvo_altura;
-      const int W = (int)s_cam.bruto_largura, H = (int)s_cam.bruto_altura;
-      int s16 = (L * 16 + H - 1) / H;
-      const int s16a = (A * 16 + W - 1) / W;
-      if (s16a > s16) { s16 = s16a; }
-      if (s16 < 1) { s16 = 1; }
-      s_cam.escala    = (float)s16 / 16.0f;
-      s_cam.recorte_h = (L * 16) / s16; if (s_cam.recorte_h > H) { s_cam.recorte_h = H; }
-      s_cam.recorte_w = (A * 16) / s16; if (s_cam.recorte_w > W) { s_cam.recorte_w = W; }
-      ESP_LOGI(TAG, "preview %dx%d: escala %d/16, usa %dx%d do quadro de %dx%d",
-               L, A, s16, s_cam.recorte_w, s_cam.recorte_h, W, H);
-    }
-
     // EXPOSICAO E COR SAO DO ISP. O ganho manual fixo que havia
     // aqui (indice 16 = 1,5x) era remendo para a imagem escura
     // a causa era o controlador do pipeline do ISP DESLIGADO no sdkconfig
@@ -503,7 +550,7 @@ static bool iniciar_hardware(int largura, int altura)
   zerar_pedestal();
 
   // So DQBUF, PPA e QBUF - a gravacao da foto saiu daqui (ver
-  // tab5_camera_pedir_foto), entao a stack volta aos 4 KB originais.
+  // tab5_camera_pedir_quadro), entao a stack volta aos 4 KB originais.
   if (!tarefa_app_criar(&s_cam.tarefa, laco_captura, "cam", 4096, 3)) {
     ESP_LOGE(TAG, "nao consegui subir a tarefa de captura");
     { const int tipo = V4L2_BUF_TYPE_VIDEO_CAPTURE; ioctl(s_cam.fd, VIDIOC_STREAMOFF, &tipo); }
@@ -512,7 +559,8 @@ static bool iniciar_hardware(int largura, int altura)
 
   s_cam.ligado = true;
   tab5_marco("camera: ligada", 0);
-  ESP_LOGI(TAG, "camera no ar (%dx%d, rotacao %d)", largura, altura, (int)TAB5_CAM_ROTACAO);
+  ESP_LOGI(TAG, "camera no ar (%ux%u, rotacao %d)", (unsigned)s_cam.bruto_largura, (unsigned)s_cam.bruto_altura,
+           (int)TAB5_CAM_ROTACAO);
   return true;
 
 erro:
@@ -537,7 +585,19 @@ static void parar_hardware(void)
     // A tarefa so faz DQBUF (bloqueia ate o proximo frame, ~33 ms) e PPA -
     // nenhuma escrita no cartao. 500 ms e folga de sobra; se ela nao sair,
     // tarefa_app_encerrar() a abandona (ver tarefa_app.h).
-    tarefa_app_encerrar(&s_cam.tarefa, 500);
+    if (!tarefa_app_encerrar(&s_cam.tarefa, 500)) {
+      // A tarefa abandonada pode estar no meio de DQBUF/PPA: liberar o PPA, os
+      // buffers mmap, o fd, a trava ou o esp_video agora seria ela escrever em
+      // memoria liberada. Nada disso e liberado. A energia do sensor tambem
+      // fica ligada: cortar com uma leitura em andamento pode travar o
+      // esp_video; o custo e o consumo ate reiniciar. O STREAMOFF tambem fica
+      // de fora (nao se sabe se e seguro com a tarefa dentro do driver).
+      ESP_LOGE(TAG, "tarefa de captura nao saiu em 500 ms - PPA, buffers, fd, esp_video e energia "
+                    "ficam vazados DE PROPOSITO ate reiniciar; a camera nao abre mais");
+      s_abandonada = true;
+      s_cam.ligado = false;
+      return;
+    }
     const int tipo = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(s_cam.fd, VIDIOC_STREAMOFF, &tipo);
   }
@@ -643,35 +703,108 @@ static void parar_hardware(void)
 // .hpp). iniciar_hardware()/parar_hardware() acima nunca sao chamadas fora
 // destas duas funcoes.
 // ---------------------------------------------------------------------------
-bool tab5_camera_iniciar(int largura, int altura)
+// A PAUSA DO REPOUSO (ver tab5_camera_pausar no .hpp). So a tarefa de
+// interface mexe aqui (o kernel no repouso, e iniciar/parar do mesmo dono).
+static struct {
+  bool ativa;
+  char quem[24];
+  tab5_cam_destino_t destino;   // o preview de quem pausou (buf nulo = nao tinha)
+  // Quadros que morreram com a camera (ela parou de verdade na pausa): voltam
+  // como prontos com falha no despausar, para quem pediu nao esperar para sempre.
+  struct { uint16_t* destino; int l, a; } mortos[TAB5_CAM_PEDIDOS];
+} s_pausa;
+
+static bool pausa_de(const char* quem)
+{
+  return s_pausa.ativa && quem && !strncmp(s_pausa.quem, quem, sizeof(s_pausa.quem) - 1);
+}
+
+static bool iniciar_interno(const char* quem);
+static void parar_interno(const char* quem);
+
+bool tab5_camera_iniciar(const char* quem)
+{
+  // O dono pausado religou sozinho (um script com a tela apagada): a pausa
+  // perde o sentido, e ele define o proprio destino.
+  if (pausa_de(quem)) { s_pausa = { }; }
+  return iniciar_interno(quem);
+}
+
+void tab5_camera_parar(const char* quem)
+{
+  // O dono pausado ja soltou o uso na pausa: parar de novo descontaria outro.
+  if (pausa_de(quem)) { s_pausa = { }; return; }
+  parar_interno(quem);
+}
+
+bool tab5_camera_pausar(const char* quem)
+{
+  if (s_pausa.ativa || !quem || !sistema_recurso_de(RECURSO_CAMERA, quem)) { return false; }
+  s_pausa = { };
+  travar();
+  s_pausa.destino = s_cam.destino;
+  destravar();
+  // O preview para JA, mesmo que outro consumidor segure a camera ligada.
+  tab5_camera_definir_destino(nullptr);
+  travar_ctrl();
+  const bool vai_parar = s_refs == 1;
+  destravar_ctrl();
+  if (vai_parar) {
+    travar();
+    for (int i = 0; i < TAB5_CAM_PEDIDOS; ++i) {
+      const auto& p = s_cam.pedidos[i];
+      if (p.destino && !p.pronto) { s_pausa.mortos[i] = { p.destino, p.l, p.a }; }
+    }
+    destravar();
+  }
+  parar_interno(quem);
+  strlcpy(s_pausa.quem, quem, sizeof(s_pausa.quem));
+  s_pausa.ativa = true;
+  ESP_LOGI(TAG, "pausada pelo repouso: %s%s", quem, vai_parar ? " (desligou)" : "");
+  return true;
+}
+
+void tab5_camera_despausar(bool religar)
+{
+  if (!s_pausa.ativa) { return; }
+  const auto p = s_pausa;
+  s_pausa = { };
+  if (!religar) { return; }
+  if (!iniciar_interno(p.quem)) {
+    ESP_LOGE(TAG, "falha ao religar a camera de %s depois do repouso", p.quem);
+    return;
+  }
+  if (p.destino.buf) { tab5_camera_definir_destino(&p.destino); }
+  travar();
+  for (const auto& m : p.mortos) {
+    if (!m.destino) { continue; }
+    for (auto& v : s_cam.pedidos) {
+      if (v.destino) { continue; }
+      v = { m.destino, m.l, m.a, true, true, false };   // pronto, com falha
+      break;
+    }
+  }
+  destravar();
+  ESP_LOGI(TAG, "religada depois do repouso: %s", p.quem);
+}
+
+static bool iniciar_interno(const char* quem)
 {
   travar_ctrl();
-
-  bool ok;
-  if (s_refs > 0) {
-    // JA LIGADA - so aceita mais um interessado se pedir a MESMA resolucao
-    // (ver "UMA UNICA RESOLUCAO POR VEZ" no .hpp). Comparar com s_cam
-    // diretamente e seguro aqui dentro da trava: nada mais escreve
-    // alvo_largura/alvo_altura fora de iniciar_hardware().
-    if (largura == s_cam.alvo_largura && altura == s_cam.alvo_altura) {
-      ++s_refs;
-      ok = true;
-    } else {
-      ESP_LOGW(TAG, "camera ja em uso a %dx%d - pedido de %dx%d recusado (uma resolucao por vez)",
-               s_cam.alvo_largura, s_cam.alvo_altura, largura, altura);
-      ok = false;
-    }
-  } else {
-    ok = iniciar_hardware(largura, altura);
-    if (ok) { s_refs = 1; }
-  }
-
+  bool ok = true;
+  if (s_refs > 0) { ++s_refs; }   // ja ligada: so mais um interessado
+  else            { ok = iniciar_hardware(); if (ok) { s_refs = 1; } }
   destravar_ctrl();
+  // A CAMERA E UM RECURSO (kernel/recursos.h): com ela ligada a suspensao
+  // segura o clock e nao entra no sono leve - por quem pediu, seja app, Berry,
+  // console ou o navegador. Quem usa nao precisa saber da suspensao.
+  if (ok) { sistema_recurso_usar(RECURSO_CAMERA, quem ? quem : "camera"); }
   return ok;
 }
 
-void tab5_camera_parar(void)
+static void parar_interno(const char* quem)
 {
+  sistema_recurso_soltar(RECURSO_CAMERA, quem ? quem : "camera");
   travar_ctrl();
 
   if (s_refs > 0) {
@@ -685,10 +818,17 @@ void tab5_camera_parar(void)
 void tab5_camera_definir_destino(const tab5_cam_destino_t* d)
 {
   if (!s_cam.trava) { return; }
+  float e = 1.0f;
+  int rw = 0, rh = 0;
+  if (d && d->buf) { encaixar(d->l, d->a, true, &e, &rw, &rh); }
   travar();
   s_cam.destino = d ? *d : tab5_cam_destino_t{ };
+  s_cam.escala = e;
+  s_cam.recorte_w = rw;
+  s_cam.recorte_h = rh;
   s_cam.tem_novo = false;
   destravar();
+  if (d && d->buf) { ESP_LOGI(TAG, "preview %dx%d: escala %.4f, usa %dx%d do quadro", d->l, d->a, (double)e, rw, rh); }
 }
 
 bool tab5_camera_quadro_escrito(void)
@@ -701,43 +841,47 @@ bool tab5_camera_quadro_escrito(void)
   return novo;
 }
 
-size_t tab5_camera_foto_bytes(void)
+size_t tab5_camera_quadro_bytes(int l, int a)
 {
   size_t alinhamento = 64;
   esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &alinhamento);
-  return ((size_t)TAB5_CAM_FOTO_L * TAB5_CAM_FOTO_A * 2 + alinhamento - 1) & ~(alinhamento - 1);
+  return ((size_t)l * a * 2 + alinhamento - 1) & ~(alinhamento - 1);
 }
 
-uint16_t* tab5_camera_foto_alocar(void)
+uint16_t* tab5_camera_quadro_alocar(int l, int a)
 {
   size_t alinhamento = 64;
   esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &alinhamento);
-  return (uint16_t*)heap_caps_aligned_calloc(alinhamento, 1, tab5_camera_foto_bytes(), MALLOC_CAP_SPIRAM);
+  return (uint16_t*)heap_caps_aligned_calloc(alinhamento, 1, tab5_camera_quadro_bytes(l, a), MALLOC_CAP_SPIRAM);
 }
 
-bool tab5_camera_pedir_foto(uint16_t* destino)
+bool tab5_camera_pedir_quadro(uint16_t* destino, int l, int a, bool em_pe)
 {
-  if (!s_cam.ligado || !destino) { return false; }
+  if (!s_cam.ligado || !destino || l <= 0 || a <= 0) { return false; }
   bool aceito = false;
   travar();
-  if (!s_cam.foto_destino) {
-    s_cam.foto_destino = destino;
-    s_cam.foto_pronta  = false;
+  bool repetido = false;
+  for (const auto& p : s_cam.pedidos) { repetido |= p.destino == destino; }
+  for (auto& p : s_cam.pedidos) {
+    if (repetido || aceito || p.destino) { continue; }
+    p = { destino, l, a, em_pe, false, false };
     aceito = true;
   }
   destravar();
   return aceito;
 }
 
-bool tab5_camera_foto_pronta(bool* ok)
+bool tab5_camera_quadro_pronto(const uint16_t* destino, bool* ok)
 {
-  bool pronta = false;
+  if (!s_cam.trava) { return false; }
+  bool pronto = false;
   travar();
-  if (s_cam.foto_pronta) {
-    if (ok) { *ok = s_cam.foto_ok; }
-    s_cam.foto_pronta = false;
-    pronta = true;
+  for (auto& p : s_cam.pedidos) {
+    if (p.destino != destino || !p.pronto) { continue; }
+    if (ok) { *ok = p.ok; }
+    p = { };
+    pronto = true;
   }
   destravar();
-  return pronta;
+  return pronto;
 }

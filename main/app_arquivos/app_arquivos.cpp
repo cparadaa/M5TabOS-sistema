@@ -1,27 +1,59 @@
-// APP: Arquivos - navegador de LEITURA do cartao.
+// APP: Arquivos - os discos do aparelho (cartao e pendrive), e o que ha neles.
 //
-// Tres niveis: pastas dos aplicativos -> arquivos da pasta -> conteudo do
-// arquivo. So le. Nao copia, nao move, nao apaga - de proposito, para nao
-// existir a possibilidade de perder dado por um toque errado. O dia em que
-// apagar for necessario, que seja um app separado e explicito.
+// SO INTERFACE. Quem lista, copia, move, apaga e ejeta e o sistema
+// (services/tab5_arquivos e services/tab5_volumes); este app mostra e pede.
+// As regras de "o que aparece / o que se mexe" tambem sao de la: /sdcard/apps
+// e so leitura (menos apps/Berry), nomes com '.' e as senhas do sistema nao
+// aparecem - o app so pergunta tab5_arq_gravavel/mexivel para acender botao.
 //
-// Este app declara usa_sd = true, entao o SISTEMA monta o cartao antes do
-// ao_abrir() e desmonta depois do ao_fechar(). Nao ha chamada de montagem aqui.
+// NIVEIS:
+//   DISCOS    a raiz: Cartao SD e, plugado, o Pendrive - espaco, lixeira,
+//             ejetar.
+//   LIXEIRA   o que foi apagado naquele disco (botao "Lixeira" da raiz): toque
+//             restaura ou exclui de vez; toque LONGO seleciona varios.
+//   PASTA     o conteudo de uma pasta de qualquer disco. Toque abre; toque
+//             LONGO seleciona (e a partir dai toque marca/desmarca), com a
+//             barra Copiar / Recortar / Apagar / Renomear. Com algo copiado,
+//             "Colar aqui" em qualquer pasta gravavel. "+ Pasta" cria.
+//   CONTEUDO  o leitor de texto (log, CSV) e o visor de imagem.
+//
+// ABRIR COM, pela extensao: musica toca pelo tocador do sistema e abre a
+// Musica; .be abre como texto, com o botao "Instalar" (variante com Berry);
+// imagem e texto abrem aqui.
+// COPIAR PARA MUSICA: numa pasta com musicas fora da pasta de musica (o
+// pendrive, tipicamente), um botao copia a pasta inteira (ou, na raiz do
+// disco, as musicas soltas) para a pasta de musica do cartao.
+//
+// COPIAR E TRABALHO DO SISTEMA: segue com o app fechado; o progresso aparece
+// aqui (barra no rodape) e na barra de status.
 
 #include "app.h"
+#include "idioma.h"
+#include "toque_longo.hpp"
 #include "esp_attr.h"   // EXT_RAM_BSS_ATTR - buffers grandes na PSRAM
 #include "tab5_tela.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
+#include "tab5_teclado.hpp"
 #include "pintura.hpp"
 #include "lista.hpp"
 #include "conversa.hpp"   // conversa_quebrar_linhas: o mesmo quebrador dos baloes
-#include "esp_heap_caps.h"
-#include <stdlib.h>
+#include "teclado_virtual.hpp"
 #include "trabalho.hpp"
+#include "tab5_sd.hpp"
+#include "tab5_volumes.hpp"
+#include "tab5_arquivos.hpp"
+#include "tab5_imagem.hpp"
+#include "tab5_texto.hpp"
+#include "tab5_gif.hpp"
+#include "tab5_musica.hpp"
+#include "tab5_video.hpp"
+#include "esp_heap_caps.h"
+#include "tab5_hora.hpp"
 
 #include "esp_log.h"
 #include "esp_timer.h"
-#include <dirent.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -34,164 +66,98 @@
 
 static const char *TAG = "app.arquivos";
 
-// Quantos itens uma pasta mostra. Era 24 - e a pasta de logs ganha um arquivo
-// por dia: no 25o dia, o log de HOJE (o ultimo que o readdir devolve) sumiria
-// da lista sem aviso. A tabela mora na PSRAM so com o app aberto.
+// Quantos itens uma pasta mostra. A tabela mora na PSRAM so com o app aberto.
 #define MAX_ITENS      512
-// LEITURA COMO TEXTO CORRIDO. A tela mostrava 28 linhas do arquivo cortadas
-// em 96 bytes e desenhadas sem medir: linha de log ou de CSV maior que a tela
-// simplesmente saia pela direita, e o fim dela nao aparecia em lugar nenhum.
-// Agora cada linha do arquivo e QUEBRADA na largura real (por palavra; o CSV
-// ganha um espaco depois de cada separador para quebrar no campo), e a
-// "pagina" e o que couber na tela - quantas linhas do arquivo isso da so se
-// sabe desenhando.
-#define BLOCO_LINHAS   28    // granularidade do indice de deslocamentos (s_off)
+// LEITURA COMO TEXTO CORRIDO. Cada linha do arquivo e QUEBRADA na largura
+// real (por palavra; o CSV ganha um espaco depois de cada separador para
+// quebrar no campo), e a "pagina" e o que couber na tela.
 #define LER_LINHAS     48    // linhas do arquivo trazidas por leitura - mais do que cabem
 #define LARG_LINHA     600   // bytes guardados de UMA linha do arquivo; o resto vira "..."
 
-// Mesmo atalho que app_mesh.cpp ja usa: "esta passada repinta tudo?".
 #define TUDO  pintura_completa(&s_p)
 
-typedef enum { NIVEL_PASTAS, NIVEL_ARQUIVOS, NIVEL_CONTEUDO } nivel_t;
-
-typedef struct {
-  char     nome[40];
-  int      arquivos;      // so para pasta
-  uint64_t bytes;
-  bool     eh_pasta;      // controla a pastinha/folhinha do icone - ver desenhar()
-} item_t;
+typedef enum { NIVEL_DISCOS, NIVEL_PASTA, NIVEL_CONTEUDO, NIVEL_LIXEIRA } nivel_t;
+typedef enum { VER_TEXTO, VER_IMG } ver_t;
+typedef enum { DLG_NADA, DLG_APAGAR, DLG_ESVAZIAR, DLG_NOME, DLG_LIXO_ITEM, DLG_LIXO_EXCLUIR } dialogo_t;
 
 // ---- estado ----------------------------------------------------------------
-static nivel_t  s_nivel = NIVEL_PASTAS;
-static item_t*  s_itens = nullptr;   // MAX_ITENS, PSRAM, alocada ao abrir
-static int      s_n_itens = 0;
-static int      s_n_achados = 0;      // quantos a pasta TEM (pode passar de MAX_ITENS)
-// Caminho relativo a apps/, com subpastas: "Sistema" ou "Sistema/logs".
-static char     s_pasta[96]   = "";
-static char     s_arquivo[48] = "";
+static nivel_t          s_nivel = NIVEL_DISCOS;
+static tab5_arq_item_t* s_itens = nullptr;   // MAX_ITENS, PSRAM, alocada ao abrir
+static int              s_n_itens = 0;
+static int              s_n_achados = 0;     // quantos a pasta TEM (pode passar de MAX_ITENS)
+static char             s_pasta[TAB5_ARQ_CAMINHO_MAX] = "";   // absoluta ("/usb/Rock")
+static char             s_arquivo[TAB5_ARQ_NOME_MAX] = "";
+static bool             s_gravavel = false;  // a pasta aberta aceita criar/colar
+static bool             s_tem_musica = false;   // ha musica solta na pasta aberta
+static char             s_musica_raiz[TAB5_ARQ_CAMINHO_MAX] = "";   // "/sdcard/Música" ("" = sem cartao)
 
-// A LISTA DE PASTAS/ARQUIVOS e uma kernel/lista: rolagem,
-// recorte, faixa exposta, barra e o "qual item foi tocado" sao dela. O
-// CONTEUDO de um arquivo aberto (NIVEL_CONTEUDO) nao rola - pagina por
-// botoes, de proposito: arquivo de log tem megabytes, e rolar exigiria ter
-// tudo medido.
+// Os discos (nivel DISCOS), com o que o worker mediu.
+typedef struct {
+  tab5_vol_t v;
+  uint64_t   total, livre;
+  int        lixeira;
+  uint64_t   lixeira_bytes;   // o peso de tudo o que esta na lixeira do disco
+} disco_t;
+static disco_t s_discos[TAB5_VOL_N];
+static int     s_n_discos = 0;
+
+// A LIXEIRA aberta (nivel LIXEIRA): a raiz do disco e s_pasta. As duas tabelas
+// (a da tela e a do worker) nascem ao entrar na lixeira, na PSRAM, e saem ao fechar.
+static tab5_arq_lixo_t* s_lixo = nullptr;
+static tab5_arq_lixo_t* s_lixo_carga = nullptr;
+static uint64_t         s_lixo_bytes = 0;
+// O que a acao em curso (ou o dialogo) vai tocar: copia dos itens escolhidos.
+EXT_RAM_BSS_ATTR static tab5_arq_lixo_t s_lixo_alvo[TAB5_ARQ_ITENS_MAX];
+static int              s_lixo_alvo_n = 0;
+
+// SELECAO (toque longo). Indices de s_itens (ou de s_lixo, na lixeira).
+EXT_RAM_BSS_ATTR static uint8_t s_sel[MAX_ITENS];
+static bool s_selecionando = false;
+static int  s_n_sel = 0;
+
+// A mensagem da ultima acao (na linha de descricao), ate navegar.
+static char s_msg[96] = "";
+static bool s_msg_erro = false;
+
+// Dialogos.
+static dialogo_t s_dlg = DLG_NADA;
+static tecvirt_t s_kb;
+static char      s_nome_txt[TAB5_ARQ_NOME_MAX] = "";
+static bool      s_nome_criar = false;          // true = nova pasta; false = renomear
+static char      s_nome_alvo[TAB5_ARQ_CAMINHO_MAX] = "";   // o item a renomear
+static char      s_esvaziar_raiz[16] = "";
+static int       s_esvaziar_itens = 0;
+static uint64_t  s_esvaziar_bytes = 0;
+static uint32_t  s_dlg_desde = 0;     // quando a confirmacao abriu (ver ao_tocar)
+
+// O trabalho de copia do sistema, como visto da ultima vez.
+static tab5_arq_fase_t s_job_fase = TAB5_ARQ_PARADO;
+static bool            s_instalando_be = false;   // a copia em curso instala um app Berry
+
 static lista_t s_lista;
 static int  item_altura(int i, void* ctx);
 static void item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void* ctx);
 
+// ---- leitor de texto ---------------------------------------------------------
 EXT_RAM_BSS_ATTR static char s_linhas[LER_LINHAS][LARG_LINHA + 1];
 static int      s_n_linhas = 0;
 static int      s_linha = 0;          // a primeira linha do arquivo na tela (0 = a primeira)
 static int      s_cabem = 1;          // quantas linhas do arquivo a ultima passada coube (o passo do DEPOIS)
 static int      s_total_linhas = 0;
-// De onde veio cada tela: o ANTES volta exatamente ao que se viu, mesmo com
-// linhas de tamanhos diferentes (o passo para tras nao e o mesmo do DEPOIS).
 #define VOLTAS_MAX 64
 static int      s_voltas[VOLTAS_MAX];
 static int      s_n_voltas = 0;
-// Tamanho da letra do texto: o botao Aa troca entre estes (px nativos).
 static const int TAM_LEITURA[] = { 24, 29, 36 };
 static int      s_tam_leitura = 1;
+static bool     s_abriu_ok = true;
 
-static uint64_t s_total = 0, s_livre = 0;
+// ---- visor de imagem ---------------------------------------------------------
+static ver_t    s_ver = VER_TEXTO;
+static uint32_t s_img_largura = 0, s_img_altura = 0;   // reais, lidos no cabecalho (0 = ainda nao sei)
 
-// ---- visualizacao de imagem (.bmp) -----------------------------------------
-// o app Camera passou a salvar fotos em .bmp, e o
-// Arquivos - que so sabia mostrar texto/CSV linha a linha - nao tinha como
-// abrir. So entende o PROPRIO formato que tab5_camera.cpp escreve (16 bits,
-// RGB565, BI_BITFIELDS) - nao e um decodificador de bmp generico, e nao
-// precisa ser: nenhum outro app grava imagem no cartao.
-static bool     s_e_imagem = false;
-static uint32_t s_img_largura = 0, s_img_altura = 0;
-static long     s_img_offset_dados = 0;
-static uint32_t s_img_linha_bytes = 0;
-static bool     s_img_ok = false;
-
-static bool tem_sufixo(const char* nome, const char* sufixo)
-{
-  const size_t ln = strlen(nome), ls = strlen(sufixo);
-  return ln >= ls && strcasecmp(nome + ln - ls, sufixo) == 0;
-}
-
-// Le so o cabecalho (BITMAPFILEHEADER + BITMAPINFOHEADER) - rapido, e o
-// bastante para saber tamanho e onde os pixels comecam. A leitura de verdade
-// e por LINHA, no desenho, para nao precisar de um buffer do tamanho da foto
-// inteira (ver desenhar_imagem()).
-static uint32_t ler_u32(const uint8_t* p) { return p[0] | (p[1]<<8) | (p[2]<<16) | ((uint32_t)p[3]<<24); }
-static uint16_t ler_u16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1]<<8)); }
-
-static void abrir_cabecalho_imagem(const char* caminho)
-{
-  s_img_ok = false;
-  FILE* f = fopen(caminho, "rb");
-  if (!f) { return; }
-
-  uint8_t cab[54];
-  if (fread(cab, 1, sizeof(cab), f) != sizeof(cab) || cab[0] != 'B' || cab[1] != 'M') {
-    fclose(f);
-    return;
-  }
-  s_img_offset_dados = (long)ler_u32(cab + 10);
-  s_img_largura      = ler_u32(cab + 18);
-  s_img_altura        = ler_u32(cab + 22);
-  const uint16_t bpp  = ler_u16(cab + 28);
-  fclose(f);
-
-  if (bpp != 16 || s_img_largura == 0 || s_img_altura == 0 || s_img_altura > 4096) { return; }
-  s_img_linha_bytes = ((s_img_largura * 2 + 3) / 4) * 4;
-  s_img_ok = true;
-}
-
-// Qual nivel foi desenhado por ultimo. O sistema NAO limpa a area entre
-// redesenhos - e de proposito, e o que mata o flickering. So que este app troca
-// o layout inteiro ao mudar de nivel, e o anterior ficaria por baixo: foi o que
-// deu a tela com dois textos sobrepostos. Entao QUANDO O NIVEL MUDA, e so
-// entao, o proprio app limpa a area uma vez.
-static int s_nivel_desenhado = -1;
-static bool s_abriu_ok = true;
-
-// ---------------------------------------------------------------------------
-// LEITURA NO WORKER (kernel/trabalho)
-// ---------------------------------------------------------------------------
-// Contar as linhas (o energia.csv cresce sem limite) e ler uma pagina eram
-// feitos NA TAREFA DE INTERFACE - com a tela e o toque parados enquanto o
-// cartao respondia. Agora o worker faz os dois, SO com o estado abaixo
-// (s_c_*) e a tabela de deslocamentos (s_off, que so ele usa); a interface
-// copia o resultado no ao_aviso. Caminho e pagina sao FOTOGRAFADOS no pedido:
-// trocar de arquivo ou virar pagina durante a leitura nao mistura nada.
-static char          s_c_caminho[192];
-static int           s_c_linha = 0;
-static bool          s_c_contar = false;
-static int           s_c_total = 0;
-EXT_RAM_BSS_ATTR static char s_c_linhas[LER_LINHAS][LARG_LINHA + 1];
-static int           s_c_n = 0;
-static bool          s_c_abriu = true;
-static volatile bool s_c_pronto = false;
-static bool          s_c_ocupado = false;     // ha pedido em andamento
-static bool          s_c_de_novo = false;     // pediram outra leitura no meio
-static bool          s_c_contar_de_novo = false;
-
-// LEITURA PENDENTE - nao ler do cartao dentro do tratador de toque.
-//
-// O ler_pagina() percorre o arquivo ate a pagina pedida e cede CPU a cada 256
-// linhas. Rodando dentro do ao_tocar(), cada toque bloqueava a tarefa de
-// interface ANTES de qualquer desenho; tocando rapido, as leituras se
-// enfileiravam e a tela alternava entre a pagina velha e a nova em ritmo
-// irregular - que e a piscada ao passar paginas depressa.
-//
-// Agora o toque so ANOTA o que quer, e a leitura acontece no desenhar(), junto
-// do resto do trabalho de tela. Mesmo padrao do app Mesh com o historico.
-static bool s_precisa_ler = false;
 static pintura_t s_p;   // pintura por diferenca desta tela
 
 // ---- geometria -------------------------------------------------------------
-// O CABECALHO E O DO AJUSTES: "< VOLTAR" e o titulo na mesma faixa, a
-// descricao embaixo e uma linha separando do conteudo. O anterior tinha o
-// titulo (41 px) em y=72, a descricao (33 px) em y=104 e a fileira de saltos
-// em y=128 - os tres se sobrepunham, e a descricao, pintada com fundo preto,
-// comia o topo dos botoes. Aqui cada faixa tem altura conhecida e a seguinte
-// comeca onde ela acaba. Larguras dos botoes: FRACAO da area, nunca pixel
-// fixo - a fileira cabe em qualquer largura.
 static const int MARGEM_X = 16;
 static const int TOPO_Y = 16, TOPO_A = 64;           // VOLTAR + titulo
 static const int VOLTAR_L = 200;
@@ -199,371 +165,476 @@ static const int AA_L = 96;                            // "Aa" (so no conteudo)
 static const int DESC_Y = 92;                          // a linha de descricao (24 px)
 static const int DIVISA_Y = 128;
 static const int LISTA_Y = 140;                        // onde a lista comeca
-// So no conteudo: a fileira de navegacao e a barra de posicao.
 static const int NAV_Y = 140, NAV_A = 64, NAV_G = 10;
-static const int BARRA_Y = 220, BARRA_A = 14;          // trilho desenhado
-static const int BARRA_TOQUE_Y = 204, BARRA_TOQUE_A = 48;   // faixa que aceita o toque
-static const int TEXTO_Y = 252;                        // onde o texto comeca
-static const int ARRASTE_PAGINA = 90;                  // px de arraste vertical que viram a pagina
-static const char* NAV_NOME[4] = { "INÍCIO", "ANTES", "DEPOIS", "FIM" };
+static const int BARRA_Y = 220, BARRA_A = 14;
+static const int BARRA_TOQUE_Y = 204, BARRA_TOQUE_A = 48;
+static const int TEXTO_Y = 252;
+static const int ARRASTE_PAGINA = 90;
+static const char* NAV_NOME[4] = { N_("INÍCIO"), N_("ANTES"), N_("DEPOIS"), N_("FIM") };
 static int nav_l(int largura) { return (largura - 2 * MARGEM_X - 3 * NAV_G) / 4; }
 static int nav_x(int largura, int i) { return MARGEM_X + i * (nav_l(largura) + NAV_G); }
-// 48 -> 72 (+50%): com 48 px o toque errava o arquivo com frequencia.
-static const int LIN_LISTA = 72;
-
-// TRES TAMANHOS: titulo +100%, descricao e lista +60%; o
-// conteudo de CSV/texto fica no BASE - maior apertaria LIN_TEXTO (30px).
-static const float TAM_BASE   = 2.6f;             // +30%
+static const int LIN_LISTA = 88;   // mais respiro entre os itens (pedido do usuario)
+static const uint16_t COR_DIVISA = TEMA_LINHA;   // separa sem pesar
+static const int LIN_DISCO = 150;
+static const int RODAPE_A = 76;                        // uma faixa de botoes no rodape
+static const int PROG_A = 70;                          // a faixa do progresso da copia
+static const float TAM_BASE   = 2.6f;
 static const float TAM_LISTA  = TAM_BASE * 1.6f;
 
-static void caminho_pasta(char* out, size_t n)
+static const uint16_t CINZA_BT = TEMA_SUPERFICIE_ALTA;   // botao apagado (sem acao aqui)
+
+// ---- botoes: o que foi desenhado e o que o toque acerta ----------------------
+// Cada passada registra os botoes que desenhou (coordenadas da AREA, as do
+// toque); o ao_tocar pergunta qual foi tocado. Assim desenho e toque usam a
+// mesma conta, nunca duas.
+typedef enum {
+  BT_NADA = 0, BT_VOLTAR, BT_AA, BT_NOVA_PASTA, BT_PARA_MUSICA, BT_TODOS, BT_INSTALAR,
+  BT_COPIAR, BT_RECORTAR, BT_APAGAR, BT_RENOMEAR, BT_SAIR_SEL,
+  BT_COLAR, BT_LIMPAR_AREA, BT_CANCELAR_JOB, BT_OK_JOB,
+  BT_DLG_SIM, BT_DLG_NAO,
+  BT_ESVAZIAR, BT_LIXO_RESTAURAR, BT_LIXO_EXCLUIR, BT_DLG_RESTAURAR, BT_DLG_EXCLUIR,
+} bt_id_t;
+typedef struct { int16_t x, y, l, a; uint8_t id; } bt_t;
+static bt_t s_bts[16];
+static int  s_n_bts = 0;
+
+static void botao(lgfx::LovyanGFX& d, const area_t& a, int x, int y, int l, int h, const char* txt,
+                  uint16_t fundo, uint16_t tinta, bt_id_t id)
 {
-  snprintf(out, n, "%s/%s", TAB5_SD_APPS, s_pasta);
+  tab5_botao(d, a.x + x, a.y + y, l, h, txt, fundo, tinta);
+  if (id != BT_NADA && s_n_bts < (int)(sizeof(s_bts) / sizeof(s_bts[0]))) {
+    s_bts[s_n_bts++] = { (int16_t)x, (int16_t)y, (int16_t)l, (int16_t)h, (uint8_t)id };
+  }
 }
-static void caminho_arquivo(char* out, size_t n)
+
+static bt_id_t botao_tocado(int x, int y)
 {
-  snprintf(out, n, "%s/%s/%s", TAB5_SD_APPS, s_pasta, s_arquivo);
+  for (int i = s_n_bts - 1; i >= 0; --i) {
+    const bt_t& b = s_bts[i];
+    if (tab5_dentro(x, y, b.x, b.y, b.l, b.a)) { return (bt_id_t)b.id; }
+  }
+  return BT_NADA;
 }
 
 // ---------------------------------------------------------------------------
-// Leitura
+// CAMINHOS
 // ---------------------------------------------------------------------------
-// stat() em vez de abrir/posicionar/fechar. Listar uma pasta com 50 arquivos
-// eram 50 aberturas de arquivo no cartao - lento e desnecessario, o tamanho
-// esta na entrada de diretorio.
-static uint64_t tamanho_de(const char* caminho)
+static bool juntar(char* out, size_t tam, const char* pasta, const char* nome)
 {
-  struct stat st;
-  if (stat(caminho, &st) != 0) { return 0; }
-  return (st.st_size > 0) ? (uint64_t)st.st_size : 0;
+  return (size_t)snprintf(out, tam, "%s/%s", pasta, nome) < tam;
 }
 
-// ORDEM: pastas primeiro, em ordem alfabetica; depois os arquivos do MAIS
-// NOVO nome para o mais velho - os arquivos do sistema sao datados
-// (log_2026-09-23.txt), e o de hoje e o que se procura, nao o do mes passado.
-static int comparar_itens(const void* pa, const void* pb)
+static void caminho_arquivo(char* out, size_t n) { juntar(out, n, s_pasta, s_arquivo); }
+
+static bool eh_raiz_de_disco(const char* c)
 {
-  const item_t* a = (const item_t*)pa;
-  const item_t* b = (const item_t*)pb;
-  if (a->eh_pasta != b->eh_pasta) { return a->eh_pasta ? -1 : 1; }
-  return a->eh_pasta ? strcasecmp(a->nome, b->nome) : strcasecmp(b->nome, a->nome);
+  return !strcmp(c, TAB5_VOL_CARTAO_RAIZ) || !strcmp(c, TAB5_VOL_PENDRIVE_RAIZ);
 }
 
-// Arquivos e bytes de uma pasta, SUBPASTAS INCLUSIVE - a pasta Sistema quase
-// nao tem arquivo solto (os logs e a energia moram em Sistema/logs e
-// Sistema/energia), e contar so o primeiro nivel diria "3 arq, 2KB".
-static void somar_pasta(const char* caminho, int nivel, int* arquivos, uint64_t* bytes)
+// "Pendrive / Rock / Anos 80" - onde se esta, para a descricao.
+static void trilha_de(const char* c, char* out, size_t tam)
 {
-  DIR* d = opendir(caminho);
-  if (!d) { return; }
-  struct dirent* e;
-  while ((e = readdir(d)) != NULL) {
-    if (e->d_name[0] == '.') { continue; }
-    char cheio[224];
-    snprintf(cheio, sizeof(cheio), "%s/%s", caminho, e->d_name);
-    if (e->d_type == DT_DIR) {
-      if (nivel < 3) { somar_pasta(cheio, nivel + 1, arquivos, bytes); }
-    } else {
-      *bytes += tamanho_de(cheio);
-      ++*arquivos;
-    }
+  snprintf(out, tam, "%s", tr(tab5_volume_tipo(c)));
+  const char* p = c + (tab5_volume_de(c) == TAB5_VOL_CARTAO ? strlen(TAB5_VOL_CARTAO_RAIZ)
+                                                             : strlen(TAB5_VOL_PENDRIVE_RAIZ));
+  while (*p == '/') {
+    ++p;
+    const char* fim = strchr(p, '/');
+    const int n = fim ? (int)(fim - p) : (int)strlen(p);
+    const size_t k = strlen(out);
+    if (k + 6 >= tam) { break; }
+    snprintf(out + k, tam - k, " / %.*s", n, p);
+    p += n;
   }
-  closedir(d);
 }
 
-// Toda listagem nova: itens em ordem, lista re-medida e de volta ao topo.
-// Quanto a listagem custou na tarefa de interface (o cartao e lido aqui, no
-// toque). Acima de 150 ms o toque ja fica perceptivelmente preso: sai no log
-// para sabermos se chegou a hora de mandar a listagem para o worker.
-// A LISTAGEM E DO WORKER. Listar uma pasta (e somar o
-// tamanho de cada subpasta, tres niveis abaixo) acontecia dentro do toque: a
-// tela parava enquanto o cartao respondia - e a raiz, com o Sistema cheio de
-// logs, levava centenas de ms. Agora o worker lista para s_carga (o
-// buffer que a tela NAO desenha) e o ao_aviso troca os dois, como a leitura
-// de conteudo ja fazia.
-static item_t*        s_carga = nullptr;          // MAX_ITENS, PSRAM
-static volatile bool  s_listando = false;         // pedido feito, resultado ainda nao entrou
-static volatile bool  s_l_pronto = false;
-static bool           s_l_pastas = true, s_l_manter = false;
-static bool           s_l_de_novo = false, s_l_de_novo_pastas = true, s_l_de_novo_manter = false;
-static char           s_l_pasta[128];             // o caminho pedido (copia: o toque pode mudar s_pasta)
-static volatile int   s_l_n = 0, s_l_achados = 0;
-static uint64_t       s_l_total = 0, s_l_livre = 0;
-
-static void listar_em(item_t* dst, const char* pasta, bool raiz)
+static void mensagem(const char* txt, bool erro)
 {
-  const int64_t t0 = esp_timer_get_time();
-  int n = 0, achados = 0;
-  if (raiz) { s_l_total = s_l_livre = 0; }
-  if (tab5_sd_montado()) {
-    if (raiz) { tab5_sd_espaco((uint64_t*)&s_l_total, (uint64_t*)&s_l_livre); }
-    DIR* d = opendir(pasta);
-    if (d) {
-      struct dirent* e;
-      while ((e = readdir(d)) != NULL) {
-        if (e->d_name[0] == '.') { continue; }
-        if (++achados > MAX_ITENS) { continue; }
-        if (sistema_trabalho_cancelado()) { break; }
-        item_t* it = &dst[n];
-        snprintf(it->nome, sizeof(it->nome), "%s", e->d_name);
-        it->arquivos = 0;
-        it->bytes    = 0;
-        it->eh_pasta = (e->d_type == DT_DIR);
-        char cheio[224];
-        snprintf(cheio, sizeof(cheio), "%s/%s", pasta, e->d_name);
-        if (it->eh_pasta) { somar_pasta(cheio, 1, &it->arquivos, &it->bytes); }
-        else if (!raiz)   { it->bytes = tamanho_de(cheio); }
-        ++n;
-      }
-      closedir(d);
-    }
-  }
-  if (n > 1) { qsort(dst, n, sizeof(item_t), comparar_itens); }
-  s_l_n = n;
-  s_l_achados = achados;
-  const int64_t ms = (esp_timer_get_time() - t0) / 1000;
-  if (ms > 150) { ESP_LOGW(TAG, "listagem de %d item(s) levou %lld ms", achados, (long long)ms); }
+  snprintf(s_msg, sizeof(s_msg), "%s", txt ? txt : "");
+  s_msg_erro = erro;
+  sistema_pedir_redesenho_completo();
 }
+
+// ---------------------------------------------------------------------------
+// LISTAGEM NO WORKER
+// ---------------------------------------------------------------------------
+// O worker lista para s_carga (o buffer que a tela NAO desenha) e o ao_aviso
+// troca os dois.
+static tab5_arq_item_t* s_carga = nullptr;
+static volatile bool    s_listando = false;
+static volatile bool    s_l_pronto = false;
+static bool             s_l_manter = false, s_l_de_novo = false, s_l_de_novo_manter = false;
+static bool             s_l_discos = false, s_l_lixo = false;
+static uint64_t         s_l_bytes = 0;
+static char             s_l_pasta[TAB5_ARQ_CAMINHO_MAX];
+static int              s_l_n = 0, s_l_achados = 0;
+static disco_t          s_l_discos_v[TAB5_VOL_N];
+static int              s_l_n_discos = 0;
+static char             s_l_musica[TAB5_ARQ_CAMINHO_MAX];
 
 static void trabalho_listar(void*)
 {
-  tab5_sd_gravar_pendentes();   // tamanhos e arquivos novos: o que ja foi entregue ao gravador
-  listar_em(s_carga, s_l_pastas ? TAB5_SD_APPS : s_l_pasta, s_l_pastas);
+  // A pasta de musica do cartao: para o "Copiar para Musica" saber o destino
+  // (e nao aparecer dentro dela).
+  if (!tab5_musica_pasta(s_l_musica, sizeof(s_l_musica))) { s_l_musica[0] = '\0'; }
+  if (s_l_discos) {
+    tab5_vol_t v[TAB5_VOL_N];
+    s_l_n_discos = tab5_volumes_listar(v, TAB5_VOL_N);
+    for (int i = 0; i < s_l_n_discos; ++i) {
+      disco_t& dk = s_l_discos_v[i];
+      dk.v = v[i];
+      dk.total = dk.livre = 0;
+      dk.lixeira = 0;
+      dk.lixeira_bytes = 0;
+      if (v[i].disponivel) {
+        tab5_volume_espaco(v[i].raiz, &dk.total, &dk.livre);
+        // Limpeza automatica (se ligada) e o aviso de lixeira grande: do servico.
+        tab5_arq_lixeira_manter(v[i].raiz);
+        dk.lixeira = tab5_arq_lixeira_itens(v[i].raiz);
+        if (dk.lixeira > 0) {
+          tab5_arq_lixo_t um;   // so o peso total interessa
+          tab5_arq_lixeira_listar(v[i].raiz, &um, 1, &dk.lixeira_bytes);
+        }
+      }
+    }
+    s_l_n = 0;
+    s_l_achados = 0;
+  } else if (s_l_lixo) {
+    s_l_n = tab5_arq_lixeira_listar(s_l_pasta, s_lixo_carga, MAX_ITENS, &s_l_bytes);
+    s_l_achados = s_l_n;
+  } else {
+    int total = 0;
+    const int n = tab5_arq_listar(s_l_pasta, s_carga, MAX_ITENS, &total, TAB5_ARQ_ORDEM_NOME, nullptr);
+    s_l_n = n < 0 ? -1 : n;
+    s_l_achados = total;
+  }
   s_l_pronto = true;
 }
 
-// Pede a listagem do nivel atual. 'manter_posicao': voltar do conteudo para a
-// mesma pasta nao deve jogar a lista para o topo.
-static void pedir_listagem(bool pastas, bool manter_posicao)
+static void pedir_listagem(bool manter_posicao)
 {
   if (s_listando) {   // uma por vez: a ultima vontade vale
-    s_l_de_novo = true; s_l_de_novo_pastas = pastas; s_l_de_novo_manter = manter_posicao;
+    s_l_de_novo = true; s_l_de_novo_manter = manter_posicao;
     return;
   }
   if (!manter_posicao) { s_n_itens = s_n_achados = 0; lista_itens_mudaram(&s_lista, 0); }
-  s_l_pastas = pastas;
   s_l_manter = manter_posicao;
-  caminho_pasta(s_l_pasta, sizeof(s_l_pasta));
+  s_l_discos = (s_nivel == NIVEL_DISCOS);
+  s_l_lixo = (s_nivel == NIVEL_LIXEIRA);
+  snprintf(s_l_pasta, sizeof(s_l_pasta), "%s", s_pasta);
   s_l_pronto = false;
   s_listando = sistema_trabalho(trabalho_listar, nullptr);
 }
 
-static void listar_pastas(bool manter_posicao = false)   { pedir_listagem(true, manter_posicao); }
-static void listar_arquivos(bool manter_posicao = false) { pedir_listagem(false, manter_posicao); }
+static void sair_da_selecao(void)
+{
+  s_selecionando = false;
+  s_n_sel = 0;
+  memset(s_sel, 0, sizeof(s_sel));
+}
 
-// No ao_aviso: o resultado entra na tela.
+// Vai para a pasta 'c' ("" = os discos).
+static void navegar(const char* c)
+{
+  sair_da_selecao();
+  s_msg[0] = '\0';
+  if (!c || !c[0]) {
+    s_nivel = NIVEL_DISCOS;
+    s_pasta[0] = '\0';
+  } else {
+    s_nivel = NIVEL_PASTA;
+    snprintf(s_pasta, sizeof(s_pasta), "%s", c);
+  }
+  s_gravavel = s_nivel == NIVEL_PASTA && tab5_arq_gravavel(s_pasta);
+  pedir_listagem(false);
+  sistema_pedir_redesenho_completo();
+}
+
+// Abre a lixeira do disco de 'raiz'.
+static void navegar_lixeira(const char* raiz)
+{
+  if (!s_lixo) { s_lixo = (tab5_arq_lixo_t*)heap_caps_calloc(MAX_ITENS, sizeof(tab5_arq_lixo_t), MALLOC_CAP_SPIRAM); }
+  if (!s_lixo_carga) { s_lixo_carga = (tab5_arq_lixo_t*)heap_caps_calloc(MAX_ITENS, sizeof(tab5_arq_lixo_t), MALLOC_CAP_SPIRAM); }
+  if (!s_lixo || !s_lixo_carga) { mensagem(tr("Sem memória para abrir a lixeira."), true); return; }
+  sair_da_selecao();
+  s_msg[0] = '\0';
+  s_nivel = NIVEL_LIXEIRA;
+  snprintf(s_pasta, sizeof(s_pasta), "%s", raiz);   // a raiz do disco (o AVISO_VOLUMES confere por ela)
+  s_gravavel = false;
+  s_lixo_bytes = 0;
+  pedir_listagem(false);
+  sistema_pedir_redesenho_completo();
+}
+
 static void listagem_chegou(void)
 {
   s_l_pronto = false;
   s_listando = false;
-  item_t* t = s_itens; s_itens = s_carga; s_carga = t;
-  s_n_itens = s_l_n;
-  s_n_achados = s_l_achados;
-  if (s_l_pastas) { s_total = s_l_total; s_livre = s_l_livre; }
+  snprintf(s_musica_raiz, sizeof(s_musica_raiz), "%s", s_l_musica);
+  if (s_l_discos) {
+    memcpy(s_discos, s_l_discos_v, sizeof(s_discos));
+    s_n_discos = s_l_n_discos;
+    s_n_itens = s_n_discos;
+    s_n_achados = s_n_discos;
+  } else if (s_l_lixo) {
+    // So vale se ainda estamos na lixeira DAQUELE disco (a pessoa pode ter voltado).
+    if (s_nivel == NIVEL_LIXEIRA && !strcmp(s_l_pasta, s_pasta)) {
+      tab5_arq_lixo_t* t = s_lixo; s_lixo = s_lixo_carga; s_lixo_carga = t;
+      s_n_itens = s_n_achados = s_l_n;
+      s_lixo_bytes = s_l_bytes;
+      if (s_selecionando) { sair_da_selecao(); }   // os indices mudaram
+    }
+  } else if (s_l_n < 0) {
+    // A pasta sumiu (pendrive saiu, cartao foi para o computador): os discos.
+    s_n_itens = s_n_achados = 0;
+    if (s_nivel == NIVEL_PASTA && !strcmp(s_l_pasta, s_pasta)) {
+      navegar("");
+      mensagem(tr("A pasta não está mais disponível."), true);
+      return;
+    }
+  } else {
+    tab5_arq_item_t* t = s_itens; s_itens = s_carga; s_carga = t;
+    s_n_itens = s_l_n;
+    s_n_achados = s_l_achados;
+    s_tem_musica = false;
+    for (int i = 0; i < s_n_itens; ++i) { if (s_itens[i].tipo == TAB5_ARQ_MUSICA) { s_tem_musica = true; break; } }
+    if (s_selecionando) { sair_da_selecao(); }   // os indices mudaram
+  }
   lista_itens_mudaram(&s_lista, s_n_itens);
   if (!s_l_manter) { lista_ao_inicio(&s_lista); }
   if (s_l_de_novo) {
     s_l_de_novo = false;
-    pedir_listagem(s_l_de_novo_pastas, s_l_de_novo_manter);
+    pedir_listagem(s_l_de_novo_manter);
   }
   sistema_pedir_redesenho_completo();
 }
 
-#define PAG_OFF 256
-static long s_off[PAG_OFF];
+// ---------------------------------------------------------------------------
+// AS ACOES NO WORKER (tocam no disco: nunca na interface)
+// ---------------------------------------------------------------------------
+typedef enum {
+  OP_APAGAR, OP_RENOMEAR, OP_CRIAR, OP_COLAR, OP_EJETAR, OP_PARA_MUSICA,
+  OP_TOCAR, OP_INSTALAR, OP_ESVAZIAR, OP_RELER_BERRY, OP_RELER,
+  OP_LIXO_RESTAURAR, OP_LIXO_EXCLUIR,
+} op_t;
+EXT_RAM_BSS_ATTR static char s_op_itens[TAB5_ARQ_ITENS_MAX][TAB5_ARQ_CAMINHO_MAX];
+static struct {
+  op_t  op;
+  int   n;                                   // itens em s_op_itens
+  char  pasta[TAB5_ARQ_CAMINHO_MAX];
+  char  nome[TAB5_ARQ_NOME_MAX];
+  // resultado
+  char  msg[96];
+  bool  erro;
+  bool  reler;          // listar de novo a pasta
+  bool  abrir_musica;   // abrir o app Musica (tocou)
+  bool  instalou;       // comecou a copia de um app Berry
+} s_op;
+static volatile bool s_op_rodando = false;
+static volatile bool s_op_pronto = false;
 
-// PASSO DA TABELA: quantas paginas cada casa cobre.
-//
-// Era uma casa por pagina, o que cobria as 256 primeiras e deixava o resto no
-// caminho lento - pular linha a linha desde o inicio. Num energia.csv de uma
-// semana (~700 paginas) ir ao FIM lia o arquivo inteiro, e o botao "FIM" seria
-// uma promessa que o app nao cumpre.
-//
-// Com passo, as mesmas 256 casas cobrem QUALQUER tamanho: a casa k guarda o
-// inicio da pagina k*passo, e chegar numa pagina qualquer custa no maximo
-// (passo-1) paginas de leitura sequencial. O custo vira limitado em vez de
-// proporcional ao arquivo.
-static int  s_passo_off = 1;
-
-static void esquecer_offsets(void)
+static void resultado(tab5_arq_erro_t r, const char* ok_txt)
 {
-  for (int i = 0; i < PAG_OFF; ++i) { s_off[i] = -1; }
-  s_off[0] = 0;                 // a primeira pagina comeca no byte zero
-  s_passo_off = 1;
+  s_op.erro = r != TAB5_ARQ_OK;
+  snprintf(s_op.msg, sizeof(s_op.msg), "%s", r == TAB5_ARQ_OK ? ok_txt : tr(tab5_arq_erro_texto(r)));
 }
 
-// Conta as linhas do arquivo. Feito UMA vez ao abrir, nao a cada pagina.
-static void contar_linhas(void)
+// Para onde um item da lixeira volta, como TEXTO para mostrar: a pasta de
+// origem sem a raiz do disco ("/Fotos/2026"), ou o nome do disco quando a
+// origem e a raiz, e desconhecida ou fora dele. 'conferir' = a mesma regra do
+// servico (pasta que nao aceita gravar -> raiz do disco); so texto, sem disco.
+static void lixo_destino(const char* raiz, const char* origem, bool conferir, char* out, size_t tam)
 {
-  s_c_total = 0;
-  FILE* f = fopen(s_c_caminho, "r");
-  if (!f) { return; }
+  snprintf(out, tam, "%s", tr(tab5_volume_tipo(raiz)));
+  const size_t lr = strlen(raiz);
+  if (strncmp(origem, raiz, lr) != 0 || origem[lr] != '/') { return; }
+  char pai[TAB5_ARQ_CAMINHO_MAX];
+  snprintf(pai, sizeof(pai), "%s", origem);
+  if (char* b = strrchr(pai, '/')) { *b = '\0'; }
+  if (strlen(pai) <= lr) { return; }
+  if (conferir && !tab5_arq_gravavel(pai)) { return; }
+  snprintf(out, tam, "%s", pai + lr);
+}
 
-  // Em BLOCO, nao byte a byte. O fgetc() num arquivo de 1MB sao um milhao de
-  // chamadas; com blocos de 1KB sao mil leituras e um memchr por bloco.
-  //
-  // Roda no worker do sistema (trabalho_ler). Cede a CPU de tempos em
-  // tempos, e SAI se o app fechou (sistema_trabalho_cancelado): fechar o app
-  // espera este trabalho, e um log de varios MB seguraria a interface ate o
-  // fim da varredura.
-  // DUAS PASSADAS SOBRE O MESMO ARQUIVO SERIAM UMA A MAIS.
-  //
-  // Esta varredura ja le tudo para contar as linhas. Entao ela tambem ANOTA os
-  // deslocamentos - o indice sai de graca, junto da contagem que ja acontecia.
-  // Montar o indice depois, sob demanda, deixaria o primeiro "FIM" caro; assim
-  // ele nasce pronto.
-  //
-  // O passo so pode ser calculado no fim (depende do total), entao a primeira
-  // passada anota TODAS as fronteiras de pagina que couberem e a correcao vem
-  // depois. Para arquivo de ate 256 paginas isso ja e o indice final.
-  static long fronteira[PAG_OFF];
-  int n_fronteiras = 0;
-  fronteira[n_fronteiras++] = 0;
-
-  static char bloco[1024];
-  size_t lidos;
-  int voltas = 0;
-  long pos = 0;
-  char ultimo = '\n';
-  while ((lidos = fread(bloco, 1, sizeof(bloco), f)) > 0) {
-    ultimo = bloco[lidos - 1];
-    const char* p = bloco;
-    const char* fim = bloco + lidos;
-    while ((p = (const char*)memchr(p, '\n', (size_t)(fim - p))) != NULL) {
-      s_c_total++;
-      p++;
-      // Fronteira de pagina: o byte seguinte a esta quebra inicia a proxima.
-      if ((s_c_total % BLOCO_LINHAS) == 0 && n_fronteiras < PAG_OFF) {
-        fronteira[n_fronteiras++] = pos + (long)(p - bloco);
+static void trabalho_op(void*)
+{
+  s_op.msg[0] = '\0';
+  s_op.erro = false;
+  s_op.reler = false;
+  s_op.abrir_musica = false;
+  s_op.instalou = false;
+  switch (s_op.op) {
+    case OP_APAGAR: {
+      int foram = 0;
+      tab5_arq_erro_t r = TAB5_ARQ_OK;
+      for (int i = 0; i < s_op.n; ++i) {
+        const tab5_arq_erro_t e = tab5_arq_apagar(s_op_itens[i]);
+        if (e == TAB5_ARQ_OK) { ++foram; } else { r = e; }
       }
+      if (r == TAB5_ARQ_OK) { snprintf(s_op.msg, sizeof(s_op.msg), tr("%d item(s) na lixeira."), foram); }
+      else { snprintf(s_op.msg, sizeof(s_op.msg), tr("%d na lixeira; os outros: %s"), foram, tr(tab5_arq_erro_texto(r))); s_op.erro = true; }
+      s_op.reler = true;
+      break;
     }
-    pos += (long)lidos;
-    if ((++voltas % 64) == 0) {
-      if (sistema_trabalho_cancelado()) { fclose(f); s_c_total = 0; return; }
-      vTaskDelay(1);
+    case OP_RENOMEAR:
+      resultado(tab5_arq_renomear(s_op_itens[0], s_op.nome), tr("Renomeado."));
+      s_op.reler = true;
+      break;
+    case OP_CRIAR:
+      resultado(tab5_arq_criar_pasta(s_op.pasta, s_op.nome), tr("Pasta criada."));
+      s_op.reler = true;
+      break;
+    case OP_COLAR:
+      resultado(tab5_arq_colar(s_op.pasta), tr("Colando..."));
+      break;
+    case OP_EJETAR:
+      switch (tab5_volume_ejetar(TAB5_VOL_PENDRIVE_RAIZ, 3000)) {
+        case TAB5_VOL_EJETADO:       snprintf(s_op.msg, sizeof(s_op.msg), tr("Pode tirar o pendrive.")); break;
+        case TAB5_VOL_EJETAR_EM_USO: snprintf(s_op.msg, sizeof(s_op.msg), tr("O pendrive está em uso (cópia ou música).")); s_op.erro = true; break;
+        default:                     snprintf(s_op.msg, sizeof(s_op.msg), tr("Não há pendrive para ejetar.")); s_op.erro = true; break;
+      }
+      s_op.reler = true;
+      break;
+    case OP_PARA_MUSICA: {
+      char destino[TAB5_ARQ_CAMINHO_MAX];
+      if (!tab5_musica_pasta(destino, sizeof(destino))) { resultado(TAB5_ARQ_ERRO_DISCO, ""); break; }
+      const char* ptrs[TAB5_ARQ_ITENS_MAX];
+      for (int i = 0; i < s_op.n; ++i) { ptrs[i] = s_op_itens[i]; }
+      resultado(tab5_arq_copiar(ptrs, s_op.n, destino, false), tr("Copiando para a Música..."));
+      break;
     }
+    case OP_TOCAR: {
+      // O tocador toca a PASTA a partir de um item da lista dele: acha o indice.
+      tab5_musica_item_t* lista = (tab5_musica_item_t*)heap_caps_malloc(sizeof(tab5_musica_item_t) * MAX_ITENS, MALLOC_CAP_SPIRAM);
+      const int n = lista ? tab5_musica_listar(s_op.pasta, lista, MAX_ITENS, nullptr) : -1;
+      int idx = -1;
+      for (int i = 0; i < n; ++i) { if (!lista[i].pasta && !strcmp(lista[i].nome, s_op.nome)) { idx = i; break; } }
+      heap_caps_free(lista);
+      if (idx >= 0 && tab5_musica_tocar(s_op.pasta, idx, "Música")) { s_op.abrir_musica = true; }
+      else { snprintf(s_op.msg, sizeof(s_op.msg), tr("Não consegui tocar esta música.")); s_op.erro = true; }
+      break;
+    }
+    case OP_INSTALAR: {
+      const char* o = s_op_itens[0];
+      resultado(tab5_arq_copiar(&o, 1, TAB5_SD_APPS "/Berry", false), "Instalando o app...");
+      s_op.instalou = !s_op.erro;
+      break;
+    }
+    case OP_ESVAZIAR:
+      resultado(tab5_arq_esvaziar_lixeira(s_op.pasta), tr("Esvaziando a lixeira..."));
+      break;
+    case OP_LIXO_RESTAURAR:
+    case OP_LIXO_EXCLUIR: {
+      const bool restaurar = s_op.op == OP_LIXO_RESTAURAR;
+      int foram = 0;
+      tab5_arq_erro_t r = TAB5_ARQ_OK;
+      char destino[96] = "";
+      for (int i = 0; i < s_op.n; ++i) {
+        const tab5_arq_lixo_t& it = s_lixo_alvo[i];
+        const tab5_arq_erro_t e = restaurar ? tab5_arq_lixeira_restaurar(s_op.pasta, it.nome)
+                                            : tab5_arq_lixeira_excluir(s_op.pasta, it.nome);
+        if (e != TAB5_ARQ_OK) { r = e; continue; }
+        if (++foram == 1) { lixo_destino(s_op.pasta, it.origem, true, destino, sizeof(destino)); }
+      }
+      if (r == TAB5_ARQ_OK) {
+        if (restaurar && foram == 1) { snprintf(s_op.msg, sizeof(s_op.msg), tr("Voltou para %s"), destino); }
+        else if (restaurar)          { snprintf(s_op.msg, sizeof(s_op.msg), tr("%d item(s) restaurados."), foram); }
+        else                         { snprintf(s_op.msg, sizeof(s_op.msg), tr("%d item(s) excluídos."), foram); }
+      } else if (foram == 0) {
+        snprintf(s_op.msg, sizeof(s_op.msg), "%s", tr(tab5_arq_erro_texto(r)));
+        s_op.erro = true;
+      } else {
+        snprintf(s_op.msg, sizeof(s_op.msg), restaurar ? tr("%d restaurados; os outros: %s") : tr("%d excluídos; os outros: %s"),
+                 foram, tr(tab5_arq_erro_texto(r)));
+        s_op.erro = true;
+      }
+      s_op.reler = true;
+      break;
+    }
+    case OP_RELER_BERRY:
+      sistema_apps_de_fora_reler();
+      snprintf(s_op.msg, sizeof(s_op.msg), tr("App instalado: o ícone está na tela inicial."));
+      break;
+    case OP_RELER:
+      sistema_apps_de_fora_reler();
+      break;
   }
-  fclose(f);
-  if (ultimo != '\n') { s_c_total++; }   // a ultima linha sem quebra tambem e linha
-
-  // Passo: quantas paginas cada casa cobre, para as PAG_OFF casas alcancarem
-  // o arquivo inteiro. Arquivo pequeno fica com passo 1 e indice exato.
-  const int paginas = (s_c_total > 0) ? (s_c_total + BLOCO_LINHAS - 1) / BLOCO_LINHAS : 1;
-  s_passo_off = (paginas + PAG_OFF - 1) / PAG_OFF;
-  if (s_passo_off < 1) { s_passo_off = 1; }
-
-  for (int k = 0; k < PAG_OFF; ++k) {
-    const int pag = k * s_passo_off;
-    s_off[k] = (pag < n_fronteiras) ? fronteira[pag] : -1;
-  }
+  // Mexeu em arquivo: os apps de fora (os .be de apps/Berry) podem ter mudado
+  // - apagado, renomeado, colado. A releitura so troca os icones se a lista
+  // mudou de fato (e na variante sem Berry nao faz nada).
+  if (s_op.op == OP_APAGAR || s_op.op == OP_RENOMEAR) { sistema_apps_de_fora_reler(); }
+  s_op_pronto = true;
 }
 
-// UMA LINHA INTEIRA do arquivo, ate o '\n' - o que passar de 'n' e lido e
-// descartado. O fgets(256) de antes partia uma linha longa em varias, e as
-// partes contavam como linhas: o "pular ate a linha L" errava para a frente e
-// a contagem (que conta '\n') nao batia com o que se via. false = fim.
-static bool ler_linha(FILE* f, char* buf, size_t n, bool* cortada)
+// s_op e s_op_itens sao do worker enquanto uma acao roda: quem vai preencher
+// pergunta antes.
+static bool op_livre(void)
 {
-  size_t k = 0;
-  bool leu = false;
-  *cortada = false;
-  int c;
-  while ((c = getc(f)) != EOF) {
-    leu = true;
-    if (c == '\n') { break; }
-    if (k + 1 < n) { buf[k++] = (char)c; } else { *cortada = true; }
-  }
-  if (n) { buf[k] = 0; }
-  return leu;
+  if (s_op_rodando) { mensagem(tr("Aguarde a ação anterior terminar."), true); return false; }
+  return true;
 }
 
-// O CSV quebra no campo: um espaco depois de cada separador (que nao tenha),
-// porque o quebrador de linha so quebra em espaco. Sem isto uma linha de CSV
-// e uma "palavra" so, cortada por caractere no meio de um numero.
-static void espacar_csv(const char* de, char* para, size_t n)
+static bool pedir_op(op_t op)
 {
-  size_t k = 0;
-  for (const char* p = de; *p && k + 1 < n; ++p) {
-    para[k++] = *p;
-    if ((*p == ',' || *p == ';') && p[1] != ' ' && p[1] != 0 && k + 1 < n) { para[k++] = ' '; }
-  }
-  para[k] = 0;
+  if (s_op_rodando) { mensagem(tr("Aguarde a ação anterior terminar."), true); return false; }
+  s_op.op = op;
+  s_op_pronto = false;
+  s_op_rodando = sistema_trabalho(trabalho_op, nullptr);
+  if (!s_op_rodando) { mensagem(tr("O sistema está ocupado; tente de novo."), true); }
+  return s_op_rodando;
 }
 
-// Carrega LER_LINHAS linhas a partir da linha s_c_linha. Vem mais do que cabe
-// de proposito: quantas cabem so o desenho sabe (depende da quebra).
-static void ler_pagina(void)
+static void op_chegou(void)
 {
-  s_c_n = 0;
-  const char* caminho = s_c_caminho;
-
-  FILE* f = fopen(caminho, "r");
-  if (!f) {
-    // Distinguir isto de "arquivo vazio" importa: os dois davam a MESMA tela em
-    // branco, e um deles e um arquivo de zero byte enquanto o outro e caminho
-    // errado, cartao desmontado ou nome que o FAT nao aceita. Sem separar, nao
-    // ha como saber qual dos dois voce esta olhando.
-    s_c_abriu = false;
-    ESP_LOGW(TAG, "nao consegui abrir '%s'", caminho);
-    return;
+  s_op_pronto = false;
+  s_op_rodando = false;
+  if (s_op.msg[0]) { mensagem(s_op.msg, s_op.erro); }
+  if (s_op.instalou) { s_instalando_be = true; }
+  if (s_op.abrir_musica) { sistema_abrir_app("Música"); }
+  if (s_op.reler) {
+    if (s_op.op == OP_EJETAR && s_nivel != NIVEL_DISCOS) { navegar(""); mensagem(s_op.msg, s_op.erro); }
+    else { pedir_listagem(true); }
   }
-  s_c_abriu = true;
-  // Buffer do stdio maior que os 128 bytes padrao: o getc() de linha a linha
-  // nao vira um read() do cartao a cada 128 bytes.
-  setvbuf(f, nullptr, _IOFBF, 4096);
-  const bool csv = tem_sufixo(s_c_caminho, ".csv");
-
-  // Casa do indice mais proxima ANTES da linha pedida, e o resto lido em
-  // sequencia (no maximo BLOCO_LINHAS * passo linhas).
-  const int bloco = s_c_linha / BLOCO_LINHAS;
-  const int casa = bloco / s_passo_off;
-  int pular;
-  if (casa < PAG_OFF && s_off[casa] >= 0) {
-    fseek(f, s_off[casa], SEEK_SET);
-    pular = s_c_linha - casa * s_passo_off * BLOCO_LINHAS;
-  } else {
-    pular = s_c_linha;   // sem indice: do inicio
-  }
-
-  static char linha[LARG_LINHA + 1];
-  bool cortada;
-  {
-    int voltas = 0;
-    while (pular > 0 && ler_linha(f, linha, sizeof(linha), &cortada)) {
-      pular--;
-      if ((++voltas % 256) == 0) { vTaskDelay(1); }   // nao segurar o core
-    }
-  }
-
-  while (s_c_n < LER_LINHAS && ler_linha(f, linha, sizeof(linha), &cortada)) {
-    const size_t k = strlen(linha);
-    if (k && linha[k - 1] == '\r') { linha[k - 1] = 0; }
-    char* dst = s_c_linhas[s_c_n];
-    if (csv) { espacar_csv(linha, dst, LARG_LINHA + 1); }
-    else     { snprintf(dst, LARG_LINHA + 1, "%s", linha); }
-    if (cortada) {
-      // Linha maior que o buffer: o fim avisa que tem mais (sem partir UTF-8).
-      size_t m = strlen(dst);
-      if (m > LARG_LINHA - 4) { m = LARG_LINHA - 4; }
-      while (m > 0 && ((unsigned char)dst[m] & 0xC0) == 0x80) { --m; }
-      memcpy(dst + m, " ...", 5);
-    }
-    s_c_n++;
-  }
-
-  fclose(f);
 }
 
-// Roda NO WORKER.
+// ---------------------------------------------------------------------------
+// LEITURA DE TEXTO NO WORKER
+// ---------------------------------------------------------------------------
+// Contar as linhas e ler uma pagina no worker, SO com o estado abaixo (s_c_*)
+// e o texto aberto (s_texto); a interface copia o resultado no ao_aviso.
+// Caminho e pagina sao FOTOGRAFADOS no pedido.
+static char          s_c_caminho[TAB5_ARQ_CAMINHO_MAX + TAB5_ARQ_NOME_MAX];
+static int           s_c_linha = 0;
+static bool          s_c_contar = false;
+static int           s_c_total = 0;
+EXT_RAM_BSS_ATTR static char s_c_linhas[LER_LINHAS][LARG_LINHA + 1];
+static int           s_c_n = 0;
+static bool          s_c_abriu = true;
+static volatile bool s_c_pronto = false;
+static bool          s_c_ocupado = false;
+static bool          s_c_de_novo = false;
+static bool          s_c_contar_de_novo = false;
+static bool          s_precisa_ler = false;
+
+// O texto aberto (indice de linhas): quem monta e le e o servico tab5_texto.
+// Nasce e e trocado no worker (ao abrir um arquivo); a interface so fecha com o worker livre.
+static tab5_texto_t* s_texto = nullptr;
+
 static void trabalho_ler(void*)
 {
-  tab5_sd_gravar_pendentes();   // o que o gravador ainda nao escreveu tem que aparecer aqui
-  if (s_c_contar) { esquecer_offsets(); contar_linhas(); }
-  ler_pagina();
+  // Abrir (contar) monta o indice; ler pega as linhas da pagina. Cada chamada
+  // do servico segura o disco (cartao ou pendrive) so enquanto le.
+  if (s_c_contar) {
+    tab5_texto_fechar(s_texto);
+    s_texto = tab5_texto_abrir(s_c_caminho, sistema_trabalho_cancelado);
+    s_c_total = tab5_texto_linhas(s_texto);
+  }
+  const int n = s_texto ? tab5_texto_ler(s_texto, s_c_linha, LER_LINHAS, &s_c_linhas[0][0], LARG_LINHA + 1) : -1;
+  s_c_abriu = (n >= 0);
+  s_c_n = s_c_abriu ? n : 0;
   s_c_pronto = true;
 }
 
-// Na interface: fotografa o pedido e entrega ao worker.
 static void pedir_leitura(bool contar)
 {
   if (s_c_ocupado) {
@@ -576,161 +647,132 @@ static void pedir_leitura(bool contar)
   s_c_contar  = contar;
   s_c_pronto  = false;
   s_c_ocupado = sistema_trabalho(trabalho_ler, nullptr);
-  if (!s_c_ocupado) { s_precisa_ler = true; }   // queue cheia: tenta na proxima passada
+  if (!s_c_ocupado) { s_precisa_ler = true; }
 }
 
-// Na interface: a leitura terminou -> copia o que ela trouxe.
-// ---- imagem lida pelo WORKER -----------------------------------------------
-// Ler a foto do cartao dentro do desenhar() segurava a interface: 1,4 MB de
-// SD linha a linha, com uma pausa a cada 8 linhas - medido, 2,3 s de tela
-// parada ao abrir uma foto, e de novo a cada redesenho completo (a foto era
-// relida do cartao toda vez). Agora o worker le UMA vez, para um buffer na
-// PSRAM ja na ordem da tela, e o desenhar() so pinta o buffer.
+// ---------------------------------------------------------------------------
+// IMAGEM NO WORKER
+// ---------------------------------------------------------------------------
+// Quem le e decodifica e o servico de imagem (services/tab5_imagem): JPEG, PNG,
+// BMP, QOI e GIF, de qualquer tamanho de arquivo. O worker pede que ele desenhe
+// a imagem inteira, ja na escala que cabe, no sprite do tamanho da caixa.
 //
-// O buffer e do app (trabalho comum, nao solto): fechar o app espera o
-// worker, e so entao o ao_fechar() o libera.
-static uint16_t*     s_img_px = nullptr;        // a imagem JA NA ESCALA da tela, de cima para baixo
-static uint32_t      s_img_px_l = 0, s_img_px_a = 0;   // tamanho de s_img_px
-static char          s_img_px_caminho[192] = "";
-static volatile bool s_img_lendo = false;       // o worker esta com o buffer
-static volatile bool s_img_lida = false;        // o worker terminou (bem ou mal)
+// GIF ANIMADO: o worker abre o GIF (s_gif) e decodifica UM quadro por pedido,
+// sempre no mesmo sprite. O app repinta quando o quadro chega e, passado o
+// atraso dele (periodo_agora), pede o seguinte. Nada e decodificado na interface.
+static M5Canvas*     s_img_spr = nullptr;       // a caixa inteira, desenhada pelo worker
+static uint32_t      s_img_px_l = 0, s_img_px_a = 0;   // tamanho do sprite
+static char          s_img_px_caminho[TAB5_ARQ_CAMINHO_MAX + TAB5_ARQ_NOME_MAX] = "";
+static volatile bool s_img_lendo = false;
+static volatile bool s_img_lida = false;
 static volatile bool s_img_lida_ok = false;
+static tab5_gif_t*   s_gif = nullptr;           // o GIF aberto: o worker abre, a interface fecha com o worker livre
+static volatile int  s_gif_atraso = 0;          // atraso do ultimo quadro (ms)
+static volatile bool s_gif_anima = false;       // o GIF aberto tem mais de um quadro
+static int64_t       s_gif_pedido_us = 0;       // quando o quadro em andamento foi pedido
+static int64_t       s_gif_devido_us = 0;       // quando o proximo quadro deve ser pedido
 
-// A IMAGEM INTEIRA, NA PROPORCAO DA TELA. A foto do Camera tem 1200x1600 e a
-// area do app ~700x1000: em tamanho real, so um pedaco aparecia. Aqui a escala
-// e a MAIOR que faz a imagem caber inteira (largura e altura), nunca acima de
-// 1: imagem menor que a area fica no tamanho dela - aumentar so borraria.
-//
-// REDUZ LENDO, sem a foto inteira na memoria: o arquivo e lido UMA vez, em
-// sequencia (um fseek so - ler para tras estourou o watchdog uma vez), e cada
-// linha de saida e feita da linha de origem correspondente com a de baixo,
-// cada pixel a media de 2x2 vizinhos - o bastante para nao serrilhar numa
-// reducao de ~0,6x. So tres linhas da origem existem ao mesmo tempo.
-// BMP guarda de BAIXO para CIMA: a primeira linha lida e a ultima da tela.
-static inline uint16_t media4(uint16_t a, uint16_t b, uint16_t c, uint16_t d)
+// Um quadro do GIF (abre o arquivo na primeira vez). false = nao abriu como GIF
+// ou o quadro falhou.
+static bool ler_quadro_gif(void)
 {
-  const uint32_t r  = ((a >> 11) + (b >> 11) + (c >> 11) + (d >> 11) + 2) >> 2;
-  const uint32_t g  = (((a >> 5) & 0x3F) + ((b >> 5) & 0x3F) + ((c >> 5) & 0x3F) + ((d >> 5) & 0x3F) + 2) >> 2;
-  const uint32_t bl = ((a & 0x1F) + (b & 0x1F) + (c & 0x1F) + (d & 0x1F) + 2) >> 2;
-  return (uint16_t)((r << 11) | (g << 5) | bl);
-}
-
-// LEITURA EM BLOCOS GRANDES, SEM O FILE* DO STDIO. Com fread, a foto de
-// 3,8 MB levava ~10 s: o FILE* do newlib tem buffer de 128 bytes
-// (CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0), entao cada linha virava dezenas de
-// read() de 128 bytes e o FatFs buscava o cartao SETOR A SETOR - milhares de
-// comandos de 512 bytes, cada um com o custo fixo do protocolo do SD.
-// Aqui o read() pede 64 KB de uma vez, sempre de uma posicao do arquivo
-// alinhada a setor e para um buffer alinhado a linha de cache: o FatFs entrega
-// os setores inteiros direto no buffer e o SDMMC le varios setores por
-// comando, por DMA, sem passar por buffer intermediario.
-#define IMG_BLOCO       (64 * 1024)   // multiplo de 512 (setor)
-#define IMG_ALINHAMENTO 128           // linha de cache L2 (CONFIG_CACHE_L2_CACHE_LINE_128B)
-
-typedef struct {
-  int      fd;
-  uint8_t* buf;
-  size_t   n;     // bytes validos no buffer
-  size_t   pos;   // proximo byte a entregar
-} leitor_img_t;
-
-// Entrega 'qtd' bytes em 'destino' (ou so pula, se destino == nullptr),
-// buscando novos blocos do cartao quando o atual acaba.
-static bool leitor_img_pegar(leitor_img_t& r, uint8_t* destino, size_t qtd)
-{
-  while (qtd > 0) {
-    if (r.pos >= r.n) {
-      const ssize_t lidos = read(r.fd, r.buf, IMG_BLOCO);
-      if (lidos <= 0) { return false; }
-      r.n = (size_t)lidos;
-      r.pos = 0;
-    }
-    size_t parte = r.n - r.pos;
-    if (parte > qtd) { parte = qtd; }
-    if (destino) { memcpy(destino, r.buf + r.pos, parte); destino += parte; }
-    r.pos += parte;
-    qtd   -= parte;
+  if (!s_gif) {
+    s_gif = tab5_gif_abrir(s_img_px_caminho);
+    if (!s_gif) { return false; }
+    s_img_largura = (uint32_t)tab5_gif_largura(s_gif);
+    s_img_altura  = (uint32_t)tab5_gif_altura(s_gif);
+    s_gif_anima   = tab5_gif_animado(s_gif);
   }
-  return true;
+  s_gif_atraso = tab5_gif_proximo(s_gif, s_img_spr);
+  return s_gif_atraso >= 0;
 }
 
 static void trabalho_ler_imagem(void*)
 {
   s_img_lida_ok = false;
   const int64_t t0 = esp_timer_get_time();
-  const uint32_t W = s_img_largura, H = s_img_altura;
-  const uint32_t L = s_img_px_l, A = s_img_px_a;
-  const bool reduz = (L < W || A < H);
-  uint16_t* atual = (uint16_t*)heap_caps_malloc((size_t)W * 2, MALLOC_CAP_SPIRAM);
-  uint16_t* baixo = (uint16_t*)heap_caps_malloc((size_t)W * 2, MALLOC_CAP_SPIRAM);   // a linha de origem logo abaixo
-  leitor_img_t r = { -1, nullptr, 0, 0 };
-  r.buf = (uint8_t*)heap_caps_aligned_alloc(IMG_ALINHAMENTO, IMG_BLOCO, MALLOC_CAP_SPIRAM);
-  if (atual && baixo && r.buf) { r.fd = open(s_img_px_caminho, O_RDONLY); }
-  int32_t o = (int32_t)A - 1;
-  bool ok = false;
-  if (r.fd >= 0) {
-    // Comeca no inicio do SETOR onde estao os pixels e descarta o pedaco do
-    // cabecalho: assim todo read() seguinte comeca alinhado a setor.
-    const off_t inicio = (off_t)s_img_offset_dados & ~(off_t)511;
-    ok = lseek(r.fd, inicio, SEEK_SET) == inicio &&
-         leitor_img_pegar(r, nullptr, (size_t)(s_img_offset_dados - inicio));
-    const size_t quer = (size_t)W * 2;
-    const size_t pulo = s_img_linha_bytes - quer;   // enchimento ate multiplo de 4
-    // Linhas de SAIDA de baixo para cima, acompanhando a leitura: a saida 'o'
-    // nasce da origem (o * H) / A.
-    for (uint32_t k = 0; ok && k < H && o >= 0; ++k) {
-      const uint32_t origem = H - 1 - k;            // linha de tela que acabou de ser lida
-      uint16_t* t = baixo; baixo = atual; atual = t;   // a anterior lida e a de baixo
-      if (!leitor_img_pegar(r, (uint8_t*)atual, quer) || !leitor_img_pegar(r, nullptr, pulo)) { ok = false; break; }
-      while (o >= 0 && ((uint32_t)o * H) / A == origem) {
-        uint16_t* destino = s_img_px + (size_t)o * L;
-        if (!reduz) {
-          memcpy(destino, atual, quer);
-        } else {
-          const uint16_t* de_baixo = (k > 0) ? baixo : atual;   // a ultima linha nao tem vizinha
-          for (uint32_t x = 0; x < L; ++x) {
-            const uint32_t sx  = (x * W) / L;
-            const uint32_t sx2 = (sx + 1 < W) ? sx + 1 : sx;
-            destino[x] = media4(atual[sx], atual[sx2], de_baixo[sx], de_baixo[sx2]);
-          }
-        }
-        --o;
-      }
-      if ((k & 31) == 0 && sistema_trabalho_cancelado()) { ok = false; break; }
-    }
-    close(r.fd);
+  if (s_gif || tab5_arq_extensao_e(s_img_px_caminho, ".gif")) { s_img_lida_ok = ler_quadro_gif(); }
+  if (!s_img_lida_ok && !s_gif) {
+    // Os outros formatos (e o ".gif" que nao e GIF: o servico reconhece pelo conteudo).
+    int l = 0, a = 0;
+    if (tab5_imagem_tamanho(s_img_px_caminho, &l, &a)) { s_img_largura = (uint32_t)l; s_img_altura = (uint32_t)a; }
+    s_img_lida_ok = tab5_imagem_desenhar(s_img_px_caminho, s_img_spr, sistema_trabalho_cancelado);
   }
-  s_img_lida_ok = ok && o < 0;
-  ESP_LOGI(TAG, "imagem %ux%u -> %ux%u lida em %d ms (ok=%d)", (unsigned)W, (unsigned)H,
-           (unsigned)L, (unsigned)A, (int)((esp_timer_get_time() - t0) / 1000), (int)s_img_lida_ok);
-  if (r.buf) { heap_caps_free(r.buf); }
-  if (atual) { heap_caps_free(atual); }
-  if (baixo) { heap_caps_free(baixo); }
+  ESP_LOGI(TAG, "imagem %s lida em %d ms (ok=%d)", s_img_px_caminho,
+           (int)((esp_timer_get_time() - t0) / 1000), (int)s_img_lida_ok);
   s_img_lida = true;
 }
 
 static void soltar_imagem(void)
 {
   if (s_img_lendo) { return; }   // o worker esta escrevendo nele: solta quando ele avisar
-  if (s_img_px) { heap_caps_free(s_img_px); s_img_px = nullptr; }
+  if (s_gif) { tab5_gif_fechar(s_gif); s_gif = nullptr; }   // so libera memoria (o disco ja foi solto)
+  s_gif_anima = false;
+  tab5_sprite_soltar(&s_img_spr);
   s_img_px_l = s_img_px_a = 0;
+  s_img_largura = s_img_altura = 0;
   s_img_px_caminho[0] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// AVISOS
+// ---------------------------------------------------------------------------
+static void job_mudou(void)
+{
+  tab5_arq_trabalho_t t;
+  tab5_arq_trabalho(&t);
+  const bool rodava = s_job_fase == TAB5_ARQ_CONTANDO || s_job_fase == TAB5_ARQ_COPIANDO || s_job_fase == TAB5_ARQ_APAGANDO;
+  const bool roda   = t.fase == TAB5_ARQ_CONTANDO || t.fase == TAB5_ARQ_COPIANDO || t.fase == TAB5_ARQ_APAGANDO;
+  s_job_fase = t.fase;
+  if (rodava && !roda) {
+    // Terminou: o que se ve pode ter mudado (destino e, num mover, a origem).
+    if (s_nivel != NIVEL_CONTEUDO) { pedir_listagem(true); }
+    // Copiar/mover para (ou de) apps/Berry muda os apps: rele. Calado, a
+    // nao ser na instalacao (que avisa "o icone esta na tela inicial").
+    const bool instalou = s_instalando_be && t.fase == TAB5_ARQ_FEITO;
+    s_instalando_be = false;
+    if (!s_op_rodando) { pedir_op(instalou ? OP_RELER_BERRY : OP_RELER); }
+  }
+  if (s_nivel != NIVEL_CONTEUDO) { sistema_pedir_redesenho_completo(); }
 }
 
 static void ao_aviso(uint32_t av)
 {
-  if ((av & AVISO_TRABALHO) && s_img_lendo && s_img_lida) {
-    s_img_lendo = false;
-    if (!s_img_lida_ok) { s_img_px_caminho[0] = '\0'; }   // le de novo se pedir
-    if (s_nivel == NIVEL_CONTEUDO && s_e_imagem) { sistema_pedir_redesenho_completo(); }
-    else                                         { soltar_imagem(); }   // ja saiu da foto
+  if (av & AVISO_ARQUIVOS) { job_mudou(); }
+  if (av & AVISO_VOLUMES) {
+    // Um disco entrou ou saiu. Na raiz, a lista dos discos muda; dentro de um
+    // disco que saiu, volta para a raiz.
+    if (s_nivel == NIVEL_DISCOS) { pedir_listagem(true); }
+    else if (!tab5_volume_disponivel(s_pasta)) {
+      if (s_nivel == NIVEL_CONTEUDO) { soltar_imagem(); }
+      navegar("");
+      mensagem(tr("O disco saiu."), true);
+    }
   }
-  if ((av & AVISO_TRABALHO) && s_l_pronto) { listagem_chegou(); }
-  if (!(av & AVISO_TRABALHO) || !s_c_pronto) { return; }
+  if (!(av & AVISO_TRABALHO)) { return; }
+  if (s_op_pronto) { op_chegou(); }
+  if (s_img_lendo && s_img_lida) {
+    s_img_lendo = false;
+    // Falhou: o caminho fica (e o desenho mostra o erro em vez de tentar de novo).
+    if (!s_img_lida_ok) { s_gif_anima = false; }
+    if (s_nivel != NIVEL_CONTEUDO || s_ver == VER_TEXTO) {
+      soltar_imagem();
+    } else if (s_gif && s_gif_anima && s_img_lida_ok && tab5_gif_quadros_vistos(s_gif) > 1) {
+      // Quadro novo do GIF: so repinta (nao e tela nova). O seguinte vem passado o atraso.
+      const int64_t agora = esp_timer_get_time();
+      s_gif_devido_us = s_gif_pedido_us + (int64_t)s_gif_atraso * 1000;
+      if (s_gif_devido_us < agora) { s_gif_devido_us = agora; }
+      sistema_pedir_redesenho();
+    } else {
+      s_gif_devido_us = esp_timer_get_time() + (int64_t)s_gif_atraso * 1000;
+      sistema_pedir_redesenho_completo();
+    }
+  }
+  if (s_l_pronto) { listagem_chegou(); }
+  if (!s_c_pronto) { return; }
   s_c_pronto  = false;
   s_c_ocupado = false;
-
-  char atual[192];
+  char atual[sizeof(s_c_caminho)];
   caminho_arquivo(atual, sizeof(atual));
   const bool mesmo_arquivo = (strcmp(atual, s_c_caminho) == 0) && s_nivel == NIVEL_CONTEUDO;
   if (mesmo_arquivo) {
@@ -739,7 +781,6 @@ static void ao_aviso(uint32_t av)
     s_n_linhas = s_c_n;
     s_abriu_ok = s_c_abriu;
   }
-  // Virou pagina (ou trocou de arquivo) durante a leitura: le de novo.
   if (s_c_de_novo || (mesmo_arquivo && s_c_linha != s_linha)) {
     const bool contar = s_c_contar_de_novo;
     s_c_de_novo = false;
@@ -749,228 +790,286 @@ static void ao_aviso(uint32_t av)
   if (mesmo_arquivo) { sistema_pedir_redesenho_completo(); }
 }
 
-static void desenhar_imagem(lgfx::LovyanGFX& d, const area_t& a, int x, int y)
+// GIF animado na tela: redesenha a cada atraso de quadro (o desenho pede o
+// quadro seguinte ao worker). Nos outros casos so acorda por aviso ou toque.
+static uint32_t periodo_agora(void)
 {
-  if (!s_img_ok) {
-    d.setTextColor(TFT_RED, TFT_BLACK);
-    d.drawString("NÃO CONSEGUI LER ESTA IMAGEM", x, y);
-    return;
-  }
-
-  // A caixa disponivel (mesma margem dos lados) e a escala que faz caber.
-  const int caixa_l = a.largura - 2 * (x - a.x);
-  const int caixa_a = (a.y + a.altura - 10) - y;
-  if (caixa_l <= 0 || caixa_a <= 0 || s_img_largura > 4096) { return; }
-  uint32_t L = s_img_largura, A = s_img_altura;
-  if (L > (uint32_t)caixa_l || A > (uint32_t)caixa_a) {
-    // Menor das duas razoes, em inteiros: compara caixa_l/W com caixa_a/H.
-    if ((uint64_t)caixa_l * s_img_altura <= (uint64_t)caixa_a * s_img_largura) {
-      L = (uint32_t)caixa_l;
-      A = (uint32_t)(((uint64_t)s_img_altura * caixa_l) / s_img_largura);
-    } else {
-      A = (uint32_t)caixa_a;
-      L = (uint32_t)(((uint64_t)s_img_largura * caixa_a) / s_img_altura);
-    }
-    if (L == 0) { L = 1; }
-    if (A == 0) { A = 1; }
-  }
-  const int px = a.x + (a.largura - (int)L) / 2;   // centralizada na caixa
-  const int py = y + (caixa_a - (int)A) / 2;
-
-  char caminho[192];
-  caminho_arquivo(caminho, sizeof(caminho));
-
-  // PRONTA: o buffer e desta foto, deste tamanho, e o worker terminou bem.
-  if (!s_img_lendo && s_img_px && s_img_px_l == L && s_img_px_a == A && strcmp(s_img_px_caminho, caminho) == 0) {
-    // "efeito arco-iris" - MESMO aviso do app Camera (ver app_camera.cpp): o
-    // LovyanGFX espera a ordem de byte trocada em relacao ao RGB565 cru que
-    // esta gravado no arquivo. Estado global do display - salva e devolve.
-    const bool troca_ant = d.getSwapBytes();
-    // As margens em volta da imagem centralizada: limpa o que estiver la (o
-    // "carregando imagem..." ficava aparecendo acima dela). Cada faixa uma vez,
-    // sem pintar duas vezes a area da imagem.
-    const int cx0 = a.x, cx1 = a.x + a.largura, cy1 = y + caixa_a;
-    if (py > y)                  { d.fillRect(cx0, y, cx1 - cx0, py - y, TFT_BLACK); }
-    if (py + (int)A < cy1)       { d.fillRect(cx0, py + (int)A, cx1 - cx0, cy1 - (py + (int)A), TFT_BLACK); }
-    if (px > cx0)                { d.fillRect(cx0, py, px - cx0, (int)A, TFT_BLACK); }
-    if (px + (int)L < cx1)       { d.fillRect(px + (int)L, py, cx1 - (px + (int)L), (int)A, TFT_BLACK); }
-    d.setSwapBytes(true);
-    d.pushImage(px, py, (int)L, (int)A, s_img_px);
-    d.setSwapBytes(troca_ant);
-    return;
-  }
-
-  // AINDA NAO: pede ao worker (uma vez) e mostra que esta vindo.
-  if (!s_img_lendo) {
-    soltar_imagem();
-    s_img_px = (uint16_t*)heap_caps_malloc((size_t)L * A * 2, MALLOC_CAP_SPIRAM);
-    if (!s_img_px) {
-      d.setTextColor(TFT_RED, TFT_BLACK);
-      d.drawString("SEM MEMÓRIA PARA A IMAGEM", x, y);
-      return;
-    }
-    s_img_px_l = L;
-    s_img_px_a = A;
-    snprintf(s_img_px_caminho, sizeof(s_img_px_caminho), "%s", caminho);
-    s_img_lida = false;
-    s_img_lendo = sistema_trabalho(trabalho_ler_imagem, nullptr);
-    if (!s_img_lendo) { soltar_imagem(); }
-  }
-  d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  d.drawString("carregando imagem...", x, y);
+  if (s_nivel != NIVEL_CONTEUDO || !s_gif_anima) { return 0; }
+  return (uint32_t)s_gif_atraso;
 }
 
 // ---------------------------------------------------------------------------
-// Ciclo de vida
+// CICLO DE VIDA
 // ---------------------------------------------------------------------------
 static bool ao_abrir(void)
 {
-  esquecer_offsets();
-  if (!s_itens) { s_itens = (item_t*)heap_caps_calloc(MAX_ITENS, sizeof(item_t), MALLOC_CAP_SPIRAM); }
-  if (!s_carga) { s_carga = (item_t*)heap_caps_calloc(MAX_ITENS, sizeof(item_t), MALLOC_CAP_SPIRAM); }
+  if (!s_itens) { s_itens = (tab5_arq_item_t*)heap_caps_calloc(MAX_ITENS, sizeof(tab5_arq_item_t), MALLOC_CAP_SPIRAM); }
+  if (!s_carga) { s_carga = (tab5_arq_item_t*)heap_caps_calloc(MAX_ITENS, sizeof(tab5_arq_item_t), MALLOC_CAP_SPIRAM); }
   if (!s_itens || !s_carga) { return false; }
   s_listando = false; s_l_pronto = false; s_l_de_novo = false;
+  s_op_rodando = false; s_op_pronto = false;
+  s_c_ocupado = false; s_c_pronto = false;
   s_n_itens = s_n_achados = 0;
-  lista_definir(&s_lista, ROLAGEM_INICIO, 0, item_altura, item_desenhar, nullptr);
-  s_nivel = NIVEL_PASTAS;
-  s_pasta[0] = s_arquivo[0] = '\0';
+  s_dlg = DLG_NADA;
   s_linha = 0;
   s_n_voltas = 0;
-  listar_pastas();
+  tab5_arq_trabalho_t t;
+  tab5_arq_trabalho(&t);
+  s_job_fase = t.fase;
+  lista_definir(&s_lista, ROLAGEM_INICIO, 0, item_altura, item_desenhar, nullptr);
+  navegar("");
   return true;
 }
 
 static void ao_fechar(void)
 {
+  if (s_dlg == DLG_NOME) { tecvirt_fechar(&s_kb); }
+  s_dlg = DLG_NADA;
   s_n_itens = 0;
   if (s_itens) { heap_caps_free(s_itens); s_itens = nullptr; }
   if (s_carga) { heap_caps_free(s_carga); s_carga = nullptr; }   // o fechamento ja esperou o worker
+  if (s_lixo) { heap_caps_free(s_lixo); s_lixo = nullptr; }
+  if (s_lixo_carga) { heap_caps_free(s_lixo_carga); s_lixo_carga = nullptr; }
   s_n_linhas = 0;
-  s_e_imagem = false;
-  s_img_ok = false;
+  tab5_texto_fechar(s_texto);   // o fechamento ja esperou o worker
+  s_texto = nullptr;
+  s_ver = VER_TEXTO;
   s_img_lendo = false;   // fechar o app ja esperou o worker
   soltar_imagem();
+  sair_da_selecao();
 }
 
 // ---------------------------------------------------------------------------
-// Desenho
+// DESENHO: icones e itens
 // ---------------------------------------------------------------------------
-static void tamanho_txt(char* buf, size_t n, uint64_t b)
-{
-  if      (b >= 1024ULL*1024*1024) { snprintf(buf, n, "%6.2fGB", b / (1024.0*1024*1024)); }
-  else if (b >= 1024ULL*1024)      { snprintf(buf, n, "%6.1fMB", b / (1024.0*1024)); }
-  else if (b >= 1024ULL)           { snprintf(buf, n, "%6.1fKB", b / 1024.0); }
-  else                             { snprintf(buf, n, "%6llu B", (unsigned long long)b); }
-}
-
-// Pastinha PEQUENA ao lado do nome de uma pasta, para distinguir pasta de
-// arquivo na mesma lista.
-// Mesmas cores/ordem de desenho do icone grande da tela inicial
-// (icone_arquivos, mais abaixo: aba primeiro, corpo por cima cobrindo a
-// junta), so sem o fundo quadrado - aqui ela senta direto no preto da linha,
-// nao numa lade de app.
 static void icone_pasta_pequena(lgfx::LovyanGFX& d, int x, int y, int w, int h)
 {
-  const uint16_t pasta = d.color565(240, 190, 90);
-  const uint16_t aba   = d.color565(205, 155, 60);
+  const uint16_t pasta = TEMA_APP_AMARELO;
+  const uint16_t aba   = TEMA_APP_LARANJA;
   const int aba_l = (int)(0.5f  * w);
   const int aba_a = (int)(0.28f * h);
   d.fillRoundRect(x, y,                 aba_l, aba_a,          2, aba);
   d.fillRoundRect(x, y + aba_a - 1,     w,     h - aba_a + 1,  3, pasta);
 }
 
-// Folha PEQUENA para arquivo comum: sem ela a coluna do icone ficaria vazia
-// nas linhas de arquivo (a pastinha so aparece quando eh_pasta). Pagina
-// clara com o canto superior direito dobrado (leitura universal de "isto e
-// um arquivo") + duas linhas finas representando texto generico dentro dela -
-// a MESMA ideia de camada da pastinha (recorte, depois a dobra por cima).
-static void icone_arquivo_pequeno(lgfx::LovyanGFX& d, int x, int y, int w, int h)
+// Folha com o canto dobrado; a faixa de baixo tem a cor do tipo (musica,
+// imagem, texto, app) - le-se o tipo sem ler a extensao.
+static void icone_arquivo_pequeno(lgfx::LovyanGFX& d, int x, int y, int w, int h, tab5_arq_tipo_t tipo)
 {
-  const uint16_t pagina = TFT_LIGHTGREY;
-  const uint16_t dobra  = TFT_DARKGREY;
-
+  const uint16_t pagina = TEMA_TEXTO_2;
+  const uint16_t dobra  = TEMA_TEXTO_3;
   const int pl = (int)(0.55f * w);
   const int pa = (int)(0.85f * h);
   const int px = x + (w - pl) / 2;
   const int py = y + (h - pa) / 2;
   const int canto = (pl < pa ? pl : pa) / 3;
-
   d.fillRoundRect(px, py, pl, pa, 2, pagina);
-  // RECORTE do canto: apaga o quadradinho superior direito de volta ao preto
-  // da linha, deixando so o triangulo diagonal da pagina.
-  d.fillTriangle(px + pl - canto, py, px + pl, py, px + pl, py + canto, TFT_BLACK);
-  // DOBRA: preenche o mesmo canto so que com o triangulo espelhado - a
-  // "pontinha" que sobraria dobrada para dentro da folha.
+  d.fillTriangle(px + pl - canto, py, px + pl, py, px + pl, py + canto, TEMA_FUNDO);
   d.fillTriangle(px + pl - canto, py, px + pl, py + canto, px + pl - canto, py + canto, dobra);
-
+  uint16_t cor = dobra;
+  switch (tipo) {
+    case TAB5_ARQ_MUSICA: cor = TEMA_APP_ROXO; break;
+    case TAB5_ARQ_IMAGEM: cor = TEMA_APP_VERDE; break;
+    case TAB5_ARQ_TEXTO:  cor = TEMA_APP_AZUL; break;
+    case TAB5_ARQ_BERRY:  cor = TEMA_APP_LARANJA; break;
+    default: break;
+  }
   const int linha_x = px + (int)(0.18f * pl);
   const int linha_l = (int)(0.64f * pl);
-  d.fillRect(linha_x, py + (int)(0.55f * pa), linha_l, 2, dobra);
-  d.fillRect(linha_x, py + (int)(0.72f * pa), linha_l, 2, dobra);
+  d.fillRect(linha_x, py + (int)(0.50f * pa), linha_l, 3, cor);
+  d.fillRect(linha_x, py + (int)(0.70f * pa), linha_l, 3, cor);
 }
 
-// ---------------------------------------------------------------------------
-// UM ITEM DA LISTA (pasta ou arquivo)
-// ---------------------------------------------------------------------------
-static int item_altura(int, void*) { return LIN_LISTA; }
+static void icone_disco(lgfx::LovyanGFX& d, int x, int y, int lado, bool pendrive, bool ativo)
+{
+  const uint16_t corpo = ativo ? (pendrive ? TEMA_APP_AZUL : TEMA_APP_VERDE) : CINZA_BT;
+  if (pendrive) {
+    d.fillRoundRect(x + lado / 4, y, lado / 2, lado / 4, 3, TEMA_TEXTO_2);           // o conector
+    d.fillRoundRect(x + lado / 8, y + lado / 4 - 2, lado * 3 / 4, lado * 3 / 4, 8, corpo);
+  } else {
+    // Cartao: o canto cortado e os contatos.
+    d.fillRoundRect(x + lado / 8, y, lado * 3 / 4, lado, 8, corpo);
+    d.fillTriangle(x + lado / 8, y, x + lado / 8 + lado / 4, y, x + lado / 8, y + lado / 4, TEMA_FUNDO);
+    for (int k = 0; k < 4; ++k) { d.fillRect(x + lado / 3 + k * lado / 10, y + 6, lado / 16, lado / 5, TEMA_FUNDO); }
+  }
+}
 
-// x = borda esquerda da area; largura = ate a coluna da barra. Colunas em X
-// proporcional a largura (a area muda com a rotacao), nao pixel chutado.
+static int item_altura(int, void*) { return s_nivel == NIVEL_DISCOS ? LIN_DISCO : LIN_LISTA; }
+
+// A linha de um disco: icone, nome, espaco, lixeira e os botoes da direita
+// (Ejetar, Esvaziar). Os botoes nao entram no registro: o toque na lista
+// decide pelo 'x' (ver tocar_disco) - a lista rola, o registro nao.
+static const int DISCO_BT_L = 190, DISCO_BT_A = 56;
+
+static void disco_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura)
+{
+  const disco_t& dk = s_discos[i];
+  const bool pendrive = dk.v.id == TAB5_VOL_PENDRIVE;
+  const int x = x0 + MARGEM_X;
+  icone_disco(d, x, y + 14, 64, pendrive, dk.v.disponivel);
+  const int tx = x + 90;
+  const int bt_x = x0 + largura - DISCO_BT_L - 8;
+  d.setTextDatum(top_left);
+  d.setFont(tab5_fonte_suave(true, 34));
+  d.setTextSize(1);
+  d.setTextColor(dk.v.disponivel ? TEMA_TEXTO : TEMA_TEXTO_3, TEMA_FUNDO);
+  char t[96];
+  snprintf(t, sizeof(t), "%s%s%s", dk.v.tipo, dk.v.nome[0] ? "  " : "", dk.v.nome);
+  tab5_cortar_com_reticencias(d, t, sizeof(t), bt_x - tx - 12);
+  d.drawString(t, tx, y + 10);
+  d.setFont(tab5_fonte_suave(false, 24));
+  d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+  if (!dk.v.disponivel) {
+    d.drawString(pendrive ? tr("saindo...") : tr("indisponível (no computador ou sem cartão)"), tx, y + 56);
+  } else {
+    char a1[16], a2[16];
+    tab5_bytes_txt(a1, sizeof(a1), dk.livre);
+    tab5_bytes_txt(a2, sizeof(a2), dk.total);
+    snprintf(t, sizeof(t), tr("livres %s de %s"), a1, a2);
+    d.drawString(t, tx, y + 56);
+    // A barra do usado.
+    const int bl = bt_x - tx - 20;
+    if (bl > 40 && dk.total) {
+      d.fillRoundRect(tx, y + 92, bl, 10, 5, TEMA_SUPERFICIE_ALTA);
+      const int usado = (int)((double)(dk.total - dk.livre) / dk.total * bl);
+      d.fillRoundRect(tx, y + 92, usado < 10 ? 10 : usado, 10, 5, pendrive ? TEMA_APP_AZUL : TEMA_APP_VERDE);
+    }
+    if (dk.lixeira > 0) {
+      char peso[16];
+      tab5_bytes_txt(peso, sizeof(peso), dk.lixeira_bytes);
+      snprintf(t, sizeof(t), tr("lixeira: %d item(s) - %s"), dk.lixeira, peso);
+      d.drawString(t, tx, y + 110);
+    }
+  }
+  // Botoes da direita.
+  if (dk.v.disponivel) {
+    int by = y + 12;
+    if (pendrive) {
+      tab5_botao(d, bt_x, by, DISCO_BT_L, DISCO_BT_A, tr("Ejetar"), TEMA_ALERTA, TEMA_FUNDO);
+      by += DISCO_BT_A + 10;
+    }
+    // Abre a lixeira (la se restaura, exclui ou esvazia). Discreto de proposito.
+    if (dk.lixeira > 0) { tab5_botao(d, bt_x, by, DISCO_BT_L, DISCO_BT_A, tr("Lixeira"), TEMA_SUPERFICIE_ALTA, TEMA_TEXTO_2); }
+  }
+  if (i + 1 < s_n_itens) { d.drawFastHLine(x0 + MARGEM_X, y + LIN_DISCO - 4, largura - MARGEM_X, COR_DIVISA); }
+}
+
+// "de /Fotos · 07/11 14:32 · 1.2 MB" - a segunda linha de um item da lixeira.
+static void lixo_detalhe(const tab5_arq_lixo_t& it, char* out, size_t tam)
+{
+  char destino[96], peso[16];
+  if (it.origem[0]) {
+    lixo_destino(s_pasta, it.origem, false, destino, sizeof(destino));
+    snprintf(out, tam, tr("de %s"), destino);
+  } else {
+    snprintf(out, tam, "%s", tr("origem desconhecida"));
+  }
+  if (it.quando) {
+    struct tm t;
+    tab5_hora_local(it.quando, &t);
+    char quando[24];
+    strftime(quando, sizeof(quando), "%d/%m %H:%M", &t);
+    const size_t k = strlen(out);
+    snprintf(out + k, tam - k, " · %s", quando);
+  }
+  tab5_bytes_txt(peso, sizeof(peso), it.bytes);
+  const size_t k = strlen(out);
+  snprintf(out + k, tam - k, " · %s", peso);
+}
+
+// Um item da lixeira: icone, o nome em destaque e, embaixo, de onde veio,
+// quando foi apagado e o tamanho. Selecionando: a caixinha antes do icone.
+static void lixo_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura)
+{
+  const tab5_arq_lixo_t& it = s_lixo[i];
+  int x = x0 + MARGEM_X;
+  if (s_selecionando) {
+    const bool marcado = s_sel[i] != 0;
+    const int lado = 40, cy = y + (LIN_LISTA - lado) / 2;
+    d.fillRoundRect(x, cy, lado, lado, 6, marcado ? TEMA_DESTAQUE : TEMA_FUNDO);
+    d.drawRoundRect(x, cy, lado, lado, 6, marcado ? TEMA_DESTAQUE : TEMA_TEXTO_2);
+    if (marcado) {
+      tab5_linha_grossa(d, x + 8, cy + 20, x + 17, cy + 29, 2.5f, TEMA_SOBRE_DESTAQUE);
+      tab5_linha_grossa(d, x + 17, cy + 29, x + 32, cy + 10, 2.5f, TEMA_SOBRE_DESTAQUE);
+    }
+    x += lado + 14;
+  }
+  if (it.pasta) { icone_pasta_pequena(d, x, y + (LIN_LISTA - 34) / 2, 40, 34); }
+  else          { icone_arquivo_pequeno(d, x, y + (LIN_LISTA - 48) / 2, 40, 48, tab5_arq_tipo(it.nome)); }
+  const int tx = x + 40 + 14;
+  const int util = x0 + largura - 16 - tx;
+  d.setTextDatum(top_left);
+  d.setTextSize(1);
+  char t[TAB5_ARQ_NOME_MAX + 4];
+  snprintf(t, sizeof(t), "%s", it.nome);
+  d.setFont(tab5_fonte_suave(true, 30));
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+  tab5_cortar_com_reticencias(d, t, sizeof(t), util);
+  d.drawString(t, tx, y + 10);
+  char det[200];
+  lixo_detalhe(it, det, sizeof(det));
+  d.setFont(tab5_fonte_suave(false, 22));
+  d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+  tab5_cortar_com_reticencias(d, det, sizeof(det), util);
+  d.drawString(det, tx, y + 50);
+  if (i + 1 < s_n_itens) { d.drawFastHLine(x0 + MARGEM_X, y + LIN_LISTA - 1, largura - MARGEM_X, COR_DIVISA); }
+}
+
 static void item_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int largura, void*)
 {
-  const item_t& it = s_itens[i];
-  const int MARGEM = 16;
-  const int x = x0 + MARGEM;
-  const int util = largura - MARGEM;
-  const int contagem_x = x + (int)(util * 0.55f);
-  const int tamanho_x  = x + (int)(util * 0.78f);
-
+  if (s_nivel == NIVEL_DISCOS) { disco_desenhar(d, i, x0, y, largura); return; }
+  if (s_nivel == NIVEL_LIXEIRA) { lixo_desenhar(d, i, x0, y, largura); return; }
+  const tab5_arq_item_t& it = s_itens[i];
+  int x = x0 + MARGEM_X;
   tab5_texto(d, TAM_LISTA);
   d.setTextDatum(top_left);
-
-  // ICONE ANCORADO NO TEXTO: mesma altura e mesmo (x,y) que o
-  // nome usa - d.fontHeight(), nunca um numero chutado. Toda linha ganha
-  // icone (pasta ou folha), entao o nome sempre comeca na mesma coluna.
-  const int icone_l = 40;
   const int icone_a = d.fontHeight();
-  if (it.eh_pasta) { icone_pasta_pequena(d, x, y, icone_l, icone_a); }
-  else             { icone_arquivo_pequeno(d, x, y, icone_l, icone_a); }
-
-  // Nome cortado MEDINDO (d.textWidth), para nao invadir a coluna seguinte.
-  const int nome_x = x + icone_l + 14;
-  const int nome_max_l = contagem_x - nome_x - 12;
-  char nome[40];
-  snprintf(nome, sizeof(nome), "%s", it.nome);
-  tab5_cortar_ao_caber(d, nome, nome_max_l);   // por caractere: nome de pasta com acento
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString(nome, nome_x, y);
-
-  char buf[24];
-  if (it.eh_pasta) {
-    snprintf(buf, sizeof(buf), "%d arq", it.arquivos);
-    d.drawString(buf, contagem_x, y);
+  // O conteudo no meio da altura do item; a linha que separa, embaixo.
+  const int y_item = y;
+  y += (LIN_LISTA - icone_a) / 2 - 2;
+  // Selecionando: a caixinha antes do icone.
+  if (s_selecionando) {
+    const bool marcado = s_sel[i] != 0;
+    d.fillRoundRect(x, y + 2, icone_a - 4, icone_a - 4, 6, marcado ? TEMA_DESTAQUE : TEMA_FUNDO);
+    d.drawRoundRect(x, y + 2, icone_a - 4, icone_a - 4, 6, marcado ? TEMA_DESTAQUE : TEMA_TEXTO_2);
+    if (marcado) {
+      tab5_linha_grossa(d, x + 8, y + icone_a / 2, x + icone_a / 2 - 4, y + icone_a - 12, 2.5f, TEMA_SOBRE_DESTAQUE);
+      tab5_linha_grossa(d, x + icone_a / 2 - 4, y + icone_a - 12, x + icone_a - 12, y + 10, 2.5f, TEMA_SOBRE_DESTAQUE);
+    } else {
+      d.fillRoundRect(x + 3, y + 5, icone_a - 10, icone_a - 10, 4, TEMA_FUNDO);
+    }
+    x += icone_a + 6;
   }
-  tamanho_txt(buf, sizeof(buf), it.bytes);
-  d.drawString(buf, tamanho_x, y);
-
-  // Linha fina entre itens - nao depois
-  // do ultimo.
+  const int util = x0 + largura - x;
+  const int tamanho_x = x + (int)(util * 0.74f);
+  const int icone_l = 40;
+  if (it.tipo == TAB5_ARQ_PASTA) { icone_pasta_pequena(d, x, y, icone_l, icone_a); }
+  else                           { icone_arquivo_pequeno(d, x, y, icone_l, icone_a, it.tipo); }
+  const int nome_x = x + icone_l + 14;
+  char nome[TAB5_ARQ_NOME_MAX + 4];
+  snprintf(nome, sizeof(nome), "%s", it.nome);
+  tab5_cortar_com_reticencias(d, nome, sizeof(nome), (it.tipo == TAB5_ARQ_PASTA ? x0 + largura - 16 : tamanho_x - 12) - nome_x);
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+  d.drawString(nome, nome_x, y);
+  if (it.tipo != TAB5_ARQ_PASTA) {
+    char buf[24];
+    tab5_bytes_txt(buf, sizeof(buf), it.bytes);
+    d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+    d.drawString(buf, tamanho_x, y);
+  }
   if (i + 1 < s_n_itens) {
-    d.drawFastHLine(x0 + MARGEM, y + LIN_LISTA - 16, largura - MARGEM, TFT_DARKGREY);
+    d.drawFastHLine(x0 + MARGEM_X, y_item + LIN_LISTA - 1, largura - MARGEM_X, COR_DIVISA);
   }
 }
 
-// Texto numa linha so, cortado MEDINDO para caber em 'largura' (com "..."),
-// sem partir um caractere UTF-8.
 static void texto_cabendo(lgfx::LovyanGFX& d, const char* txt, int x, int y, int largura)
 {
-  char buf[192];
+  char buf[256];
   snprintf(buf, sizeof(buf), "%s", txt);
   tab5_cortar_com_reticencias(d, buf, sizeof(buf), largura);
   d.drawString(buf, x, y);
 }
 
-// "1.234" - numero grande de linhas se le melhor com milhar.
 static void milhar(char* out, size_t n, int v)
 {
   if (v >= 1000000) { snprintf(out, n, "%d.%03d.%03d", v / 1000000, (v / 1000) % 1000, v % 1000); }
@@ -978,11 +1077,9 @@ static void milhar(char* out, size_t n, int v)
   else { snprintf(out, n, "%d", v); }
 }
 
-// O TEXTO: cada linha do arquivo quebrada na largura; continuacao recuada,
-// e um respiro entre uma linha do arquivo e a seguinte - assim se ve onde uma
-// linha longa acaba. Para quando a proxima nao cabe inteira (a nao ser a
-// primeira, que aparece no que couber: uma linha maior que a tela nao pode
-// travar a leitura). Devolve quantas linhas do arquivo couberam.
+// ---------------------------------------------------------------------------
+// DESENHO: o conteudo (texto e imagem)
+// ---------------------------------------------------------------------------
 static int desenhar_texto(lgfx::LovyanGFX& d, const area_t& a, int y)
 {
   const int px = TAM_LEITURA[s_tam_leitura];
@@ -995,19 +1092,16 @@ static int desenhar_texto(lgfx::LovyanGFX& d, const area_t& a, int y)
   const int x = a.x + MARGEM_X;
   const int largura = a.largura - 2 * MARGEM_X;
   const int fundo = a.y + a.altura - 10;
-
   static char vis[CONVERSA_MAX_LINHAS][CONVERSA_LINHA_BYTES];
   int cabem = 0;
   for (int i = 0; i < s_n_linhas; ++i) {
     const char* txt = s_linhas[i][0] ? s_linhas[i] : " ";
-    // Primeira linha visual na largura toda, as seguintes recuadas: quebra
-    // primeiro na largura menor (o recuo) e redesenha a primeira sem ele.
     const int n = conversa_quebrar_linhas(d, txt, largura - recuo, vis, CONVERSA_MAX_LINHAS);
     const int altura = n * alt_linha;
     if (y + altura > fundo && cabem > 0) { break; }
     for (int k = 0; k < n; ++k) {
       if (y + alt_linha > fundo) { break; }
-      d.setTextColor(k == 0 ? TFT_WHITE : TFT_LIGHTGREY, TFT_BLACK);
+      d.setTextColor(k == 0 ? TEMA_TEXTO : TEMA_TEXTO_2, TEMA_FUNDO);
       d.drawString(vis[k], k == 0 ? x : x + recuo, y);
       y += alt_linha;
     }
@@ -1016,169 +1110,397 @@ static int desenhar_texto(lgfx::LovyanGFX& d, const area_t& a, int y)
     if (y >= fundo) { break; }
   }
   if (s_n_linhas == 0) {
-    d.setTextColor(s_abriu_ok ? TFT_LIGHTGREY : TFT_RED, TFT_BLACK);
-    d.drawString(s_abriu_ok ? "(arquivo vazio ou fim do conteúdo)"
-                             : "NÃO CONSEGUI ABRIR - veja o caminho no log", x, y);
+    d.setTextColor(s_abriu_ok ? TEMA_TEXTO_2 : TEMA_PERIGO, TEMA_FUNDO);
+    d.drawString(s_abriu_ok ? tr("(arquivo vazio ou fim do conteúdo)") : tr("NÃO CONSEGUI ABRIR ESTE ARQUIVO"), x, y);
     y += alt_linha;
-    if (!s_abriu_ok) {
-      char cam[192];
-      caminho_arquivo(cam, sizeof(cam));
-      d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-      texto_cabendo(d, cam, x, y, largura);
-      y += alt_linha;
-    }
   }
-  // Apaga o resto, para tela curta nao deixar resto da anterior.
-  if (y < fundo) { tab5_tela_limpar(a.x, y, a.largura, a.y + a.altura - y, TFT_BLACK); }
+  if (y < fundo) { tab5_tela_limpar(a.x, y, a.largura, a.y + a.altura - y, TEMA_FUNDO); }
   tab5_fonte_corpo(d);
   return cabem > 0 ? cabem : 1;
 }
 
-// Barra de posicao: onde a tela esta no arquivo. Tocar nela pula para la.
 static void desenhar_barra(lgfx::LovyanGFX& d, const area_t& a)
 {
   const int x = a.x + MARGEM_X, l = a.largura - 2 * MARGEM_X;
   const int y = a.y + BARRA_Y;
-  d.fillRoundRect(x, y, l, BARRA_A, BARRA_A / 2, d.color565(50, 50, 62));
+  d.fillRoundRect(x, y, l, BARRA_A, BARRA_A / 2, TEMA_SUPERFICIE_ALTA);
   if (s_total_linhas <= 0) { return; }
   int ini = (int)((int64_t)l * s_linha / s_total_linhas);
   int fim = (int)((int64_t)l * (s_linha + s_cabem) / s_total_linhas);
   if (fim > l) { fim = l; }
   if (fim - ini < BARRA_A) { ini = (fim - BARRA_A > 0) ? fim - BARRA_A : 0; fim = ini + BARRA_A; }
-  d.fillRoundRect(x + ini, y, fim - ini, BARRA_A, BARRA_A / 2, TFT_SKYBLUE);
+  d.fillRoundRect(x + ini, y, fim - ini, BARRA_A, BARRA_A / 2, TEMA_DESTAQUE);
+}
+
+static void desenhar_imagem(lgfx::LovyanGFX& d, const area_t& a, int x, int y)
+{
+  const int caixa_l = a.largura - 2 * (x - a.x);
+  const int caixa_a = (a.y + a.altura - 10) - y;
+  if (caixa_l <= 0 || caixa_a <= 0) { return; }
+  char caminho[sizeof(s_img_px_caminho)];
+  caminho_arquivo(caminho, sizeof(caminho));
+  const bool mesma = s_img_px_caminho[0] && !strcmp(s_img_px_caminho, caminho);
+
+  // O worker escreve no sprite: nao se pinta enquanto ele trabalha. Num GIF que ja
+  // esta na tela, a imagem fica como esta ate o proximo quadro chegar.
+  if (s_img_lendo && s_gif_anima && mesma) { return; }
+
+  // O sprite e a caixa inteira; o servico desenha a imagem dentro, reduzida
+  // para caber e centralizada, com o fundo preto.
+  const bool pronta = !s_img_lendo && mesma && s_img_spr && s_img_px_l == (uint32_t)caixa_l && s_img_px_a == (uint32_t)caixa_a;
+  if (pronta) {
+    s_img_spr->pushSprite(&d, a.x + (a.largura - caixa_l) / 2, y);
+    // GIF animado: passado o atraso do quadro, o worker decodifica o seguinte.
+    if (s_gif_anima && esp_timer_get_time() + 16000 >= s_gif_devido_us) {
+      s_gif_pedido_us = esp_timer_get_time();
+      s_img_lida = false;
+      s_img_lendo = sistema_trabalho(trabalho_ler_imagem, nullptr);
+    }
+    return;
+  }
+  if (!s_img_lendo && mesma && !s_img_lida_ok && s_img_lida) {
+    d.setTextColor(TEMA_PERIGO, TEMA_FUNDO);
+    d.drawString(tr("NÃO CONSEGUI LER ESTA IMAGEM"), x, y);
+    return;
+  }
+  if (!s_img_lendo) {
+    soltar_imagem();
+    s_img_spr = tab5_sprite_novo(&d, caixa_l, caixa_a);
+    if (!s_img_spr) {
+      d.setTextColor(TEMA_PERIGO, TEMA_FUNDO);
+      d.drawString(tr("SEM MEMÓRIA PARA A IMAGEM"), x, y);
+      return;
+    }
+    s_img_px_l = (uint32_t)caixa_l;
+    s_img_px_a = (uint32_t)caixa_a;
+    snprintf(s_img_px_caminho, sizeof(s_img_px_caminho), "%s", caminho);
+    s_img_lida = false;
+    s_gif_pedido_us = esp_timer_get_time();
+    s_img_lendo = sistema_trabalho(trabalho_ler_imagem, nullptr);
+    if (!s_img_lendo) { soltar_imagem(); }
+  }
+  d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+  d.drawString(tr("carregando imagem..."), x, y);
+}
+
+// ---------------------------------------------------------------------------
+// DESENHO: dialogos, rodape e a tela
+// ---------------------------------------------------------------------------
+static void desenhar_dialogo(lgfx::LovyanGFX& d, const area_t& a)
+{
+  if (s_dlg == DLG_NOME) {
+    tecvirt_posicionar(&s_kb, a);
+    if (TUDO) {
+      d.fillRect(a.x, a.y, a.largura, a.altura, TEMA_FUNDO);
+      d.setFont(tab5_fonte_suave(true, 40));
+      d.setTextSize(1);
+      d.setTextDatum(middle_left);
+      d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+      d.drawString(s_nome_criar ? tr("Nova pasta") : tr("Renomear"), a.x + 24, a.y + 60);
+      d.setFont(tab5_fonte_suave(false, 24));
+      d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+      d.drawString(tr("ENVIAR confirma; X cancela."), a.x + 24, a.y + 230);
+    }
+    char campo[TAB5_ARQ_NOME_MAX + 2];
+    snprintf(campo, sizeof(campo), "%s_", s_nome_txt);
+    const uint16_t escuro = TEMA_SUPERFICIE_ALTA;
+    d.fillRoundRect(a.x + 24, a.y + 110, a.largura - 48, 80, 14, escuro);
+    d.setFont(tab5_fonte_suave(false, 34));
+    d.setTextDatum(middle_left);
+    d.setTextColor(TEMA_TEXTO, escuro);
+    tab5_cortar_com_reticencias(d, campo, sizeof(campo), a.largura - 88);
+    d.drawString(campo, a.x + 44, a.y + 150);
+    d.setTextDatum(top_left);
+    tecvirt_pintar(&s_kb, d, TUDO);
+    return;
+  }
+  if (s_dlg == DLG_LIXO_ITEM) {
+    // Um item da lixeira: o que fazer com ele (tres botoes, um sobre o outro).
+    const int bl = a.largura - 80, bh = 400;
+    const int bx = 40, by = (a.altura - bh) / 2;
+    const uint16_t caixa = TEMA_SUPERFICIE;
+    d.fillRect(a.x, a.y, a.largura, a.altura, TEMA_FUNDO);
+    d.fillRoundRect(a.x + bx, a.y + by, bl, bh, 20, caixa);
+    d.setTextSize(1);
+    d.setTextDatum(top_left);
+    d.setFont(tab5_fonte_suave(true, 34));
+    d.setTextColor(TEMA_TEXTO, caixa);
+    texto_cabendo(d, s_lixo_alvo[0].nome, a.x + bx + 30, a.y + by + 24, bl - 60);
+    char det[200];
+    lixo_detalhe(s_lixo_alvo[0], det, sizeof(det));
+    d.setFont(tab5_fonte_suave(false, 24));
+    d.setTextColor(TEMA_TEXTO_2, caixa);
+    texto_cabendo(d, det, a.x + bx + 30, a.y + by + 76, bl - 60);
+    botao(d, a, bx + 30, by + 124, bl - 60, 72, tr("Restaurar"), TEMA_SUCESSO, TEMA_FUNDO, BT_DLG_RESTAURAR);
+    botao(d, a, bx + 30, by + 206, bl - 60, 72, tr("Excluir de vez"), TEMA_PERIGO, TEMA_SOBRE_DESTAQUE, BT_DLG_EXCLUIR);
+    botao(d, a, bx + 30, by + 288, bl - 60, 72, tr("Cancelar"), CINZA_BT, TEMA_TEXTO, BT_DLG_NAO);
+    return;
+  }
+  // Confirmar: caixa no meio.
+  const int bl = a.largura - 80, bh = 330;
+  const int bx = 40, by = (a.altura - bh) / 2;
+  d.fillRect(a.x, a.y, a.largura, a.altura, TEMA_FUNDO);
+  d.fillRoundRect(a.x + bx, a.y + by, bl, bh, 20, TEMA_SUPERFICIE);
+  d.setFont(tab5_fonte_suave(true, 34));
+  d.setTextSize(1);
+  d.setTextDatum(top_left);
+  d.setTextColor(TEMA_TEXTO, TEMA_SUPERFICIE);
+  char t[96], t2[96];
+  if (s_dlg == DLG_APAGAR) {
+    snprintf(t, sizeof(t), tr("Mandar %d item(s) para a lixeira?"), s_n_sel);
+    snprintf(t2, sizeof(t2), "%s", tr("Dá para recuperar pela lixeira até esvaziar."));
+  } else if (s_dlg == DLG_LIXO_EXCLUIR) {
+    snprintf(t, sizeof(t), tr("Excluir de vez %d item(s)?"), s_lixo_alvo_n);
+    snprintf(t2, sizeof(t2), "%s", tr("Não dá para recuperar depois."));
+  } else {
+    char peso[16];
+    tab5_bytes_txt(peso, sizeof(peso), s_esvaziar_bytes);
+    snprintf(t, sizeof(t), tr("Apagar de vez %d item(s) da lixeira (%s)?"), s_esvaziar_itens, tr(tab5_volume_tipo(s_esvaziar_raiz)));
+    snprintf(t2, sizeof(t2), tr("Total: %s. Apaga de vez, sem recuperação."), peso);
+  }
+  texto_cabendo(d, t, a.x + bx + 30, a.y + by + 40, bl - 60);
+  d.setFont(tab5_fonte_suave(false, 26));
+  d.setTextColor(TEMA_TEXTO_2, TEMA_SUPERFICIE);
+  texto_cabendo(d, t2, a.x + bx + 30, a.y + by + 110, bl - 60);
+  const int bw = (bl - 90) / 2;
+  botao(d, a, bx + 30, by + bh - 110, bw, 80, tr("Cancelar"), CINZA_BT, TEMA_TEXTO, BT_DLG_NAO);
+  botao(d, a, bx + 60 + bw, by + bh - 110, bw, 80, s_dlg == DLG_APAGAR ? tr("Apagar") : s_dlg == DLG_LIXO_EXCLUIR ? tr("Excluir") : tr("Esvaziar"),
+        TEMA_PERIGO, TEMA_SOBRE_DESTAQUE, BT_DLG_SIM);
+}
+
+// Uma fileira de botoes no rodape, de larguras iguais.
+typedef struct { const char* txt; bt_id_t id; uint16_t cor; uint16_t tinta; } bt_def_t;
+static bt_def_t bt_def(const char* txt, bt_id_t id, uint16_t cor, uint16_t tinta) { return { txt, id, cor, tinta }; }
+static void fileira(lgfx::LovyanGFX& d, const area_t& a, int y, const bt_def_t* b, int n)
+{
+  const int g = 10;
+  const int l = (a.largura - 2 * MARGEM_X - (n - 1) * g) / n;
+  for (int i = 0; i < n; ++i) {
+    botao(d, a, MARGEM_X + i * (l + g), y, l, RODAPE_A - 12, b[i].txt, b[i].cor, b[i].tinta,
+          b[i].id);
+  }
+}
+
+// O rodape: progresso da copia (se houver) e a fileira de acoes da vez.
+// Devolve a altura que ocupou (a lista termina acima dela).
+static int desenhar_rodape(lgfx::LovyanGFX& d, const area_t& a)
+{
+  int ocupado = 0;
+  int y = a.altura - 8;
+  // 1. A fileira de acoes.
+  bt_def_t b[5];
+  int n = 0;
+  bool recortar = false;
+  const int na = tab5_arq_area(&recortar);
+  if (s_nivel == NIVEL_PASTA && s_selecionando) {
+    const bool mexe = s_gravavel;
+    b[n++] = bt_def(tr("Copiar"), s_n_sel ? BT_COPIAR : BT_NADA, s_n_sel ? TEMA_DESTAQUE : CINZA_BT, s_n_sel ? TEMA_FUNDO : TEMA_TEXTO_3);
+    b[n++] = bt_def(tr("Recortar"), (mexe && s_n_sel) ? BT_RECORTAR : BT_NADA, (mexe && s_n_sel) ? TEMA_DESTAQUE : CINZA_BT, (mexe && s_n_sel) ? TEMA_FUNDO : TEMA_TEXTO_3);
+    b[n++] = bt_def(tr("Apagar"), (mexe && s_n_sel) ? BT_APAGAR : BT_NADA, (mexe && s_n_sel) ? TEMA_PERIGO : CINZA_BT, TEMA_SOBRE_DESTAQUE);
+    b[n++] = bt_def(tr("Renomear"), (mexe && s_n_sel == 1) ? BT_RENOMEAR : BT_NADA, (mexe && s_n_sel == 1) ? TEMA_DESTAQUE : CINZA_BT, (mexe && s_n_sel == 1) ? TEMA_FUNDO : TEMA_TEXTO_3);
+    b[n++] = bt_def(tr("Pronto"), BT_SAIR_SEL, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO);
+  } else if (s_nivel == NIVEL_LIXEIRA && s_selecionando) {
+    static char restaurar[32], excluir[32];
+    snprintf(restaurar, sizeof(restaurar), tr("Restaurar (%d)"), s_n_sel);
+    snprintf(excluir, sizeof(excluir), tr("Excluir (%d)"), s_n_sel);
+    b[n++] = bt_def(restaurar, s_n_sel ? BT_LIXO_RESTAURAR : BT_NADA, s_n_sel ? TEMA_SUCESSO : CINZA_BT, s_n_sel ? TEMA_FUNDO : TEMA_TEXTO_3);
+    b[n++] = bt_def(excluir, s_n_sel ? BT_LIXO_EXCLUIR : BT_NADA, s_n_sel ? TEMA_PERIGO : CINZA_BT, TEMA_SOBRE_DESTAQUE);
+    b[n++] = bt_def(tr("Cancelar"), BT_SAIR_SEL, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO);
+  } else if (s_nivel == NIVEL_PASTA && na > 0) {
+    static char colar[40];
+    snprintf(colar, sizeof(colar), tr("%s aqui (%d)"), recortar ? tr("Mover") : tr("Colar"), na);
+    b[n++] = bt_def(colar, s_gravavel ? BT_COLAR : BT_NADA, s_gravavel ? TEMA_SUCESSO : CINZA_BT, s_gravavel ? TEMA_FUNDO : TEMA_TEXTO_3);
+    b[n++] = bt_def(tr("Esquecer"), BT_LIMPAR_AREA, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO);
+  }
+  if (n) {
+    y -= RODAPE_A;
+    tab5_tela_limpar(a.x, a.y + y, a.largura, RODAPE_A, TEMA_FUNDO);
+    fileira(d, a, y + 6, b, n);
+    ocupado += RODAPE_A;
+  }
+  // 2. O trabalho de copia: rodando, ou terminado e ainda nao visto.
+  tab5_arq_trabalho_t t;
+  tab5_arq_trabalho(&t);
+  if (t.fase != TAB5_ARQ_PARADO) {
+    y -= PROG_A;
+    const int x = a.x + MARGEM_X;
+    const int bt_l = 170;
+    const int l = a.largura - 2 * MARGEM_X - bt_l - 16;
+    tab5_tela_limpar(a.x, a.y + y, a.largura, PROG_A, TEMA_FUNDO);
+    const bool roda = tab5_arq_ocupado();
+    char linha[160];
+    const int pct = t.bytes ? (int)(t.bytes_feitos * 100 / t.bytes) : t.itens ? t.itens_feitos * 100 / t.itens : 0;
+    switch (t.fase) {
+      case TAB5_ARQ_CONTANDO: snprintf(linha, sizeof(linha), tr("Medindo o que vai copiar...")); break;
+      case TAB5_ARQ_APAGANDO: snprintf(linha, sizeof(linha), "%s", t.mover ? tr("Movendo: limpando a origem") : tr("Esvaziando a lixeira...")); break;
+      case TAB5_ARQ_COPIANDO:
+        snprintf(linha, sizeof(linha), "%s %d%% · %d/%d · %s", t.mover ? tr("Movendo") : tr("Copiando"), pct,
+                 t.itens_feitos, t.itens, t.atual);
+        break;
+      case TAB5_ARQ_FEITO:
+        snprintf(linha, sizeof(linha), tr("Pronto: %d arquivo(s)%s"), t.itens_feitos, t.mover ? tr(" movidos") : "");
+        break;
+      case TAB5_ARQ_CANCELADO: snprintf(linha, sizeof(linha), tr("Cancelado (%d arquivo(s) ficaram)."), t.itens_feitos); break;
+      default: snprintf(linha, sizeof(linha), tr("Falhou: %s"), t.erro[0] ? t.erro : tr("veja o log")); break;
+    }
+    d.setFont(tab5_fonte_suave(false, 24));
+    d.setTextSize(1);
+    d.setTextDatum(top_left);
+    d.setTextColor(t.fase == TAB5_ARQ_FALHOU ? TEMA_PERIGO : TEMA_TEXTO, TEMA_FUNDO);
+    texto_cabendo(d, linha, x, a.y + y + 6, l);
+    d.fillRoundRect(x, a.y + y + 42, l, 12, 6, TEMA_SUPERFICIE_ALTA);
+    const int feito = roda ? l * (pct > 100 ? 100 : pct) / 100 : (t.fase == TAB5_ARQ_FEITO ? l : 0);
+    if (feito > 0) { d.fillRoundRect(x, a.y + y + 42, feito < 12 ? 12 : feito, 12, 6, TEMA_DESTAQUE); }
+    botao(d, a, MARGEM_X + l + 16, y + 6, bt_l, PROG_A - 14, roda ? tr("Cancelar") : tr("OK"),
+          roda ? TEMA_TEXTO_3 : TEMA_DESTAQUE, roda ? TEMA_TEXTO : TEMA_FUNDO, roda ? BT_CANCELAR_JOB : BT_OK_JOB);
+    ocupado += PROG_A;
+  }
+  return ocupado;
 }
 
 static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 {
-  char linha[128], t1[16], t2[16], t3[16];
+  char linha[TAB5_ARQ_CAMINHO_MAX + 64], t1[16], t2[16], t3[16];
   const int x = a.x + MARGEM_X;
-
-  // Datum e tamanho SEMPRE: sao estado global do display e a barra de status
-  // desenha entre duas passadas daqui. Ver o aviso no app_config.cpp.
   tab5_texto(d, TAM_BASE);
   d.setTextDatum(top_left);
-
   pintura_iniciar(&s_p);
+  s_n_bts = 0;
 
-  // A leitura do cartao acontece AQUI, nao no toque. Ver s_precisa_ler.
+  if (s_dlg != DLG_NADA) { lista_esconder(&s_lista); desenhar_dialogo(d, a); return; }
+
   if (s_precisa_ler) { s_precisa_ler = false; pedir_leitura(false); }
 
-  s_nivel_desenhado = (int)s_nivel;
+  const bool conteudo = s_nivel == NIVEL_CONTEUDO;
+  const bool texto = conteudo && s_ver == VER_TEXTO;
 
-  if (!tab5_sd_montado()) {
-    tab5_texto(d, 3.625f);
-    d.setTextColor(TFT_RED, TFT_BLACK);
-    d.drawString("CARTÃO NÃO MONTADO      ", x, a.y + 24);
-    tab5_texto(d, 2);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    d.drawString("Confira o encaixe e se está em FAT32.", x, a.y + 90);
-    d.drawString("O motivo exato sai no log (sd).  ", x, a.y + 120);
-    return;
-  }
-
-  const bool texto = (s_nivel == NIVEL_CONTEUDO && !s_e_imagem);
-
-  // ---- cabecalho: [< VOLTAR] titulo [Aa] ------------------------------------
-  // Sempre numa passada completa (toda troca de nivel/pagina pede uma): o
-  // sistema ja limpou a area, nada aqui precisa largura fixa.
+  // ---- cabecalho: [< VOLTAR] titulo [botoes da direita] -----------------
   int titulo_x = x;
   int titulo_fim = a.x + a.largura - MARGEM_X;
-  if (s_nivel != NIVEL_PASTAS) {
-    tab5_botao(d, x, a.y + TOPO_Y, VOLTAR_L, TOPO_A, "< VOLTAR", TFT_SKYBLUE);
+  if (s_nivel != NIVEL_DISCOS) {
+    botao(d, a, MARGEM_X, TOPO_Y, VOLTAR_L, TOPO_A, tr("< VOLTAR"), TEMA_DESTAQUE, TEMA_FUNDO, BT_VOLTAR);
     titulo_x = x + VOLTAR_L + 20;
   }
-  if (texto) {
-    tab5_botao(d, titulo_fim - AA_L, a.y + TOPO_Y, AA_L, TOPO_A, "Aa", d.color565(70, 70, 86), TFT_WHITE);
-    titulo_fim -= AA_L + 16;
+  auto direita = [&](const char* txt, int l, uint16_t cor, uint16_t tinta, bt_id_t id) {
+    titulo_fim -= l;
+    botao(d, a, titulo_fim - a.x, TOPO_Y, l, TOPO_A, txt, cor, tinta, id);
+    titulo_fim -= 12;
+  };
+  if (texto) { direita("Aa", AA_L, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO, BT_AA); }
+#if M5_COM_BERRY
+  if (texto && tab5_arq_tipo(s_arquivo) == TAB5_ARQ_BERRY && strcmp(s_pasta, TAB5_SD_APPS "/Berry")) {
+    direita(tr("Instalar"), 190, TEMA_APP_VERDE, TEMA_FUNDO, BT_INSTALAR);
+  }
+#endif
+  if (s_nivel == NIVEL_PASTA && s_selecionando) {
+    direita(tr("Todos"), 150, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO, BT_TODOS);
+  } else if (s_nivel == NIVEL_PASTA) {
+    if (s_gravavel) { direita(tr("+ Pasta"), 160, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO, BT_NOVA_PASTA); }
+    // COPIAR PARA MUSICA: ha musica aqui, ha pasta de musica, e nao estamos nela.
+    if (s_tem_musica && s_musica_raiz[0] && strncmp(s_pasta, s_musica_raiz, strlen(s_musica_raiz))) {
+      direita(tr("Para Música"), 230, TEMA_APP_ROXO, TEMA_TEXTO, BT_PARA_MUSICA);
+    }
+  }
+  if (s_nivel == NIVEL_LIXEIRA && !s_selecionando && s_n_itens > 0) {
+    // Discreto de proposito: esvaziar apaga de vez (o vermelho fica so na confirmacao).
+    direita(tr("Esvaziar"), 190, TEMA_SUPERFICIE_ALTA, TEMA_TEXTO_2, BT_ESVAZIAR);
   }
   tab5_titulo(d, 36);
   d.setTextDatum(middle_left);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  texto_cabendo(d, (s_nivel == NIVEL_PASTAS) ? (tab5_sd_nome()[0] ? tab5_sd_nome() : "Cartão") : (s_nivel == NIVEL_ARQUIVOS) ? s_pasta : s_arquivo,
-                titulo_x, a.y + TOPO_Y + TOPO_A / 2, titulo_fim - titulo_x);
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+  char titulo_lixo[64];
+  if (s_nivel == NIVEL_LIXEIRA) { snprintf(titulo_lixo, sizeof(titulo_lixo), tr("Lixeira - %s"), tr(tab5_volume_tipo(s_pasta))); }
+  const char* titulo = s_nivel == NIVEL_DISCOS ? tr("Arquivos")
+                     : s_nivel == NIVEL_LIXEIRA ? titulo_lixo
+                     : conteudo ? s_arquivo
+                     : eh_raiz_de_disco(s_pasta) ? tr(tab5_volume_tipo(s_pasta))
+                     : strrchr(s_pasta, '/') + 1;
+  if (titulo_fim > titulo_x + 40) {
+    texto_cabendo(d, titulo, titulo_x, a.y + TOPO_Y + TOPO_A / 2, titulo_fim - titulo_x);
+  }
   d.setTextDatum(top_left);
 
-  // ---- descricao ------------------------------------------------------------
+  // ---- descricao -------------------------------------------------------------
   linha[0] = '\0';
-  if (s_nivel == NIVEL_PASTAS) {
-    tamanho_txt(t1, sizeof(t1), (s_total > s_livre) ? (s_total - s_livre) : 0);
-    tamanho_txt(t2, sizeof(t2), s_total);
-    snprintf(linha, sizeof(linha), "%s | usado %s de %s", tab5_sd_descricao(), t1, t2);
-  } else if (s_nivel == NIVEL_ARQUIVOS) {
-    if (s_n_achados > s_n_itens) {
-      snprintf(linha, sizeof(linha), "%d de %d item(s) - toque para abrir", s_n_itens, s_n_achados);
-    } else {
-      snprintf(linha, sizeof(linha), "%d item(s) - toque para abrir", s_n_itens);
-    }
-  } else if (s_e_imagem) {
-    if (s_img_ok) { snprintf(linha, sizeof(linha), "imagem %ux%u", (unsigned)s_img_largura, (unsigned)s_img_altura); }
-    else          { snprintf(linha, sizeof(linha), "não consegui ler esta imagem"); }
+  uint16_t cor_desc = TEMA_TEXTO_2;
+  if (s_msg[0] && !conteudo) {
+    snprintf(linha, sizeof(linha), "%s", s_msg);
+    cor_desc = s_msg_erro ? TEMA_ALERTA : TEMA_SUCESSO;
+  } else if (s_nivel == NIVEL_DISCOS) {
+    snprintf(linha, sizeof(linha), tr("Toque num disco para abrir."));
+  } else if (s_nivel == NIVEL_PASTA) {
+    char trilha[160];
+    trilha_de(s_pasta, trilha, sizeof(trilha));
+    if (s_selecionando)       { snprintf(linha, sizeof(linha), tr("%d selecionado(s) - toque para marcar"), s_n_sel); }
+    else if (!s_gravavel)     { snprintf(linha, sizeof(linha), tr("%s  (só leitura)"), trilha); }
+    else if (s_n_achados > s_n_itens) { snprintf(linha, sizeof(linha), "%s  ·  %d de %d", trilha, s_n_itens, s_n_achados); }
+    else                      { snprintf(linha, sizeof(linha), tr("%s  ·  segure um item para selecionar"), trilha); }
+  } else if (s_nivel == NIVEL_LIXEIRA) {
+    char peso[16];
+    tab5_bytes_txt(peso, sizeof(peso), s_lixo_bytes);
+    if (s_selecionando) { snprintf(linha, sizeof(linha), tr("%d selecionado(s) - toque para marcar"), s_n_sel); }
+    else                { snprintf(linha, sizeof(linha), tr("%d item(s)  ·  %s  ·  segure um item para selecionar"), s_n_itens, peso); }
+  } else if (s_ver != VER_TEXTO) {
+    if (s_img_largura) { snprintf(linha, sizeof(linha), tr("imagem %ux%u"), (unsigned)s_img_largura, (unsigned)s_img_altura); }
+    else               { snprintf(linha, sizeof(linha), tr("imagem")); }
   }
-  // (a descricao do texto depende de quantas linhas couberam: sai depois dele)
   d.setFont(tab5_fonte_suave(false, 24));
   d.setTextSize(1);
-  d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  d.setTextColor(cor_desc, TEMA_FUNDO);
+  tab5_tela_limpar(a.x, a.y + DESC_Y, a.largura, DIVISA_Y - DESC_Y - 2, TEMA_FUNDO);
   if (!texto) { texto_cabendo(d, linha, x, a.y + DESC_Y, a.largura - 2 * MARGEM_X); }
-  d.drawFastHLine(a.x, a.y + DIVISA_Y, a.largura, d.color565(60, 60, 72));
+  d.drawFastHLine(a.x, a.y + DIVISA_Y, a.largura, TEMA_LINHA);
   tab5_texto(d, TAM_BASE);
 
-  // ---- corpo ----------------------------------------------------------------
-  if (s_nivel == NIVEL_CONTEUDO) { lista_esconder(&s_lista); }   // o conteudo nao usa a lista
-  if (s_nivel == NIVEL_CONTEUDO && s_e_imagem) {
-    desenhar_imagem(d, a, x, a.y + LISTA_Y);
-    return;
-  }
-
-  if (texto) {
-    // O texto primeiro: e ele que diz quantas linhas couberam - e disso
-    // depende o DEPOIS estar ativo e o tamanho da marca na barra.
+  // ---- corpo -----------------------------------------------------------------
+  if (conteudo) {
+    lista_esconder(&s_lista);
+    if (s_ver != VER_TEXTO) { desenhar_imagem(d, a, x, a.y + LISTA_Y); return; }
     s_cabem = desenhar_texto(d, a, a.y + TEXTO_Y);
     const int L = a.largura;
     for (int i = 0; i < 4; ++i) {
       const bool ativo = (i < 2) ? s_linha > 0 : s_linha + s_cabem < s_total_linhas;
-      tab5_botao(d, a.x + nav_x(L, i), a.y + NAV_Y, nav_l(L), NAV_A, NAV_NOME[i],
-                 ativo ? ((i == 0 || i == 3) ? TFT_DARKCYAN : TFT_SKYBLUE) : d.color565(60, 60, 72),
-                 ativo ? TFT_BLACK : TFT_DARKGREY);
+      tab5_botao(d, a.x + nav_x(L, i), a.y + NAV_Y, nav_l(L), NAV_A, tr(NAV_NOME[i]),
+                 ativo ? ((i == 0 || i == 3) ? TEMA_APP_CIANO : TEMA_DESTAQUE) : TEMA_SUPERFICIE_ALTA,
+                 ativo ? TEMA_FUNDO : TEMA_TEXTO_3);
     }
     desenhar_barra(d, a);
-    // Descricao: que linhas estao na tela, de quantas.
     milhar(t1, sizeof(t1), s_linha + 1);
     int ult = s_linha + s_cabem;
     if (ult > s_total_linhas) { ult = s_total_linhas; }
     milhar(t2, sizeof(t2), ult);
     milhar(t3, sizeof(t3), s_total_linhas);
     const int pct = s_total_linhas > 0 ? (int)((int64_t)ult * 100 / s_total_linhas) : 100;
-    if (s_total_linhas <= 0) { snprintf(linha, sizeof(linha), s_c_ocupado ? "lendo..." : "vazio"); }
-    else { snprintf(linha, sizeof(linha), "linhas %s-%s de %s  (%d%%)", t1, t2, t3, pct); }
+    if (s_total_linhas <= 0) { snprintf(linha, sizeof(linha), s_c_ocupado ? tr("lendo...") : tr("vazio")); }
+    else { snprintf(linha, sizeof(linha), tr("linhas %s-%s de %s  (%d%%)"), t1, t2, t3, pct); }
     d.setFont(tab5_fonte_suave(false, 24));
     d.setTextSize(1);
     d.setTextDatum(top_left);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
     texto_cabendo(d, linha, x, a.y + DESC_Y, a.largura - 2 * MARGEM_X);
     tab5_texto(d, TAM_BASE);
     return;
   }
 
-  tab5_texto(d, TAM_LISTA);   // +60%
+  const int rodape = desenhar_rodape(d, a);
+  tab5_texto(d, TAM_LISTA);
   const int y = a.y + LISTA_Y;
-
+  const int fim = a.y + a.altura - 10 - rodape;
   if (s_n_itens == 0) {
     lista_esconder(&s_lista);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    d.drawString(s_listando ? "lendo o cartão...        " : "(vazio)                  ", x, y);
+    tab5_tela_limpar(a.x, y, a.largura, fim - y, TEMA_FUNDO);
+    d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+    d.drawString(s_listando ? tr("lendo...") : (s_nivel == NIVEL_DISCOS ? tr("nenhum disco")
+                 : s_nivel == NIVEL_LIXEIRA ? tr("A lixeira está vazia") : tr("(vazio)")), x, y);
     return;
   }
-
-  // A LISTA: tudo o que sobra abaixo do cabecalho, ate 10px do rodape.
-  const area_t janela = { a.x, y, a.largura, (a.y + a.altura - 10) - y };
-  lista_desenhar(&s_lista, d, janela, TFT_BLACK, TUDO);
+  const area_t janela = { a.x, y, a.largura, fim - y };
+  lista_desenhar(&s_lista, d, janela, TEMA_FUNDO, TUDO);
 }
 
 // ---------------------------------------------------------------------------
-// Toque
+// TOQUE
 // ---------------------------------------------------------------------------
-// Vai para a linha 'nova' do arquivo. 'lembrar': guardar a tela atual para o
-// ANTES voltar a ela (so o DEPOIS lembra; saltos zeram o caminho).
 static void ir_para(int nova, bool lembrar)
 {
   if (nova > s_total_linhas - 1) { nova = s_total_linhas - 1; }
@@ -1203,28 +1525,320 @@ static void pagina_seguinte(void)
 static void pagina_anterior(void)
 {
   if (s_linha <= 0) { return; }
-  int volta;
-  if (s_n_voltas > 0) { volta = s_voltas[--s_n_voltas]; }
-  else                { volta = s_linha - s_cabem; }   // chegou por salto: o mesmo tanto para tras
+  int volta = s_n_voltas > 0 ? s_voltas[--s_n_voltas] : s_linha - s_cabem;
   if (volta < 0) { volta = 0; }
   s_linha = volta;
   s_precisa_ler = true;
   sistema_pedir_redesenho_completo();
 }
 
-// ARRASTE: na lista (pastas/arquivos) rola; no texto, arrastar para cima
-// vira para a pagina seguinte, para baixo volta - como folhear.
-static int  s_arr_y0 = -1;
-static bool s_arr_valeu = false;
-static void ao_tocar_nivel(int x, int y, bool pressionado)
+// Junta os caminhos selecionados (ate 'max') em 'out'. Devolve quantos.
+static int selecionados(char (*out)[TAB5_ARQ_CAMINHO_MAX], int max)
+{
+  int n = 0;
+  for (int i = 0; i < s_n_itens && n < max; ++i) {
+    if (s_sel[i] && juntar(out[n], TAB5_ARQ_CAMINHO_MAX, s_pasta, s_itens[i].nome)) { ++n; }
+  }
+  return n;
+}
+
+static void marcar(int i)
+{
+  if (i < 0 || i >= s_n_itens) { return; }
+  if (!s_sel[i] && s_n_sel >= TAB5_ARQ_ITENS_MAX) {
+    mensagem(tr("Até 64 itens por vez."), true);
+    return;
+  }
+  s_sel[i] = !s_sel[i];
+  s_n_sel += s_sel[i] ? 1 : -1;
+  lista_item_mudou(&s_lista, i);
+  sistema_pedir_redesenho_completo();   // a descricao e o rodape mudam junto
+}
+
+static void abrir_dialogo_nome(bool criar, const char* atual)
+{
+  s_nome_criar = criar;
+  snprintf(s_nome_txt, sizeof(s_nome_txt), "%s", atual ? atual : "");
+  s_dlg = DLG_NOME;
+  tecvirt_abrir(&s_kb, TECVIRT_TEXTO);
+  sistema_pedir_redesenho_completo();
+}
+
+static void fechar_dialogo(void)
+{
+  if (s_dlg == DLG_NOME) { tecvirt_fechar(&s_kb); }
+  s_dlg = DLG_NADA;
+  sistema_pedir_redesenho_completo();
+}
+
+static void nome_tecla(int ac)
+{
+  if (ac == TECVIRT_FECHAR) { fechar_dialogo(); return; }
+  if (ac == TECVIRT_ENVIAR) {
+    if (!op_livre()) { fechar_dialogo(); return; }
+    if (!tab5_arq_nome_valido(s_nome_txt)) { mensagem(tr("Nome inválido (sem / \\ : * ? \" < > |, sem começar com ponto)."), true); fechar_dialogo(); return; }
+    snprintf(s_op.nome, sizeof(s_op.nome), "%s", s_nome_txt);
+    snprintf(s_op.pasta, sizeof(s_op.pasta), "%s", s_pasta);
+    if (!s_nome_criar) { snprintf(s_op_itens[0], sizeof(s_op_itens[0]), "%s", s_nome_alvo); s_op.n = 1; }
+    fechar_dialogo();
+    sair_da_selecao();
+    pedir_op(s_nome_criar ? OP_CRIAR : OP_RENOMEAR);
+    return;
+  }
+  tecvirt_editar(s_nome_txt, sizeof(s_nome_txt), ac);
+  sistema_pedir_redesenho();
+}
+
+// Abre o arquivo 'i' da pasta, pelo tipo ("abrir com").
+static void abrir_arquivo(int i)
+{
+  const tab5_arq_item_t& it = s_itens[i];
+  // .avi: o servico de video abre (e toca o .mp3 de mesmo nome ao lado); o app so mostra.
+  if (tab5_video_suportado(it.nome)) {
+    char caminho[TAB5_ARQ_CAMINHO_MAX + TAB5_ARQ_NOME_MAX];
+    juntar(caminho, sizeof(caminho), s_pasta, it.nome);
+    if (tab5_video_abrir(caminho)) { sistema_abrir_app("Vídeo"); }
+    else { mensagem(tr("Não consegui abrir este vídeo."), true); }
+    return;
+  }
+  if (it.tipo == TAB5_ARQ_MUSICA && !op_livre()) { return; }
+  if (it.tipo == TAB5_ARQ_MUSICA) {
+    snprintf(s_op.pasta, sizeof(s_op.pasta), "%s", s_pasta);
+    snprintf(s_op.nome, sizeof(s_op.nome), "%s", it.nome);
+    pedir_op(OP_TOCAR);
+    return;
+  }
+  // Um .be ABRE como texto (para ler o script antes); instalar e o botao
+  // "Instalar" no alto dessa tela. Antes o toque ja copiava para apps/Berry.
+  snprintf(s_arquivo, sizeof(s_arquivo), "%s", it.nome);
+  s_nivel = NIVEL_CONTEUDO;
+  s_linha = 0;
+  s_cabem = 1;
+  s_n_voltas = 0;
+  s_ver = VER_TEXTO;
+  if (it.tipo == TAB5_ARQ_IMAGEM) {
+    s_ver = VER_IMG;
+    s_total_linhas = 0;
+  } else {
+    s_total_linhas = 0;
+    s_n_linhas = 0;
+    pedir_leitura(true);
+  }
+  ESP_LOGI(TAG, "abrindo %s/%s", s_pasta, s_arquivo);
+  sistema_pedir_redesenho_completo();
+}
+
+// Toque numa linha de disco: os botoes da direita pelo x/dy, senao entra.
+static void tocar_disco(int i, int x, int dy)
+{
+  const disco_t& dk = s_discos[i];
+  if (!dk.v.disponivel) { return; }
+  const area_t a = sistema_area();
+  const int bt_x = a.largura - DISCO_BT_L - 8;
+  if (x >= bt_x) {
+    const bool pendrive = dk.v.id == TAB5_VOL_PENDRIVE;
+    int by = 12;
+    if (pendrive) {
+      if (dy >= by && dy < by + DISCO_BT_A) { pedir_op(OP_EJETAR); return; }
+      by += DISCO_BT_A + 10;
+    }
+    if (dk.lixeira > 0 && dy >= by && dy < by + DISCO_BT_A) { navegar_lixeira(dk.v.raiz); return; }
+  }
+  navegar(dk.v.raiz);
+}
+
+static void voltar(void)
 {
   if (s_nivel == NIVEL_CONTEUDO) {
-    if (s_e_imagem) { return; }
+    s_nivel = NIVEL_PASTA;
+    soltar_imagem();
+    pedir_listagem(true);
+  } else if (s_selecionando) {
+    sair_da_selecao();
+  } else if (s_nivel == NIVEL_LIXEIRA) {
+    navegar("");
+    return;
+  } else if (s_nivel == NIVEL_PASTA) {
+    if (eh_raiz_de_disco(s_pasta)) { navegar(""); return; }
+    char pai[TAB5_ARQ_CAMINHO_MAX];
+    snprintf(pai, sizeof(pai), "%s", s_pasta);
+    if (char* b = strrchr(pai, '/')) { *b = '\0'; }
+    navegar(pai);
+    return;
+  }
+  sistema_pedir_redesenho_completo();
+}
+
+// Copia para s_lixo_alvo os itens marcados na lixeira. Devolve quantos.
+static int lixo_levar_marcados(void)
+{
+  s_lixo_alvo_n = 0;
+  for (int i = 0; i < s_n_itens && s_lixo_alvo_n < TAB5_ARQ_ITENS_MAX; ++i) {
+    if (s_sel[i]) { s_lixo_alvo[s_lixo_alvo_n++] = s_lixo[i]; }
+  }
+  return s_lixo_alvo_n;
+}
+
+// Pede ao worker o que esta em s_lixo_alvo.
+static void lixo_pedir(op_t op)
+{
+  snprintf(s_op.pasta, sizeof(s_op.pasta), "%s", s_pasta);
+  s_op.n = s_lixo_alvo_n;
+  sair_da_selecao();
+  pedir_op(op);
+}
+
+// Pergunta de excluir de vez o que esta em s_lixo_alvo.
+static void lixo_perguntar_excluir(void)
+{
+  s_dlg = DLG_LIXO_EXCLUIR;
+  s_dlg_desde = tab5_agora_ms();
+  sistema_pedir_redesenho_completo();
+}
+
+static void tocar_botao(bt_id_t b)
+{
+  switch (b) {
+    case BT_VOLTAR: voltar(); break;
+    case BT_AA:
+      s_tam_leitura = (s_tam_leitura + 1) % (int)(sizeof(TAM_LEITURA) / sizeof(TAM_LEITURA[0]));
+      sistema_pedir_redesenho_completo();
+      break;
+    case BT_NOVA_PASTA: abrir_dialogo_nome(true, ""); break;
+    case BT_INSTALAR:
+      if (!op_livre()) { break; }
+      caminho_arquivo(s_op_itens[0], sizeof(s_op_itens[0]));
+      s_op.n = 1;
+      pedir_op(OP_INSTALAR);
+      break;
+    case BT_PARA_MUSICA:
+      if (!op_livre()) { break; }
+      // Numa pasta: a pasta inteira (o album vai junto com o nome dele). Na
+      // raiz do disco (que nao se copia): as musicas soltas dela.
+      if (!eh_raiz_de_disco(s_pasta)) {
+        snprintf(s_op_itens[0], sizeof(s_op_itens[0]), "%s", s_pasta);
+        s_op.n = 1;
+      } else {
+        s_op.n = 0;
+        for (int i = 0; i < s_n_itens && s_op.n < TAB5_ARQ_ITENS_MAX; ++i) {
+          if (s_itens[i].tipo == TAB5_ARQ_MUSICA && juntar(s_op_itens[s_op.n], TAB5_ARQ_CAMINHO_MAX, s_pasta, s_itens[i].nome)) { ++s_op.n; }
+        }
+      }
+      if (s_op.n) { pedir_op(OP_PARA_MUSICA); }
+      break;
+    case BT_TODOS: {
+      const bool todos = s_n_sel < s_n_itens && s_n_itens <= TAB5_ARQ_ITENS_MAX;
+      memset(s_sel, todos ? 1 : 0, sizeof(s_sel));
+      s_n_sel = todos ? s_n_itens : 0;
+      if (!todos && s_n_itens > TAB5_ARQ_ITENS_MAX) { mensagem(tr("Até 64 itens por vez."), true); }
+      lista_itens_mudaram(&s_lista, s_n_itens);
+      sistema_pedir_redesenho_completo();
+      break;
+    }
+    case BT_COPIAR:
+    case BT_RECORTAR: {
+      if (!op_livre()) { break; }
+      const int n = selecionados(s_op_itens, TAB5_ARQ_ITENS_MAX);
+      const char* ptrs[TAB5_ARQ_ITENS_MAX];
+      for (int i = 0; i < n; ++i) { ptrs[i] = s_op_itens[i]; }
+      // So texto (as regras de permissao nao tocam no disco): pode na interface.
+      const bool ok = n && tab5_arq_area_por(ptrs, n, b == BT_RECORTAR);
+      sair_da_selecao();
+      char t[96];
+      snprintf(t, sizeof(t), ok ? tr("%d item(s) %s: abra o destino e toque %s.") : tr("Não deu para %s estes itens."),
+               n, b == BT_RECORTAR ? tr("recortados") : tr("copiados"), b == BT_RECORTAR ? tr("Mover aqui") : tr("Colar aqui"));
+      if (!ok) { snprintf(t, sizeof(t), tr("Não deu para %s estes itens."), b == BT_RECORTAR ? tr("recortar") : tr("copiar")); }
+      mensagem(t, !ok);
+      lista_itens_mudaram(&s_lista, s_n_itens);
+      break;
+    }
+    case BT_APAGAR: s_dlg = DLG_APAGAR; sistema_pedir_redesenho_completo(); break;
+    case BT_RENOMEAR:
+      for (int i = 0; i < s_n_itens; ++i) {
+        if (s_sel[i] && juntar(s_nome_alvo, sizeof(s_nome_alvo), s_pasta, s_itens[i].nome)) {
+          abrir_dialogo_nome(false, s_itens[i].nome);
+          break;
+        }
+      }
+      break;
+    case BT_SAIR_SEL: sair_da_selecao(); lista_itens_mudaram(&s_lista, s_n_itens); sistema_pedir_redesenho_completo(); break;
+    case BT_COLAR:
+      if (!op_livre()) { break; }
+      snprintf(s_op.pasta, sizeof(s_op.pasta), "%s", s_pasta);
+      pedir_op(OP_COLAR);
+      break;
+    case BT_LIMPAR_AREA: tab5_arq_area_limpar(); sistema_pedir_redesenho_completo(); break;
+    case BT_CANCELAR_JOB: tab5_arq_cancelar(); break;
+    case BT_OK_JOB: tab5_arq_trabalho_visto(); s_job_fase = TAB5_ARQ_PARADO; sistema_pedir_redesenho_completo(); break;
+    case BT_DLG_NAO: fechar_dialogo(); break;
+    case BT_ESVAZIAR:
+      if (!op_livre()) { break; }
+      snprintf(s_esvaziar_raiz, sizeof(s_esvaziar_raiz), "%s", s_pasta);
+      s_esvaziar_itens = s_n_itens;
+      s_esvaziar_bytes = s_lixo_bytes;
+      s_dlg = DLG_ESVAZIAR;
+      s_dlg_desde = tab5_agora_ms();
+      sistema_pedir_redesenho_completo();
+      break;
+    case BT_LIXO_RESTAURAR:
+      if (!op_livre()) { break; }
+      if (lixo_levar_marcados()) { lixo_pedir(OP_LIXO_RESTAURAR); }
+      break;
+    case BT_LIXO_EXCLUIR:
+      if (!op_livre()) { break; }
+      if (lixo_levar_marcados()) { lixo_perguntar_excluir(); }
+      break;
+    case BT_DLG_RESTAURAR:
+      fechar_dialogo();
+      if (op_livre()) { lixo_pedir(OP_LIXO_RESTAURAR); }
+      break;
+    case BT_DLG_EXCLUIR:
+      lixo_perguntar_excluir();
+      break;
+    case BT_DLG_SIM:
+      if (!op_livre()) { fechar_dialogo(); break; }
+      if (s_dlg == DLG_LIXO_EXCLUIR) {
+        fechar_dialogo();
+        lixo_pedir(OP_LIXO_EXCLUIR);
+      } else if (s_dlg == DLG_APAGAR) {
+        s_op.n = selecionados(s_op_itens, TAB5_ARQ_ITENS_MAX);
+        sair_da_selecao();
+        fechar_dialogo();
+        if (s_op.n) { pedir_op(OP_APAGAR); }
+      } else {
+        snprintf(s_op.pasta, sizeof(s_op.pasta), "%s", s_esvaziar_raiz);
+        fechar_dialogo();
+        pedir_op(OP_ESVAZIAR);
+      }
+      break;
+    default: break;
+  }
+}
+
+// TOQUE LONGO (kernel/toque_longo.hpp): o dedo parado num item da pasta vira "selecionar".
+static toque_longo_t s_lp;
+
+// ARRASTE no texto: para cima vira a pagina seguinte, para baixo volta.
+static int  s_arr_y0 = -1;
+static bool s_arr_valeu = false;
+
+static void ao_tocar_nivel(int x, int y, bool pressionado)
+{
+  if (s_dlg == DLG_NOME) {
+    if (tecvirt_aberto(&s_kb)) {
+      int acoes[8];
+      const int n = tecvirt_nivel(&s_kb, acoes, 8);
+      for (int i = 0; i < n && s_dlg == DLG_NOME; ++i) { nome_tecla(acoes[i]); }
+    }
+    return;
+  }
+  if (s_dlg != DLG_NADA) { return; }
+  if (s_nivel == NIVEL_CONTEUDO) {
+    if (s_ver != VER_TEXTO) { return; }
     if (pressionado) {
-      if (s_arr_y0 < 0) { s_arr_y0 = (y >= TEXTO_Y) ? y : -2; s_arr_valeu = false; }   // so arraste que comeca no texto
+      if (s_arr_y0 < 0) { s_arr_y0 = (y >= TEXTO_Y) ? y : -2; s_arr_valeu = false; }
       else if (s_arr_y0 >= 0 && !s_arr_valeu) {
         const int dy = y - s_arr_y0;
-        // Um arraste vira UMA pagina; a soltura dele nao vira clique.
         if (dy <= -ARRASTE_PAGINA) { s_arr_valeu = true; sistema_consumir_toque(); pagina_seguinte(); }
         else if (dy >= ARRASTE_PAGINA) { s_arr_valeu = true; sistema_consumir_toque(); pagina_anterior(); }
       }
@@ -1233,41 +1847,42 @@ static void ao_tocar_nivel(int x, int y, bool pressionado)
     }
     return;
   }
+  // Toque longo (so nas pastas).
+  if ((s_nivel == NIVEL_PASTA || s_nivel == NIVEL_LIXEIRA) && toque_longo(&s_lp, x, y, pressionado) && !s_listando) {
+    const int i = lista_item_em(&s_lista, x, y, nullptr);
+    if (i >= 0) {
+      sistema_consumir_toque();
+      if (!s_selecionando) { s_selecionando = true; s_n_sel = 0; memset(s_sel, 0, sizeof(s_sel)); lista_itens_mudaram(&s_lista, s_n_itens); }
+      marcar(i);
+      sistema_beep(1800, 25);
+      return;
+    }
+  }
   if (lista_arrastar(&s_lista, x, y, pressionado)) { sistema_pedir_redesenho(); }
 }
 
 static void ao_tocar(int x, int y)
 {
   const area_t a = sistema_area();
-  // ---- VOLTAR ---------------------------------------------------------------
-  if (s_nivel != NIVEL_PASTAS && tab5_dentro(x, y, MARGEM_X, TOPO_Y, VOLTAR_L, TOPO_A)) {
-    if (s_nivel == NIVEL_CONTEUDO) {
-      // De volta a pasta NO MESMO PONTO da lista: quem abriu o 40o log e
-      // voltou quer ver o 41o, nao o topo.
-      s_nivel = NIVEL_ARQUIVOS;
-      soltar_imagem();   // 1,4 MB da foto nao ficam presos na lista
-      listar_arquivos(true);
-    } else if (char* barra = strrchr(s_pasta, '/')) {
-      // Dentro de uma subpasta: VOLTAR sobe um nivel de pasta, nao para a raiz.
-      *barra = '\0';
-      listar_arquivos();
-    } else {
-      s_nivel = NIVEL_PASTAS;
-      listar_pastas();
+  if (s_dlg == DLG_NOME) {
+    if (tecvirt_contem(&s_kb, a.x + x, a.y + y)) {
+      const int ac = tecvirt_clique(&s_kb, a.x + x, a.y + y);
+      if (ac) { nome_tecla(ac); }
     }
-    sistema_pedir_redesenho_completo();
     return;
   }
-
-  if (s_nivel == NIVEL_CONTEUDO && s_e_imagem) { return; }   // so o VOLTAR existe numa imagem
+  const bt_id_t b = botao_tocado(x, y);
+  if (s_dlg != DLG_NADA) {
+    // Um toque duplo nao pode confirmar sem querer um apagar de vez: o SIM so
+    // vale 0,7 s depois de a pergunta aparecer.
+    if (b == BT_DLG_SIM && (s_dlg == DLG_ESVAZIAR || s_dlg == DLG_LIXO_EXCLUIR) && tab5_agora_ms() - s_dlg_desde < 700) { return; }
+    if (b == BT_DLG_SIM || b == BT_DLG_NAO || b == BT_DLG_RESTAURAR || b == BT_DLG_EXCLUIR) { tocar_botao(b); }
+    return;
+  }
+  if (b != BT_NADA) { tocar_botao(b); return; }
 
   if (s_nivel == NIVEL_CONTEUDO) {
-    // Aa: o proximo tamanho de letra. A linha do topo continua a mesma.
-    if (tab5_dentro(x, y, a.largura - MARGEM_X - AA_L, TOPO_Y, AA_L, TOPO_A)) {
-      s_tam_leitura = (s_tam_leitura + 1) % (int)(sizeof(TAM_LEITURA) / sizeof(TAM_LEITURA[0]));
-      sistema_pedir_redesenho_completo();
-      return;
-    }
+    if (s_ver != VER_TEXTO) { return; }
     if (y >= NAV_Y && y < NAV_Y + NAV_A) {
       for (int i = 0; i < 4; ++i) {
         if (x < nav_x(a.largura, i) || x >= nav_x(a.largura, i) + nav_l(a.largura)) { continue; }
@@ -1275,123 +1890,97 @@ static void ao_tocar(int x, int y)
           case 0: ir_para(0, false); break;
           case 1: pagina_anterior(); break;
           case 2: pagina_seguinte(); break;
-          // FIM: a ultima tela - aproximada pelo tanto que cabe agora.
           default: ir_para(s_total_linhas - (s_cabem > 1 ? s_cabem : 1), false); break;
         }
         return;
       }
       return;
     }
-    // Barra: a posicao do dedo vira a linha.
     if (y >= BARRA_TOQUE_Y && y < BARRA_TOQUE_Y + BARRA_TOQUE_A && s_total_linhas > 0) {
       const int l = a.largura - 2 * MARGEM_X;
       int px = x - MARGEM_X;
       if (px < 0) { px = 0; }
       if (px > l) { px = l; }
       ir_para((int)((int64_t)s_total_linhas * px / l), false);
-      return;
     }
-    return;   // no texto, toque solto nao faz nada (arrastar vira a pagina)
+    return;
   }
 
-  // ---- linhas da lista ----------------------------------------------------
-  // A lista responde "qual item" com a MESMA geometria do desenho, rolagem
-  // incluida, e devolve LISTA_ARRASTE se o toque foi o fim de uma rolagem.
   if (s_listando) { return; }   // a lista na tela esta para ser trocada
-  const int i = lista_item_tocado(&s_lista, x, y, nullptr);
-  if (i < 0) { return; }
-
-  if (s_nivel == NIVEL_PASTAS) {
-    snprintf(s_pasta, sizeof(s_pasta), "%s", s_itens[i].nome);
-    s_nivel = NIVEL_ARQUIVOS;
-    listar_arquivos();
-  } else if (s_itens[i].eh_pasta) {
-    // SUBPASTA (Sistema/logs, Sistema/energia): entra nela e
-    // continua no mesmo nivel de listagem; o VOLTAR sobe de volta.
-    const size_t n = strlen(s_pasta);
-    if (n + 1 + strlen(s_itens[i].nome) < sizeof(s_pasta)) {
-      snprintf(s_pasta + n, sizeof(s_pasta) - n, "/%s", s_itens[i].nome);
-      listar_arquivos();
-    }
-  } else {
-    snprintf(s_arquivo, sizeof(s_arquivo), "%s", s_itens[i].nome);
-    s_nivel = NIVEL_CONTEUDO;
-    s_linha = 0;
-    s_cabem = 1;
-    s_n_voltas = 0;
-    s_arr_y0 = -1;
-    s_arr_valeu = false;
-    s_e_imagem = tem_sufixo(s_arquivo, ".bmp");
-    if (s_e_imagem) {
-      char caminho[192];
-      caminho_arquivo(caminho, sizeof(caminho));
-      abrir_cabecalho_imagem(caminho);
-      s_total_linhas = 0;
-      ESP_LOGI(TAG, "abrindo imagem %s/%s (%ux%u, ok=%d)", s_pasta, s_arquivo,
-               (unsigned)s_img_largura, (unsigned)s_img_altura, (int)s_img_ok);
-    } else {
-      // ARQUIVO NOVO, TABELA NOVA. Sem isto os deslocamentos do arquivo
-      // anterior seriam usados neste - e o fseek levaria ao meio de outra
-      // coisa, mostrando conteudo errado sem nenhum erro na tela.
-      // (A tabela de deslocamentos e refeita pelo worker, junto da
-      // contagem - ver trabalho_ler.)
-      s_total_linhas = 0;
-      s_n_linhas = 0;
-      pedir_leitura(true);
-      ESP_LOGI(TAG, "abrindo %s/%s", s_pasta, s_arquivo);
-    }
+  int dy = 0;
+  const int i = lista_item_tocado(&s_lista, x, y, &dy);
+  if (i < 0 || i >= s_n_itens) { return; }
+  if (s_nivel == NIVEL_DISCOS) { tocar_disco(i, x, dy); return; }
+  if (s_selecionando) { marcar(i); return; }
+  if (s_nivel == NIVEL_LIXEIRA) {
+    // Um item: o dialogo (restaurar / excluir de vez / cancelar).
+    if (!op_livre()) { return; }
+    s_lixo_alvo[0] = s_lixo[i];
+    s_lixo_alvo_n = 1;
+    s_dlg = DLG_LIXO_ITEM;
+    sistema_pedir_redesenho_completo();
+    return;
   }
-  sistema_pedir_redesenho_completo();
+  if (s_itens[i].tipo == TAB5_ARQ_PASTA) {
+    char c[TAB5_ARQ_CAMINHO_MAX];
+    if (juntar(c, sizeof(c), s_pasta, s_itens[i].nome)) { navegar(c); }
+    else { mensagem(tr("Caminho longo demais."), true); }
+    return;
+  }
+  abrir_arquivo(i);
 }
 
-// 'extern' e OBRIGATORIO: em C++ um const no escopo de arquivo tem ligacao
-// interna, e o apps.cpp nao enxergaria este simbolo.
+static void ao_teclar(const char* txt, uint8_t codigo, uint8_t)
+{
+  if (s_dlg != DLG_NOME) { return; }
+  if (codigo == TAB5_TECLA_ENTER)       { nome_tecla(TECVIRT_ENVIAR); }
+  else if (codigo == TAB5_TECLA_ESC)    { nome_tecla(TECVIRT_FECHAR); }
+  else if (codigo == TAB5_TECLA_APAGAR) { nome_tecla(TECVIRT_APAGAR); }
+  else if (!codigo && txt && txt[0] && strlen(s_nome_txt) + strlen(txt) < sizeof(s_nome_txt)) {
+    strcat(s_nome_txt, txt);
+    sistema_pedir_redesenho();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ICONE DA TELA INICIAL
 // ---------------------------------------------------------------------------
-// Primitivas e fracao do lado, como a marca do Mesh: sai limpo em qualquer
-// tamanho, nao gasta flash e nao serrilha. A letra grande que estava aqui era
-// a fonte embutida ampliada 6x - cada pixel dela virava um quadrado de 6.
 static void icone_arquivos(lgfx::LovyanGFX& d, int x, int y, int lado)
 {
   const uint16_t fundo = d.color565(30, 48, 70);
   const uint16_t pasta = d.color565(240, 190, 90);
   const uint16_t aba   = d.color565(205, 155, 60);
-
   d.fillRoundRect(x, y, lado, lado, lado / 6, fundo);
-
   #define IX(f) (x + (int)((f) * lado))
   #define IY(f) (y + (int)((f) * lado))
-
-  // ORDEM IMPORTA: aba, folha, corpo. Cada camada cobre a junta da anterior,
-  // e a pasta sai como peca unica em vez de retangulos encostados. A folha no
-  // meio e o que diz que ha coisa DENTRO - desenhada por ULTIMO ela viraria
-  // uma etiqueta colada por cima, que e outra leitura.
-  d.fillRoundRect(IX(0.16f), IY(0.26f), (int)(0.34f * lado), (int)(0.14f * lado),
-                  lado / 22, aba);
-  d.fillRoundRect(IX(0.26f), IY(0.30f), (int)(0.48f * lado), (int)(0.10f * lado),
-                  lado / 30, d.color565(245, 245, 245));
-  d.fillRoundRect(IX(0.16f), IY(0.36f), (int)(0.68f * lado), (int)(0.40f * lado),
-                  lado / 16, pasta);
-
+  // ORDEM IMPORTA: aba, folha, corpo - cada camada cobre a junta da anterior.
+  d.fillRoundRect(IX(0.16f), IY(0.26f), (int)(0.34f * lado), (int)(0.14f * lado), lado / 22, aba);
+  d.fillRoundRect(IX(0.26f), IY(0.30f), (int)(0.48f * lado), (int)(0.10f * lado), lado / 30, d.color565(245, 245, 245));
+  d.fillRoundRect(IX(0.16f), IY(0.36f), (int)(0.68f * lado), (int)(0.40f * lado), lado / 16, pasta);
   #undef IX
   #undef IY
 }
 
+// 'extern' e OBRIGATORIO: em C++ um const no escopo de arquivo tem ligacao
+// interna, e o apps.cpp nao enxergaria este simbolo.
 extern const app_t APP_ARQUIVOS = {
   .nome  = "Arquivos",
   .cor   = TFT_SKYBLUE,
   .perfil = { },
+  // O cartao fica montado com o app aberto (ele e o disco principal). Sem
+  // cartao o app abre assim mesmo: o pendrive pode estar ai.
   .usa_sd = true,
-  .exige_sd = true,         // sem cartao nao ha o que fazer (ver app.h)
-  .piso_repouso_mhz = 0,
+  .exige_sd = false,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
   .ao_tocar  = ao_tocar,
   .ao_tocar_nivel = ao_tocar_nivel,
+  .ao_teclar = ao_teclar,
   .periodo_ms = 0,
-  .avisos = AVISO_TRABALHO,
+  .periodo_agora = periodo_agora,
+  .avisos = AVISO_TRABALHO | AVISO_VOLUMES | AVISO_ARQUIVOS,
   .ao_aviso = ao_aviso,
   .icone = icone_arquivos,
+  .fundo_tema = true,   // o sistema limpa a area com TEMA_FUNDO
 };

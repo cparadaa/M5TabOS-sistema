@@ -1,6 +1,8 @@
 #include "teclado_virtual.hpp"
+#include "idioma.h"
 #include "tab5_tela.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "tab5_hora.hpp"   // tab5_agora_ms
@@ -8,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// TRES PAGINAS, mesma geometria (10/10/9/7 teclas): trocar de pagina so troca
+// QUATRO PAGINAS, mesma geometria (10/10/9/7 teclas): trocar de pagina so troca
 // rotulos, nada pula de lugar. Cada tecla e UM caractere UTF-8.
 //  0 letras: a fileira dos numeros fica sempre (senha, PIN e hora sem trocar
 //    de pagina).
@@ -16,14 +18,51 @@
 //  2 "=\<": o resto do ASCII e os acentos do portugues (a fonte do sistema
 //    tem estes e nao muito mais - ver ferramentas/gerar_fontes.py). Os
 //    acentos seguem o shift, como as letras.
+//  3 emoji: os do dia a dia, todos da tabela leve do sistema (tab5_emoji -
+//    a mesma do Mesh); nas paginas de simbolos a tecla da esquerda circula
+//    "=\<" -> emoji -> "?123". Emoji nao volta as letras sozinho: da para
+//    mandar varios seguidos.
 static const int N_FILA[TECVIRT_FILAS] = { 10, 10, 9, 7 };
-static const char* const PAGINA[3][TECVIRT_FILAS] = {
+static const char* const PAGINA[4][TECVIRT_FILAS] = {
   { "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm" },
   { "1234567890", "@#$%&-+()/", "*\"':;!?_=", "[]{}<>\\" },
   { "1234567890", "áàâãéêíóôõ", "úç°ºª|~^`", "•…«»×÷±" },
+  { "😀😂🤣😊😍😘😉😎🤔😢", "😭😡😱🥳😇🤗👍👎👏🙏", "💪👋👀🔥🎉❤⭐✅❌", "💡📍🏠☀⚡☕🎵" },
 };
 
 #define FILAS   TECVIRT_FILAS
+
+// O PERFIL DE CADA TIPO DE CAMPO (a tabela do .hpp). A unica fonte: abrir e
+// tecvirt_tipo copiam daqui para o teclado.
+enum { ACAO_OK = 0, ACAO_LINHA, ACAO_BUSCAR };
+typedef struct {
+  uint8_t acao;        // o que a tecla verde e
+  bool    frase;       // maiuscula automatica e espaco duplo (com tecvirt_contexto)
+  bool    variantes;   // acentos no toque longo
+  bool    emoji;       // a pagina de emoji
+  bool    ascii;       // so ASCII
+  bool    digitos;     // so 0-9
+} perfil_t;
+static const perfil_t PERFIL[TECVIRT_TIPOS] = {
+  /* TEXTO     */ { ACAO_OK,     false, true,  false, false, false },
+  /* ASCII     */ { ACAO_OK,     false, false, false, true,  false },
+  /* SENHA     */ { ACAO_OK,     false, false, false, true,  false },
+  /* NUMERO    */ { ACAO_OK,     false, false, false, true,  true  },
+  /* BUSCA     */ { ACAO_BUSCAR, false, true,  false, false, false },
+  /* PARAGRAFO */ { ACAO_LINHA,  true,  true,  true,  false, false },
+  /* CODIGO    */ { ACAO_LINHA,  false, true,  false, false, false },
+  /* COMANDO   */ { ACAO_LINHA,  false, true,  false, false, false },
+};
+static const perfil_t& perfil(const tecvirt_t* t) { return PERFIL[t->tipo < TECVIRT_TIPOS ? t->tipo : TECVIRT_TEXTO]; }
+
+// TOQUE LONGO: as variantes de cada tecla (minusculas; o shift vale), na
+// ordem do teclado do Android. So o que a fonte do sistema desenha
+// (ferramentas/gerar_fontes.py): sem i grave e sem U grave maiusculo.
+static const struct { int base; const char* var; } VARIANTES[] = {
+  { 'a', "áàâãä" }, { 'e', "éêèë" }, { 'i', "íîï" }, { 'o', "óôõòö" },
+  { 'u', "úüû" },   { 'c', "ç" },    { 'n', "ñ" },
+  { '.', "!?,;:…" },   // a tecla do ponto, na fileira de comando
+};
 
 // ---------------------------------------------------------------------------
 // MEDIDAS POR ORIENTACAO
@@ -39,9 +78,14 @@ static int  alt_t(const area_t& a)    { return em_pe(a) ? 68 : 52; }   // altura
 static int  vao(const area_t& a)      { return em_pe(a) ? 5 : 6; }
 static int  px_letra(const area_t& a) { return em_pe(a) ? 34 : 30; }   // fonte das letras e numeros
 
+static int altura_teclas(const area_t& a) { return vao(a) + (FILAS + 1) * (alt_t(a) + vao(a)); }
+
+// O fisico encaixado esconde o virtual (ver o .hpp).
+static bool fisico(void) { return tab5_teclado_presente(); }
+
 int tecvirt_altura(const area_t& a)
 {
-  return vao(a) + (FILAS + 1) * (alt_t(a) + vao(a));
+  return fisico() ? 0 : altura_teclas(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,19 +157,20 @@ static int cp_tecla(const tecvirt_t* t, int fila, int col)
 #define ICO_SHIFT1 "\x02"
 #define ICO_CAPS   "\x03"
 #define ICO_APAGA  "\x04"
+#define ICO_ENTER  "\x05"   // nova linha (a fonte nao tem o simbolo)
 enum { E_SHIFT, E_APAGA, E_MODO, E_VIRG, E_ESPACO, E_PONTO, E_ENVIAR, E_FECHAR, NESP };
 #define ID_ESP(i) (64 + (i))
 #define CMD0 E_MODO   // a primeira especial da fileira de comando
 typedef struct { uint16_t cor; int acao; int meias; } esp_t;
 static const esp_t ESP[NESP] = {
-  { TFT_LIGHTGREY,   0,              0 },   // shift / troca de pagina de simbolos (interna)
-  { TFT_ORANGE,      TECVIRT_APAGAR, 0 },
-  { TFT_CYAN,        0,              3 },   // ?123 / ABC (interna)
-  { TFT_LIGHTGREY,   ',',            2 },
-  { TFT_LIGHTGREY,   ' ',            8 },
-  { TFT_LIGHTGREY,   '.',            2 },
-  { TFT_GREENYELLOW, TECVIRT_ENVIAR, 3 },
-  { TFT_RED,         TECVIRT_FECHAR, 2 },
+  { TEMA_LINHA,    0,              0 },   // shift / troca de pagina de simbolos (interna)
+  { TEMA_LINHA,    TECVIRT_APAGAR, 0 },
+  { TEMA_LINHA,    0,              3 },   // ?123 / ABC (interna)
+  { TEMA_LINHA,    ',',            2 },
+  { TEMA_LINHA,    ' ',            8 },
+  { TEMA_LINHA,    '.',            2 },
+  { TEMA_DESTAQUE, TECVIRT_ENVIAR, 3 },   // a unica tecla de destaque: enviar / OK
+  { TEMA_LINHA,    TECVIRT_FECHAR, 2 },
 };
 
 // O rotulo da especial no estado atual.
@@ -134,28 +179,34 @@ static const char* rotulo_esp(const tecvirt_t* t, int i)
   switch (i) {
     case E_SHIFT:
       if (t->pagina == 1) { return "=\\<"; }
-      if (t->pagina == 2) { return "?123"; }
+      if (t->pagina == 2) { return "😀"; }
+      if (t->pagina == 3) { return "?123"; }
       return t->shift == TECVIRT_SHIFT_TRAVA ? ICO_CAPS : t->shift == TECVIRT_SHIFT_UMA ? ICO_SHIFT1 : ICO_SHIFT;
     case E_APAGA:  return ICO_APAGA;
     case E_MODO:   return t->pagina ? "ABC" : "?123";
     case E_VIRG:   return ",";
-    case E_ESPACO: return "espaço";
+    case E_ESPACO: return tr("espaço");
     case E_PONTO:  return ".";
-    case E_ENVIAR: return "ENVIAR";
+    case E_ENVIAR:
+      switch (perfil(t).acao) {
+        case ACAO_LINHA:  return ICO_ENTER;
+        case ACAO_BUSCAR: return tr("BUSCAR");
+        default:          return "OK";
+      }
     default:       return "X";
   }
 }
 
 static uint16_t cor_esp(const tecvirt_t* t, int i)
 {
-  if (i == E_SHIFT && t->pagina == 0 && t->shift != TECVIRT_SHIFT_NAO) { return TFT_CYAN; }   // aceso = vale
+  if (i == E_SHIFT && t->pagina == 0 && t->shift != TECVIRT_SHIFT_NAO) { return TEMA_DESTAQUE; }   // aceso = vale
   return ESP[i].cor;
 }
 
 // ---------------------------------------------------------------------------
 // GEOMETRIA - calculada e nao tabelada: a largura muda com a rotacao.
 // ---------------------------------------------------------------------------
-static int topo_de(const area_t& a) { return a.y + a.altura - tecvirt_altura(a); }
+static int topo_de(const area_t& a) { return a.y + a.altura - altura_teclas(a); }
 static int y_fila(const area_t& a, int f) { return topo_de(a) + vao(a) + f * (alt_t(a) + vao(a)); }
 static int larg_tecla(const area_t& a) { return (a.largura - 2 * vao(a) - vao(a) * 9) / 10; }   // pela maior fileira
 static int recuo_fila(const area_t& a, int f)
@@ -276,12 +327,13 @@ static bool eh_apagar(int id) { return id == ID_ESP(E_APAGA); }
 // respiro de cada lado).
 static void medir(tecvirt_t* t, lgfx::LovyanGFX& d)
 {
-  static const char* const VARIANTES[NESP][2] = {
+  const char* const VARIANTES[NESP][2] = {   // os rotulos no idioma atual
     { "=\\<", "?123" }, { "", "" }, { "?123", "ABC" }, { ",", "" },
-    { "espaço", "" }, { ".", "" }, { "ENVIAR", "" }, { "X", "" },
+    { tr("espaço"), "" }, { ".", "" }, { "OK", tr("BUSCAR") }, { "X", "" },
   };
-  if (t->med_larg == t->a.largura) { return; }
-  t->med_larg = t->a.largura;
+  const int chave = t->a.largura ^ (int)(idioma_versao() << 16);   // outra largura ou outro idioma: mede de novo
+  if (t->med_larg == chave) { return; }
+  t->med_larg = chave;
   for (int i = 0; i < NESP; ++i) {
     int x, y, l;
     especial_em(t->a, i, &x, &y, &l);
@@ -298,26 +350,37 @@ static void medir(tecvirt_t* t, lgfx::LovyanGFX& d)
 
 // Seta do shift: cheia quando vale (uma letra ou travado), so o contorno
 // quando solta; travado ganha a barra embaixo.
-static void icone_shift(lgfx::LovyanGFX& d, int cx, int cy, char tipo)
+static void icone_shift(lgfx::LovyanGFX& d, int cx, int cy, char tipo, uint16_t tinta)
 {
   const int oy = (tipo == ICO_CAPS[0]) ? cy - 3 : cy;
   if (tipo == ICO_SHIFT[0]) {
     for (int o = 0; o < 2; ++o) {
-      d.drawTriangle(cx, oy - 15 + o, cx - 15 + o, oy + 1 - o, cx + 15 - o, oy + 1 - o, TFT_BLACK);
-      d.drawRect(cx - 6 + o, oy + 1 - o, 12 - 2 * o, 13, TFT_BLACK);
+      d.drawTriangle(cx, oy - 15 + o, cx - 15 + o, oy + 1 - o, cx + 15 - o, oy + 1 - o, tinta);
+      d.drawRect(cx - 6 + o, oy + 1 - o, 12 - 2 * o, 13, tinta);
     }
     return;
   }
-  d.fillTriangle(cx, oy - 15, cx - 15, oy + 1, cx + 15, oy + 1, TFT_BLACK);
-  d.fillRect(cx - 6, oy + 1, 12, 13, TFT_BLACK);
-  if (tipo == ICO_CAPS[0]) { d.fillRect(cx - 13, oy + 18, 26, 4, TFT_BLACK); }
+  d.fillTriangle(cx, oy - 15, cx - 15, oy + 1, cx + 15, oy + 1, tinta);
+  d.fillRect(cx - 6, oy + 1, 12, 13, tinta);
+  if (tipo == ICO_CAPS[0]) { d.fillRect(cx - 13, oy + 18, 26, 4, tinta); }
+}
+
+// Nova linha: o desenho de sempre do "return" - desce pela direita e volta
+// para a esquerda com a ponta da seta.
+static void icone_enter(lgfx::LovyanGFX& d, int cx, int cy, uint16_t tinta)
+{
+  for (int o = 0; o < 3; ++o) {
+    d.drawFastVLine(cx + 12 + o, cy - 14, 18, tinta);
+    d.drawFastHLine(cx - 12, cy + 2 + o, 27, tinta);
+  }
+  d.fillTriangle(cx - 22, cy + 3, cx - 10, cy - 7, cx - 10, cy + 13, tinta);
 }
 
 // Apagar: corpo com ponta a esquerda e um X vazado na cor da tecla.
-static void icone_apagar(lgfx::LovyanGFX& d, int cx, int cy, uint16_t cor)
+static void icone_apagar(lgfx::LovyanGFX& d, int cx, int cy, uint16_t cor, uint16_t tinta)
 {
-  d.fillTriangle(cx - 24, cy, cx - 9, cy - 14, cx - 9, cy + 14, TFT_BLACK);
-  d.fillRect(cx - 9, cy - 14, 33, 29, TFT_BLACK);
+  d.fillTriangle(cx - 24, cy, cx - 9, cy - 14, cx - 9, cy + 14, tinta);
+  d.fillRect(cx - 9, cy - 14, 33, 29, tinta);
   for (int o = -1; o <= 1; ++o) {
     d.drawLine(cx + 1 + o, cy - 6, cx + 13 + o, cy + 6, cor);
     d.drawLine(cx + 13 + o, cy - 6, cx + 1 + o, cy + 6, cor);
@@ -339,31 +402,68 @@ static void pintar_tecla(const tecvirt_t* t, lgfx::LovyanGFX& d, int id, bool ac
   } else {
     letra[tecvirt_utf8(cp_tecla(t, id / 16, id % 16), letra)] = 0;
     txt = letra;
-    cor = TFT_LIGHTGREY;
+    cor = TEMA_SUPERFICIE_ALTA;
     px  = px_letra(t->a);
   }
-  // Acesa = AZUL, e nao "a mesma cor mais clara": debaixo do dedo so a borda
-  // aparece, e uma cor DIFERENTE e o que se ve nela.
-  if (acesa) { cor = TFT_SKYBLUE; }
-  d.fillRoundRect(x, y, l, alt_t(t->a), 8, cor);
+  // Letra e icone: branco sobre o destaque, texto comum nas demais.
+  const uint16_t tinta = cor == TEMA_DESTAQUE ? (uint16_t)TEMA_SOBRE_DESTAQUE : (uint16_t)TEMA_TEXTO;
+  // Acesa = DESTAQUE_SUAVE, e nao "a mesma cor mais clara": debaixo do dedo so
+  // a borda aparece, e uma cor DIFERENTE e o que se ve nela.
+  if (acesa) { cor = TEMA_DESTAQUE_SUAVE; }
+  d.fillRoundRect(x, y, l, alt_t(t->a), TEMA_RAIO_M, cor);
 
   const int cx = x + l / 2, cy = y + alt_t(t->a) / 2;
   if ((unsigned char)txt[0] < 0x20) {
-    if (txt[0] == ICO_APAGA[0]) { icone_apagar(d, cx, cy, cor); }
-    else                        { icone_shift(d, cx, cy, txt[0]); }
+    if (txt[0] == ICO_APAGA[0])      { icone_apagar(d, cx, cy, cor, tinta); }
+    else if (txt[0] == ICO_ENTER[0]) { icone_enter(d, cx, cy, tinta); }
+    else                             { icone_shift(d, cx, cy, txt[0], tinta); }
     return;
   }
   d.setFont(tab5_fonte_suave(true, px));
-  d.setTextColor(TFT_BLACK, cor);
+  d.setTextColor(tinta, cor);
   d.drawString(txt, cx, cy);
+}
+
+static void soltar_dedos(tecvirt_t* t);
+
+// A FAIXA DAS VARIANTES (toque longo), por cima da fileira de cima da tecla:
+// uma celula por variante, a escolhida em destaque.
+static void pintar_faixa(tecvirt_t* t, lgfx::LovyanGFX& d)
+{
+  const int a = alt_t(t->a);
+  d.fillRoundRect(t->pop_x - 4, t->pop_y - 4, t->pop_n * t->pop_l + 8, a + 8, TEMA_RAIO_M, TEMA_LINHA);
+  d.setFont(tab5_fonte_suave(true, px_letra(t->a)));
+  for (int k = 0; k < t->pop_n; ++k) {
+    const int x = t->pop_x + k * t->pop_l;
+    const uint16_t cor = k == t->pop_sel ? (uint16_t)TEMA_DESTAQUE : (uint16_t)TEMA_SUPERFICIE_ALTA;
+    d.fillRoundRect(x + 2, t->pop_y, t->pop_l - 4, a, TEMA_RAIO_M, cor);
+    char u[5];
+    u[tecvirt_utf8(t->pop_cp[k], u)] = 0;
+    d.setTextColor(k == t->pop_sel ? (uint16_t)TEMA_SOBRE_DESTAQUE : (uint16_t)TEMA_TEXTO, cor);
+    d.drawString(u, x + t->pop_l / 2, t->pop_y + a / 2);
+  }
+}
+
+// Visivel ou nao (o fisico entrou ou saiu com ele aberto): a trava da
+// navegacao acompanha, e o app redesenha inteiro - a area dele mudou de tamanho.
+static void sincronizar(tecvirt_t* t)
+{
+  const bool quer = t->aberto && !fisico();
+  if (quer == t->trava) { return; }
+  t->trava = quer;
+  t->sujo = true;
+  soltar_dedos(t);
+  sistema_travar_navegacao(quer);
+  sistema_pedir_redesenho_completo();
 }
 
 void tecvirt_pintar(tecvirt_t* t, lgfx::LovyanGFX& d, bool completo)
 {
-  if (!t->aberto) { return; }
+  sincronizar(t);
+  if (!t->aberto || fisico()) { return; }
   const bool tudo = completo || t->sujo;
   const bool rot  = !tudo && t->rotulos;
-  if (!tudo && !rot && t->tecla_sob == t->tecla_pinta) { return; }   // nada mudou: nem toca na tela
+  if (!tudo && !rot && t->tecla_sob == t->tecla_pinta && !t->pop_pintar) { return; }   // nada mudou: nem toca na tela
 
   const lgfx::TextStyle estilo = d.getTextStyle();
   const lgfx::IFont* fonte = d.getFont();
@@ -373,9 +473,13 @@ void tecvirt_pintar(tecvirt_t* t, lgfx::LovyanGFX& d, bool completo)
 
   if (tudo || rot) {
     // O fundo so e limpo quando o teclado aparece ou muda de lugar; na troca
-    // de shift/pagina as teclas sao opacas, os cantos ja estao pretos, e
+    // de shift/pagina as teclas sao opacas, os cantos ja estao no fundo do painel, e
     // repintar todas e mais simples (e quase tao barato) que escolher quais.
-    if (tudo) { tab5_tela_limpar(t->a.x, topo_de(t->a), t->a.largura, tecvirt_altura(t->a), TFT_BLACK); }
+    if (tudo) { tab5_tela_limpar(t->a.x, topo_de(t->a), t->a.largura, altura_teclas(t->a), TEMA_SUPERFICIE); }
+    else if (t->pop_limpar) {   // a faixa fechou: so o retangulo dela (as teclas vem em seguida)
+      tab5_tela_limpar(t->pop_x - 4, t->pop_y - 4, t->pop_n * t->pop_l + 8, alt_t(t->a) + 8, TEMA_SUPERFICIE);
+    }
+    t->pop_limpar = false;
     for (int f = 0; f < FILAS; ++f) {
       for (int c = 0; c < N_FILA[f]; ++c) { pintar_tecla(t, d, f * 16 + c, f * 16 + c == t->tecla_sob); }
     }
@@ -387,6 +491,8 @@ void tecvirt_pintar(tecvirt_t* t, lgfx::LovyanGFX& d, bool completo)
     if (t->tecla_sob   != TECVIRT_NENHUMA) { pintar_tecla(t, d, t->tecla_sob, true); }
   }
   t->tecla_pinta = t->tecla_sob;
+  if (t->pop_dedo >= 0 && (tudo || rot || t->pop_pintar)) { pintar_faixa(t, d); }
+  t->pop_pintar = false;
 
   d.setFont(fonte);
   d.setTextStyle(estilo);
@@ -404,7 +510,19 @@ static void mudar(tecvirt_t* t, uint8_t shift, uint8_t pagina)
   sistema_pedir_redesenho();
 }
 
-void tecvirt_frase(tecvirt_t* t, bool ligada) { t->frase = ligada; }
+void tecvirt_tipo(tecvirt_t* t, uint8_t tipo)
+{
+  if (tipo >= TECVIRT_TIPOS) { tipo = TECVIRT_TEXTO; }
+  t->tipo = tipo;
+  t->frase = PERFIL[tipo].frase;
+  t->tem_contexto = false;
+  t->ult_acao = 0;
+  // A pagina atual pode ter sumido (emoji num campo de senha): volta as letras.
+  if (t->pagina == 3 && !PERFIL[tipo].emoji) { t->pagina = 0; }
+  if (!t->frase && t->shift == TECVIRT_SHIFT_UMA) { t->shift = TECVIRT_SHIFT_NAO; }
+  t->rotulos = true;
+  sistema_pedir_redesenho();
+}
 
 void tecvirt_contexto(tecvirt_t* t, const char* texto, int cursor)
 {
@@ -413,13 +531,17 @@ void tecvirt_contexto(tecvirt_t* t, const char* texto, int cursor)
   const int n = texto ? (int)strlen(texto) : 0;
   if (i > n) { i = n; }
   if (i < 0) { i = 0; }
+  t->antes[0] = i > 0 ? texto[i - 1] : 0;
+  t->antes[1] = i > 1 ? texto[i - 2] : 0;
+  t->tem_contexto = true;
   bool espaco = false;
   while (i > 0 && texto[i - 1] == ' ') { --i; espaco = true; }
-  const bool inicio = i == 0 || (espaco && (texto[i - 1] == '.' || texto[i - 1] == '!' || texto[i - 1] == '?'));
+  const bool inicio = i == 0 || texto[i - 1] == '\n'
+                  || (espaco && (texto[i - 1] == '.' || texto[i - 1] == '!' || texto[i - 1] == '?'));
   mudar(t, inicio ? TECVIRT_SHIFT_UMA : TECVIRT_SHIFT_NAO, t->pagina);
 }
 
-bool tecvirt_editar(char* buf, size_t cap, int acao, bool so_ascii)
+bool tecvirt_editar(char* buf, size_t cap, int acao)
 {
   size_t n = strlen(buf);
   if (acao == TECVIRT_APAGAR) {
@@ -431,7 +553,7 @@ bool tecvirt_editar(char* buf, size_t cap, int acao, bool so_ascii)
     return true;
   }
   if (acao <= 0) { return false; }
-  if (acao < 0x20 || (so_ascii && acao >= 0x7F)) { return true; }
+  if (acao < 0x20) { return true; }
   char u[4];
   const int k = tecvirt_utf8(acao, u);
   if (n + k < cap) { memcpy(buf + n, u, k); buf[n + k] = 0; }
@@ -450,11 +572,12 @@ static void soltar_dedos(tecvirt_t* t)
     dd.cand_n = 0;
     dd.eco = dd.repetiu = false;
   }
+  if (t->pop_dedo >= 0) { t->pop_dedo = -1; t->pop_limpar = t->rotulos = true; }   // a faixa some com os dedos
 }
 
-void tecvirt_abrir(tecvirt_t* t)
+void tecvirt_abrir(tecvirt_t* t, uint8_t tipo)
 {
-  if (t->aberto) { return; }
+  if (t->aberto) { if (tipo != t->tipo) { tecvirt_tipo(t, tipo); } return; }
   t->aberto = true;
   t->shift = TECVIRT_SHIFT_NAO;
   t->pagina = 0;
@@ -463,8 +586,14 @@ void tecvirt_abrir(tecvirt_t* t)
   t->livre = 0;
   t->tecla_sob = t->tecla_pinta = t->ultima_tecla = TECVIRT_NENHUMA;
   t->solta.tecla = TECVIRT_NENHUMA;
+  t->pop_dedo = -1;
+  t->pop_limpar = false;
   soltar_dedos(t);
-  sistema_travar_navegacao(true);   // o INICIO fica logo abaixo da tecla de espaco
+  tecvirt_tipo(t, tipo);
+  // O INICIO fica logo abaixo da tecla de espaco - mas so com o virtual na
+  // tela: com o fisico, nada cobre a navegacao.
+  t->trava = !fisico();
+  if (t->trava) { sistema_travar_navegacao(true); }
 }
 
 void tecvirt_fechar(tecvirt_t* t)
@@ -473,7 +602,7 @@ void tecvirt_fechar(tecvirt_t* t)
   t->aberto = false;
   t->tecla_sob = t->tecla_pinta = TECVIRT_NENHUMA;
   soltar_dedos(t);
-  sistema_travar_navegacao(false);
+  if (t->trava) { t->trava = false; sistema_travar_navegacao(false); }
 }
 
 void tecvirt_posicionar(tecvirt_t* t, const area_t& a)
@@ -486,7 +615,7 @@ void tecvirt_posicionar(tecvirt_t* t, const area_t& a)
 
 bool tecvirt_contem(const tecvirt_t* t, int xs, int ys)
 {
-  return t->aberto && ys >= topo_de(t->a) && xs >= t->a.x && xs < t->a.x + t->a.largura;
+  return t->aberto && !fisico() && ys >= topo_de(t->a) && xs >= t->a.x && xs < t->a.x + t->a.largura;
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +642,15 @@ static bool dedos_ativos(const tecvirt_t* t)
 // um toque travado solta. Nas paginas de simbolos a mesma tecla alterna
 // entre as duas paginas. ESPACO numa pagina de simbolos volta as letras, e
 // um acento (pagina 2) tambem: a palavra continua em letras.
+// O tipo do campo aceita este caractere?
+static bool aceita(const tecvirt_t* t, int cp)
+{
+  const perfil_t& p = perfil(t);
+  if (p.digitos) { return cp >= '0' && cp <= '9'; }
+  if (p.ascii)   { return cp >= 0x20 && cp < 0x7F; }
+  return true;
+}
+
 static int confirmar(tecvirt_t* t, int tecla)
 {
   static const uint32_t REPIQUE_MS     = 45;
@@ -525,7 +663,13 @@ static int confirmar(tecvirt_t* t, int tecla)
   t->ultima_tecla = (int16_t)tecla;
 
   if (tecla == ID_ESP(E_SHIFT)) {
-    if (t->pagina) { mudar(t, t->shift, t->pagina == 1 ? 2 : 1); return 0; }
+    // Nas paginas de simbolos ela circula "?123" -> "=\<" -> emoji, e o emoji
+    // so existe nos tipos que o aceitam.
+    if (t->pagina) {
+      const uint8_t prox = t->pagina == 1 ? 2 : (t->pagina == 2 && perfil(t).emoji) ? 3 : 1;
+      mudar(t, t->shift, prox);
+      return 0;
+    }
     uint8_t s = TECVIRT_SHIFT_NAO;
     if (t->shift == TECVIRT_SHIFT_NAO)                                   { s = TECVIRT_SHIFT_UMA; }
     else if (t->shift == TECVIRT_SHIFT_UMA && agora - t->shift_ms < SHIFT_DUPLO_MS) { s = TECVIRT_SHIFT_TRAVA; }
@@ -539,9 +683,12 @@ static int confirmar(tecvirt_t* t, int tecla)
   if (tecla >= 64) {
     if (tecla - 64 >= NESP) { return 0; }
     ac = ESP[tecla - 64].acao;
+    if (ac == TECVIRT_ENVIAR && perfil(t).acao == ACAO_LINHA) { ac = TECVIRT_LINHA; }
   } else {
     ac = cp_tecla(t, tecla / 16, tecla % 16);
   }
+  // O QUE O CAMPO NAO ACEITA NAO SAI (e nao muda shift nem pagina).
+  if (ac > 0 && !aceita(t, ac)) { return 0; }
   if (ac > 0) {
     // Depois do caractere: o shift de UMA letra solta; espaco e acento voltam as letras.
     const uint8_t s = t->shift == TECVIRT_SHIFT_UMA ? (uint8_t)TECVIRT_SHIFT_NAO : t->shift;
@@ -550,6 +697,66 @@ static int confirmar(tecvirt_t* t, int tecla)
   }
   return ac;
 }
+
+// ---------------------------------------------------------------------------
+// TOQUE LONGO: A FAIXA DAS VARIANTES
+// ---------------------------------------------------------------------------
+// As variantes da tecla agora (so na pagina das letras). 0 = nenhuma.
+static int variantes_de(const tecvirt_t* t, int tecla, int32_t* out)
+{
+  if (t->pagina != 0 || !perfil(t).variantes) { return 0; }
+  int base;
+  if (tecla == ID_ESP(E_PONTO))      { base = '.'; }
+  else if (tecla >= 0 && tecla < 64) { base = cp_em(PAGINA[0][tecla / 16], tecla % 16); }
+  else                               { return 0; }
+  for (const auto& v : VARIANTES) {
+    if (v.base != base) { continue; }
+    int n = 0;
+    for (int k = 0; n < 6; ++k) {
+      const int cp = cp_em(v.var, k);
+      if (!cp) { break; }
+      out[n++] = (t->shift != TECVIRT_SHIFT_NAO && eh_letra(cp)) ? maiuscula(cp) : cp;
+    }
+    return n;
+  }
+  return 0;
+}
+
+// Abre a faixa da tecla para o dedo k: uma fileira acima, comecando sobre a
+// tecla e empurrada para dentro nas bordas. false = a tecla nao tem variantes.
+static bool abrir_faixa(tecvirt_t* t, int k, int tecla)
+{
+  const int n = variantes_de(t, tecla, t->pop_cp);
+  int x, y, l;
+  if (!n || !retangulo(t->a, tecla, &x, &y, &l)) { return false; }
+  const int cel = larg_tecla(t->a) + vao(t->a);
+  const int esq = t->a.x + vao(t->a), dir = t->a.x + t->a.largura - vao(t->a);
+  int x0 = x + l / 2 - cel / 2;
+  if (x0 + n * cel > dir) { x0 = dir - n * cel; }
+  if (x0 < esq) { x0 = esq; }
+  t->pop_dedo = (int8_t)k;
+  t->pop_tecla = (int16_t)tecla;
+  t->pop_n = (uint8_t)n;
+  t->pop_sel = 0;
+  t->pop_x = (int16_t)x0;
+  t->pop_y = (int16_t)(y - alt_t(t->a) - vao(t->a));
+  t->pop_l = (int16_t)cel;
+  t->pop_dedo_x = (int16_t)(x + l / 2);
+  t->pop_mexeu = false;
+  t->pop_pintar = true;
+  return true;
+}
+
+// A variante escolhida vale como tecla digitada: o shift de UMA letra solta.
+static int confirmar_variante(tecvirt_t* t)
+{
+  t->tecla_ms = tab5_agora_ms();
+  t->ultima_tecla = t->pop_tecla;
+  if (t->shift == TECVIRT_SHIFT_UMA) { mudar(t, TECVIRT_SHIFT_NAO, t->pagina); }
+  return (int)t->pop_cp[t->pop_sel];
+}
+
+static bool letra_ou_numero(int cp) { return eh_letra(cp) || (cp >= '0' && cp <= '9'); }
 
 // UM DEDO POR TECLA, CADA UM COM A SUA SOLTURA.
 //
@@ -593,7 +800,10 @@ int tecvirt_nivel(tecvirt_t* t, int* acoes, int max)
   // Os mesmos tempos do teclado fisico (hal/tab5_teclado.hpp).
   static const uint32_t REP_INICIO_MS = TAB5_TECLA_REPETE_INICIO_MS;
   static const uint32_t REP_MS        = TAB5_TECLA_REPETE_MS;
-  if (!t->aberto) { return 0; }
+  static const uint32_t LONGO_MS      = 450;   // segurar uma letra: as variantes
+  static const uint32_t ESPACO_DUPLO_MS = 700;
+  sincronizar(t);
+  if (!t->aberto || fisico()) { return 0; }
   ++t->amostra;
   sistema_toque_t q[SISTEMA_TOQUES_MAX];
   const int n = sistema_toques(q, SISTEMA_TOQUES_MAX);
@@ -613,9 +823,28 @@ int tecvirt_nivel(tecvirt_t* t, int* acoes, int max)
     return (int16_t)tecla_no_ponto(t->a, ap.x + p.x, ap.y + p.y, atual);
   };
   int na = 0;
-  auto anotar = [&](int ac) { if (ac && na < max) { acoes[na++] = ac; } };
-  const int16_t antes = t->tecla_sob;
   const uint32_t agora = tab5_agora_ms();
+  auto por = [&](int ac) { if (na < max) { acoes[na++] = ac; } };
+  // ESPACO DUPLO = ". " (texto corrido): o primeiro espaco e trocado pelo ponto.
+  // ESPACO DUPLO = ". " (PARAGRAFO): o primeiro espaco vira ponto. Decidido
+  // pelo TEXTO que o app contou (tecvirt_contexto), nao pela memoria das
+  // teclas: com o cursor movido entre os dois espacos, a memoria apagaria
+  // a letra errada.
+  auto anotar = [&](int ac) {
+    if (!ac) { return; }
+    const bool duplo = ac == ' ' && t->frase && t->tem_contexto && t->ult_acao == ' '
+                    && agora - t->ult_ms < ESPACO_DUPLO_MS
+                    && t->antes[0] == ' ' && letra_ou_numero((unsigned char)t->antes[1]);
+    if (duplo) {
+      por(TECVIRT_APAGAR); por('.'); por(' ');
+      t->ult_acao = 0;   // o terceiro espaco seguido e um espaco
+      t->ult_ms = agora;
+      return;
+    }
+    por(ac);
+    t->ult_acao = ac; t->ult_ms = agora;
+  };
+  const int16_t antes = t->tecla_sob;
 
   // 1) Dedos que ja estavam: seguem a tecla sob eles, ou soltam.
   for (int k = 0; k < SISTEMA_TOQUES_MAX; ++k) {
@@ -623,6 +852,31 @@ int tecvirt_nivel(tecvirt_t* t, int* acoes, int max)
     if (dd.id < 0) { continue; }
     int achou = -1;
     for (int i = 0; i < n; ++i) { if (q[i].id == dd.id) { achou = i; break; } }
+    // O DEDO DA FAIXA: escorregar escolhe a variante, soltar a digita.
+    if (k == t->pop_dedo) {
+      if (achou >= 0) {
+        // Ate o dedo ESCORREGAR vale a primeira variante (como no Android e no
+        // iPhone): perto da borda a faixa e empurrada para dentro, e a celula
+        // embaixo do dedo parado nao e a que a pessoa quis.
+        const int xs = ap.x + q[achou].x;
+        if (abs(xs - t->pop_dedo_x) > 12) { t->pop_mexeu = true; }
+        int sel = t->pop_mexeu ? (xs - t->pop_x) / t->pop_l : 0;
+        if (sel < 0) { sel = 0; }
+        if (sel >= t->pop_n) { sel = t->pop_n - 1; }
+        if (sel != t->pop_sel) { t->pop_sel = (uint8_t)sel; t->pop_pintar = true; sistema_pedir_redesenho(); }
+        dd.x = q[achou].x; dd.y = q[achou].y;
+        continue;
+      }
+      anotar(confirmar_variante(t));
+      t->pop_dedo = -1;
+      t->pop_limpar = t->rotulos = true;   // limpa so o lugar da faixa e repinta as teclas
+      t->solta.tecla = TECVIRT_NENHUMA;
+      dd.id = -1;
+      dd.tecla = dd.firme = dd.cand = TECVIRT_NENHUMA;
+      dd.cand_n = 0;
+      dd.eco = dd.repetiu = false;
+      continue;
+    }
     if (achou >= 0) {
       const int16_t sob = tecla_de(q[achou], dd.tecla);
       const int dx = q[achou].x - dd.x, dy = q[achou].y - dd.y;
@@ -656,6 +910,11 @@ int tecvirt_nivel(tecvirt_t* t, int* acoes, int max)
         anotar(confirmar(t, dd.firme));
         dd.repetiu = true;
         dd.rep_ms = agora;
+      }
+      // Segurou parado numa tecla com variantes: abre a faixa (uma por vez).
+      else if (t->pop_dedo < 0 && !dd.eco && !dd.repetiu && dd.cand_n == 0 && dd.firme != TECVIRT_NENHUMA
+            && agora - dd.rep_ms >= LONGO_MS && abrir_faixa(t, k, dd.firme)) {
+        sistema_pedir_redesenho();
       }
     } else {
       const bool digita = !dd.eco && !dd.repetiu;
@@ -700,10 +959,31 @@ int tecvirt_nivel(tecvirt_t* t, int* acoes, int max)
   return na;
 }
 
+bool tecvirt_centro(const tecvirt_t* t, int acao, int* xs, int* ys)
+{
+  int x, y, l;
+  for (int fi = 0; fi < FILAS; ++fi) {
+    for (int c = 0; c < N_FILA[fi]; ++c) {
+      const int cp = cp_tecla(t, fi, c);   // com o shift: a letra vale nas duas caixas
+      if ((cp == acao || (acao > 0 && maiuscula(cp) == maiuscula(acao))) && tecla_em(t->a, fi, c, &x, &y, &l)) {
+        *xs = x + l / 2; *ys = y + alt_t(t->a) / 2;
+        return true;
+      }
+    }
+  }
+  for (int i = 0; i < NESP; ++i) {
+    if (ESP[i].acao == acao && especial_em(t->a, i, &x, &y, &l)) {
+      *xs = x + l / 2; *ys = y + alt_t(t->a) / 2;
+      return true;
+    }
+  }
+  return false;
+}
+
 int tecvirt_clique(tecvirt_t* t, int xs, int ys)
 {
   // So a rede para o toque rapido demais para o nivel ter visto (senao daria
   // letra dupla): o nivel cuida de tudo que ele viu.
-  if (!t->aberto || t->livre < LIVRE_AMOSTRAS || dedos_ativos(t) || tab5_agora_ms() - t->tecla_ms < 120) { return 0; }
+  if (!t->aberto || fisico() || t->livre < LIVRE_AMOSTRAS || dedos_ativos(t) || tab5_agora_ms() - t->tecla_ms < 120) { return 0; }
   return confirmar(t, tecla_no_ponto(t->a, xs, ys, TECVIRT_NENHUMA));   // confirmar() marca tecla_ms
 }

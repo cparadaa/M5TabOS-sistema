@@ -16,42 +16,45 @@
 //
 // perfil.imu = true E UM FLAG DE FASE 1 (ver tab5_power.hpp): uma vez que
 // este app existe na tabela, o BMI270 e ligado no boot para a SESSAO
-// INTEIRA - com giroscopio ativo e advanced power save desligado, o pior
-// caso de consumo do chip (e o M5Unified quem decide assim; nao da para
-// mudar depois do M5.begin()). tab5_power_imu_so_acelerometro() ja existe
-// pronta para cortar isso quando nada estiver usando o giroscopio, mas
-// nao e chamada por ninguem ainda - fica de fora deste app de proposito:
-// e uma decisao de politica de energia do SISTEMA (quando ligar/desligar
-// para TODOS os apps), nao deste playground.
+// INTEIRA. O M5Unified o deixa com giroscopio e sem economia; o servico
+// hal/tab5_imu corta isso quando ninguem le o giroscopio (so o acelerometro,
+// em economia). Este app le o giroscopio: pede ao abrir e solta ao fechar
+// (tab5_imu_giroscopio).
 
 #include "app.h"
+#include "idioma.h"
 #include "pintura.hpp"
 #include <math.h>
 #include <stdio.h>
 #include "esp_log.h"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
+#include "tab5_imu.hpp"
 
 static const char* TAG = "app.imu";
 
 // CONTRASTE PROPRIO, NAO SIS_BORDA/SIS_LINHA: moldura e cruzeta ficavam
-// FRACAS DEMAIS contra o preto, SIS_LINHA e rgb(56,60,60), quase invisivel).
+// FRACAS DEMAIS contra o fundo, SIS_LINHA e rgb(56,60,60), quase invisivel).
 // SIS_BORDA/SIS_LINHA sao constantes do SISTEMA (app.h), usadas por varios
 // apps para bordas discretas de proposito - mudar as duas mudaria todo
 // mundo. Este app e um mostrador de instrumento (nivel + barras de eixo),
-// onde a grade PRECISA se ver por cima do fundo preto - por isso IMU_BORDA
-// so daqui, mais clara que a do sistema (a linha do meio usa d.color565()
-// direto nos pontos de desenho, rgb(72,76,80), so um pouco mais clara que a
-// SIS_LINHA original).
-static const uint16_t IMU_BORDA = TFT_DARKGREY;   // 0x7BEF, rgb(128,130,128)
+// onde a grade PRECISA se ver por cima do fundo - por isso IMU_BORDA so daqui.
+// Moldura no tom de texto desativado do tema (mais clara que TEMA_LINHA, que
+// some contra o fundo); a cruzeta usa o mesmo tom: precisa se ver para o nivel
+// ser lido, e TEMA_LINHA sumia no escuro.
+static const uint16_t IMU_BORDA = TEMA_TEXTO_3;
 
 static bool ao_abrir(void)
 {
-  if (!M5.Imu.isEnabled()) {
+  if (!tab5_imu_disponivel()) {
     // Nao recusa a abertura: desenhar() mostra o aviso na tela mesmo assim.
     // Isso so aconteceria se perfil.imu tivesse ficado false por engano -
     // ver sistema_perfil_de_boot(), que uniao o campo de TODOS os apps.
-    ESP_LOGW(TAG, "M5.Imu nao esta habilitada - perfil.imu chegou a false no boot?");
+    ESP_LOGW(TAG, "IMU nao esta habilitada - perfil.imu chegou a false no boot?");
   }
+  // O giroscopio liga ja (este app le direto do sensor a cada quadro).
+  tab5_imu_giroscopio(TAB5_GIRO_APP_IMU, true);
+  tab5_imu_medir();
   ESP_LOGI(TAG, "aberto");
   return true;
 }
@@ -73,6 +76,7 @@ static void ao_fechar(void)
   s_nivel_fundo_r = -1;
   tab5_sprite_soltar(&s_barra_fundo);
   s_barra_fundo_w = s_barra_fundo_h = -1;
+  tab5_imu_giroscopio(TAB5_GIRO_APP_IMU, false);   // volta a economia na proxima medida
   ESP_LOGI(TAG, "fechado");
 }
 
@@ -113,8 +117,8 @@ static void desenhar_nivel(lgfx::LovyanGFX& d, int cx, int cy, int r, float ax, 
   }
 
   if (!s_nivel_fundo) {
-    const uint16_t linha = d.color565(72, 76, 80);   // ver o aviso de IMU_BORDA no topo do arquivo
-    d.fillRect(cx - r - 6, cy - r - 6, lado, lado, TFT_BLACK);
+    const uint16_t linha = TEMA_TEXTO_3;   // ver o aviso de IMU_BORDA no topo do arquivo
+    d.fillRect(cx - r - 6, cy - r - 6, lado, lado, TEMA_FUNDO);
     d.drawCircle(cx, cy, r, IMU_BORDA);
     d.drawCircle(cx, cy, r / 2, linha);
     d.drawFastHLine(cx - r, cy, 2 * r, linha);
@@ -124,8 +128,8 @@ static void desenhar_nivel(lgfx::LovyanGFX& d, int cx, int cy, int r, float ax, 
       // SO QUANDO O RAIO MUDA (nunca, na pratica - a tela nao redimensiona
       // com o app aberto - mas e o mesmo cuidado do resto do sistema: nao
       // supor um layout fixo por sorte).
-      const uint16_t linha = d.color565(72, 76, 80);
-      s_nivel_fundo->fillSprite(TFT_BLACK);
+      const uint16_t linha = TEMA_TEXTO_3;
+      s_nivel_fundo->fillSprite(TEMA_FUNDO);
       s_nivel_fundo->drawCircle(lado / 2, lado / 2, r, IMU_BORDA);
       s_nivel_fundo->drawCircle(lado / 2, lado / 2, r / 2, linha);
       s_nivel_fundo->drawFastHLine(lado / 2 - r, lado / 2, 2 * r, linha);
@@ -146,8 +150,8 @@ static void desenhar_nivel(lgfx::LovyanGFX& d, int cx, int cy, int r, float ax, 
   // por isso o sinal trocado em py.
   const int dx = cx + (int)(px * (r - 16));
   const int dy = cy - (int)(py * (r - 16));
-  d.fillCircle(dx, dy, 11, TFT_GREENYELLOW);
-  d.drawCircle(dx, dy, 11, TFT_BLACK);
+  d.fillCircle(dx, dy, 11, TEMA_APP_LIMA);
+  d.drawCircle(dx, dy, 11, TEMA_FUNDO);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,9 +184,9 @@ static void desenhar_barra(lgfx::LovyanGFX& d, int x, int y, int w, int h,
     // defesa do nivel.
     s_barra_fundo = tab5_sprite_novo(&d, w, h);
     if (s_barra_fundo) {
-      s_barra_fundo->fillSprite(TFT_BLACK);
+      s_barra_fundo->fillSprite(TEMA_FUNDO);
       s_barra_fundo->drawRect(0, 0, w, h, IMU_BORDA);
-      s_barra_fundo->drawFastVLine(w / 2, 0, h, d.color565(72, 76, 80));
+      s_barra_fundo->drawFastVLine(w / 2, 0, h, TEMA_LINHA);
       s_barra_fundo_w = w;
       s_barra_fundo_h = h;
     }
@@ -191,9 +195,9 @@ static void desenhar_barra(lgfx::LovyanGFX& d, int x, int y, int w, int h,
   if (s_barra_fundo) {
     s_barra_fundo->pushSprite(&d, x, y);
   } else {
-    d.fillRect(x, y, w, h, TFT_BLACK);
+    d.fillRect(x, y, w, h, TEMA_FUNDO);
     d.drawRect(x, y, w, h, IMU_BORDA);
-    d.drawFastVLine(cx, y, h, d.color565(72, 76, 80));
+    d.drawFastVLine(cx, y, h, TEMA_LINHA);
   }
 
   if (frac >  1.0f) { frac =  1.0f; }
@@ -219,13 +223,13 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   // O sistema tenta subir de novo uma IMU que falhou no boot (tab5_imu_medir):
   // quando ela aparece, o aviso sai numa repintura completa.
   static bool s_sem_imu = false;
-  if (!M5.Imu.isEnabled()) {
+  if (!tab5_imu_disponivel()) {
     if (pintura_completa(&s_p) || !s_sem_imu) {
       s_sem_imu = true;
       tab5_texto(d, 2.3f);
       d.setTextDatum(middle_center);
-      d.setTextColor(TFT_RED, TFT_BLACK);
-      d.drawString("IMU não respondeu", a.x + a.largura / 2, a.y + a.altura / 2);
+      d.setTextColor(TEMA_PERIGO, TEMA_FUNDO);
+      d.drawString(tr("IMU não respondeu"), a.x + a.largura / 2, a.y + a.altura / 2);
     }
     return;
   }
@@ -237,48 +241,61 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 
   // UMA leitura por frame, na tarefa de interface - mesma regra do INA226 e
   // do teclado (ver o aviso grande em tab5_power.hpp sobre o barramento
-  // interno sem mutex). M5.Imu.update() e quem fala com o BMI270; getAccel/
-  // getGyro so leem o cache que ele acabou de encher.
+  // interno sem mutex).
   //
   // POR QUE NAO tab5_imu_ultima() (ver hal/tab5_imu.hpp): aquele
   // cache existe para OUTROS apps perguntarem "como o aparelho esta" sem
   // tocar no I2C - mas so e alimentado 1x/segundo, rapido demais para
   // energia/temperatura, devagar demais para um nivel bolha nao parecer
-  // travado. Este app CONTINUA lendo direto de proposito - e o unico lugar
-  // que precisa da leitura rapida, e ja e seguro (mesma tarefa).
-  M5.Imu.update();
-  float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
-  M5.Imu.getAccel(&ax, &ay, &az);
-  M5.Imu.getGyro(&gx, &gy, &gz);
+  // travado. Este app le por tab5_imu_amostra(): e o unico lugar que precisa
+  // da leitura rapida, e ja e seguro (mesma tarefa).
+  //
+  // Sem amostra nova neste quadro, ficam os valores do quadro anterior (como
+  // o M5Unified ja fazia): zerar faria o nivel piscar.
+  static float s_a[3] = {0, 0, 0}, s_g[3] = {0, 0, 0};
+  tab5_imu_amostra(s_a, s_g);
+  const float ax = s_a[0], ay = s_a[1], az = s_a[2];
+  const float gx = s_g[0], gy = s_g[1], gz = s_g[2];
 
+  // DEITADO (teclado fisico encaixado, kernel/orientacao): duas colunas - o
+  // nivel a esquerda, as barras a direita. Empilhado, as barras passavam da
+  // altura da area (~584 px) e escreviam por cima da navegacao.
+  const bool deitado = a.largura > a.altura;
   const int nivel_r  = 130;
-  const int nivel_cx = a.x + a.largura / 2;
+  const int nivel_cx = deitado ? a.x + 40 + nivel_r : a.x + a.largura / 2;
   const int nivel_cy = a.y + 24 + nivel_r;
-  desenhar_nivel(d, nivel_cx, nivel_cy, nivel_r, ax, ay);
+  // O NIVEL E DA TELA, nao do chip: deitada (rotacao 3, kernel/orientacao)
+  // o "para a direita" da tela e o +Y do chip e o "para cima" e o -X. Sem
+  // girar os eixos, a bolha andava 90 graus fora do lado que se inclinava.
+  // As barras abaixo seguem mostrando os eixos do chip (sao medidas).
+  desenhar_nivel(d, nivel_cx, nivel_cy, nivel_r, deitado ? ay : ax, deitado ? -ax : ay);
 
   if (pintura_completa(&s_p)) {
     tab5_texto(d, 2.3f);
     d.setTextDatum(top_center);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    d.drawString("incline o aparelho", nivel_cx, nivel_cy + nivel_r + 6);
+    d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+    d.drawString(tr("incline o aparelho"), nivel_cx, nivel_cy + nivel_r + 6);
   }
 
   // Escala do acelerometro em g (1g = repouso na vertical) e do giroscopio em
   // graus/segundo. Os numeros sao teto de TELA, nao teto do sensor: passar
   // deles so encosta a barra na borda, o valor numerico continua exato.
   const eixo_t eixos[6] = {
-    { "AX", ax,   2.0f, TFT_RED,     "g"   },
-    { "AY", ay,   2.0f, TFT_GREEN,   "g"   },
-    { "AZ", az,   2.0f, TFT_SKYBLUE, "g"   },
-    { "GX", gx, 250.0f, TFT_ORANGE,  "dps" },
-    { "GY", gy, 250.0f, TFT_YELLOW,  "dps" },
-    { "GZ", gz, 250.0f, TFT_MAGENTA, "dps" },
+    // Cores de DADO (eixos X/Y/Z em vermelho/verde/azul, giro em laranja/amarelo/roxo),
+    // suavizadas para os tons do tema sem perder a distincao entre os seis.
+    { "AX", ax,   2.0f, TEMA_APP_VERMELHO, "g"   },
+    { "AY", ay,   2.0f, TEMA_APP_VERDE,    "g"   },
+    { "AZ", az,   2.0f, TEMA_APP_AZUL,     "g"   },
+    { "GX", gx, 250.0f, TEMA_APP_LARANJA,  "dps" },
+    { "GY", gy, 250.0f, TEMA_APP_AMARELO,  "dps" },
+    { "GZ", gz, 250.0f, TEMA_APP_ROXO,     "dps" },
   };
 
-  const int y0        = nivel_cy + nivel_r + 46;
+  const int col_x      = deitado ? nivel_cx + nivel_r + 40 : a.x;   // a coluna das barras
+  const int y0         = deitado ? a.y + 40 : nivel_cy + nivel_r + 46;
   const int alt_linha  = 72;
-  const int barra_x    = a.x + 100;
-  const int barra_w    = a.largura - 100 - 150;
+  const int barra_x    = col_x + 100;
+  const int barra_w    = a.x + a.largura - barra_x - 150;
   const int barra_h    = 36;
 
   for (int i = 0; i < 6; ++i) {
@@ -288,8 +305,8 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
     if (pintura_completa(&s_p)) {
       tab5_texto(d, 2.3f);
       d.setTextDatum(middle_left);
-      d.setTextColor(TFT_WHITE, TFT_BLACK);
-      d.drawString(eixos[i].rotulo, a.x + 16, cy + barra_h / 2);
+      d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+      d.drawString(eixos[i].rotulo, col_x + 16, cy + barra_h / 2);
     }
 
     desenhar_barra(d, barra_x, cy, barra_w, barra_h,
@@ -299,7 +316,7 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
     snprintf(buf, sizeof(buf), "%+6.2f %s", (double)eixos[i].valor, eixos[i].unidade);
     tab5_texto(d, 2.3f);
     d.setTextDatum(middle_left);
-    d.setTextColor(TFT_WHITE, TFT_BLACK);
+    d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
     d.drawString(buf, barra_x + barra_w + 12, cy + barra_h / 2);
   }
 }
@@ -344,7 +361,6 @@ extern const app_t APP_IMU = {
   .perfil = { .imu = true },
   .usa_sd = false,
   .orientacao = ORI_EM_PE,
-  .piso_repouso_mhz = 0,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -356,4 +372,5 @@ extern const app_t APP_IMU = {
   .periodo_ms = 50,
   .altura_conteudo = 0,
   .icone = icone_imu,
+  .fundo_tema = true,
 };

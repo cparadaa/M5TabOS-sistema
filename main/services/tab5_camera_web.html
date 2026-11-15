@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab5 · Câmera</title>
+<!-- A CAMERA DO TAB5 AO VIVO (services/tab5_camera_web). Quadro a quadro: a
+     pagina pede o proximo JPEG assim que o anterior chega - o servidor do
+     Tab5 tem uma tarefa so, e entre um quadro e outro os outros apps
+     respondem. A camera liga no primeiro quadro e desliga sozinha 5 s depois
+     do ultimo (pausar ou fechar a aba). O quadro chega DEITADO, como o sensor
+     ve (girar no Tab5 custava ~117 ms por quadro): o canvas o desenha
+     transposto - girado 90 graus e espelhado, o mesmo que a tela do Tab5. -->
+<style>
+:root { --fundo:#0f1115; --painel:#171a21; --linha:#2a2e38; --texto:#dfe3ea; --apagado:#8a91a0;
+        --verde:#a6e22e; --laranja:#ff9f43; --erro:#ff6b6b; }
+* { box-sizing:border-box; }
+html, body { height:100%; margin:0; background:var(--fundo); color:var(--texto);
+             font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#tudo { display:flex; flex-direction:column; height:100%; }
+#barra { display:flex; align-items:center; gap:10px; padding:8px 14px; background:var(--painel);
+         border-bottom:1px solid var(--linha); min-height:46px; flex-wrap:wrap; }
+#barra b { font-size:15px; display:flex; align-items:center; }
+#estado { color:var(--apagado); flex:1; min-width:140px; font-variant-numeric:tabular-nums; }
+.ponto { display:inline-block; width:9px; height:9px; border-radius:50%; background:#555; margin-right:8px; }
+.ponto.on { background:var(--verde); } .ponto.meio { background:var(--laranja); }
+button { font:inherit; border:0; border-radius:8px; padding:6px 12px; cursor:pointer; background:#3a3f4c; color:#fff; }
+button:hover { filter:brightness(1.15); }
+button.ativo { background:#2c6fb0; }
+#palco { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; padding:12px; position:relative; }
+#video { max-width:100%; max-height:100%; border-radius:10px; background:#000; box-shadow:0 4px 24px rgba(0,0,0,.4); }
+#aviso { position:absolute; color:var(--apagado); text-align:center; padding:24px; }
+#aviso.erro { color:var(--erro); }
+</style>
+</head>
+<body>
+<div id="tudo">
+  <div id="barra">
+    <b><span class="ponto" id="ponto"></span>Câmera</b>
+    <span id="estado">ligando a câmera...</span>
+    <button id="tamBt" title="480×640 ou 720×960">Normal</button>
+    <button id="pausaBt">Pausar</button>
+    <button id="fotoBt" title="Baixa o quadro inteiro do sensor, 1200×1600">Foto</button>
+  </div>
+  <div id="palco">
+    <canvas id="video" hidden></canvas>
+    <div id="aviso">ligando a câmera do Tab5...</div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let rodando = true, alta = false, quadros = 0, bytes = 0, desde = performance.now(), falhas = 0;
+const tela = $("video"), ctx = tela.getContext("2d");
+
+// Deitado -> em pe: TRANSPOR ((x, y) -> (y, x)) e girar 90 graus no sentido
+// horario e espelhar - o que o PPA fazia no Tab5.
+function desenhar(bmp) {
+  if (tela.width !== bmp.height || tela.height !== bmp.width) { tela.width = bmp.height; tela.height = bmp.width; }
+  ctx.setTransform(0, 1, 1, 0, 0, 0);
+  ctx.drawImage(bmp, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  bmp.close();
+}
+
+function mostrarAviso(txt, erro) {
+  $("aviso").textContent = txt;
+  $("aviso").className = erro ? "erro" : "";
+  $("aviso").hidden = !txt;
+}
+
+// O LACO: um quadro de cada vez, o proximo assim que este chega. Com a aba
+// escondida ou pausada, para - e a camera do Tab5 desliga sozinha.
+async function proximo() {
+  if (!rodando || document.hidden) return;
+  try {
+    const r = await fetch("quadro.jpg" + (alta ? "?alta=1" : ""), { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status === 503 ? "a câmera não entregou o quadro" : "erro " + r.status);
+    const b = await r.blob();
+    desenhar(await createImageBitmap(b));
+    tela.hidden = false;
+    mostrarAviso("");
+    falhas = 0;
+    ++quadros; bytes += b.size;
+  } catch (e) {
+    ++falhas;
+    $("ponto").className = "ponto meio";
+    mostrarAviso(falhas > 3 ? "Sem quadro do Tab5 (" + e.message + ") - tentando de novo..." : "", falhas > 3);
+    await new Promise((ok) => setTimeout(ok, Math.min(500 * falhas, 3000)));
+  }
+  proximo();
+}
+
+// A cada segundo: quadros por segundo e o tamanho medio.
+setInterval(() => {
+  const s = (performance.now() - desde) / 1000;
+  if (rodando && !document.hidden && quadros) {
+    $("ponto").className = "ponto on";
+    $("estado").textContent = (quadros / s).toFixed(1) + " quadros/s · " + Math.round(bytes / quadros / 1024) + " KB cada · " +
+                              tela.width + "×" + tela.height;
+  } else if (!rodando) {
+    $("ponto").className = "ponto";
+    $("estado").textContent = "pausado - a câmera do Tab5 desliga em 5 s";
+  }
+  quadros = 0; bytes = 0; desde = performance.now();
+}, 1000);
+
+$("pausaBt").onclick = () => {
+  rodando = !rodando;
+  $("pausaBt").textContent = rodando ? "Pausar" : "Continuar";
+  $("pausaBt").className = rodando ? "" : "ativo";
+  if (rodando) proximo();
+};
+$("tamBt").onclick = () => {
+  alta = !alta;
+  $("tamBt").textContent = alta ? "Alta" : "Normal";
+  $("tamBt").className = alta ? "ativo" : "";
+};
+$("fotoBt").onclick = () => {
+  const a = document.createElement("a");
+  a.href = "foto.jpg?t=" + Date.now();   // o nome vem do Tab5 (data e hora)
+  a.click();
+};
+document.addEventListener("visibilitychange", () => { if (!document.hidden) proximo(); });
+proximo();
+</script>
+</body>
+</html>

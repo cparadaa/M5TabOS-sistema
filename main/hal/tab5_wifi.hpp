@@ -115,13 +115,23 @@ bool tab5_wifi_radio_ativo(void);
 // Quem precisa do receptor ligado o TEMPO TODO - o ESP-NOW, que perde o frame
 // que chega durante o cochilo - pede com o proprio bit, e desfaz quando nao
 // precisar mais. O radio so economiza sem pedido nenhum. Nao bloqueia.
-#define TAB5_ACORDADO_ESPNOW  (1u << 0)
-// Um bit POR QUEM PEDE: o servico ESP-NOW reafirma o dele de tempos em tempos,
-// e com um bit compartilhado ele desfazia o pedido do farejo.
-#define TAB5_ACORDADO_FAREJO  (1u << 1)
-#define TAB5_ACORDADO_TESTE   (1u << 2)   // comando radio do console
-#define TAB5_ACORDADO_CSI     (1u << 3)   // servico CSI (tab5_csi)
+//
+// SERVICO NAO USA ISTO DIRETO: declara RECURSO_RADIO_ESCUTA (kernel/recursos.h),
+// com o proprio nome - o registro e por quem usa, e o kernel liga o bit.
+#define TAB5_ACORDADO_RECURSOS (1u << 0)   // RECURSO_RADIO_ESCUTA em uso
 void tab5_wifi_manter_acordado(uint32_t quem, bool sim);
+// Alguem pediu o receptor ligado agora (ESP-NOW conversando, CSI, farejo...)?
+bool tab5_wifi_receptor_pedido(void);
+
+// PRECISA DA REDE CONECTADA, sem pedir o receptor ligado o tempo todo: o
+// cochilo (services/tab5_wifi_cochilo) nao desliga o Wi-Fi enquanto houver
+// pedido. Para quem atende pela rede com a tela apagada (o servidor web: sem
+// isto, 3 min de tela apagada derrubavam o Wi-Fi e o servidor caia junto).
+// O modem sleep continua: so o cochilo e que nao vem. Um bit por quem pede.
+// Servico declara RECURSO_REDE (kernel/recursos.h); o kernel liga o bit.
+#define TAB5_PRECISA_RECURSOS (1u << 0)
+void tab5_wifi_precisar(uint32_t quem, bool sim);
+bool tab5_wifi_precisada(void);
 
 // O ENLACE SDIO com o C6 esta de pe? Mais fraco que a pergunta acima, e de
 // proposito: aqui basta o transporte ter negociado. Um C6 com firmware
@@ -131,16 +141,10 @@ bool tab5_wifi_c6_enlace(void);
 
 // REMOVIDA (auditoria de camadas): fazia "s_pilha_de_pe ||
 // ajustes_wifi()" aqui dentro - HAL perguntando a um servico (ajustes.h),
-// sentido errado da dependencia (ver ESCREVENDO_APPS.md secao 8). O unico
+// sentido errado da dependencia (ver docs/ESCREVENDO_APPS.md secao 8). O unico
 // chamador era sistema_impor_preferencias() no kernel, que ja tem
 // ajustes_wifi() disponivel legitimamente - a conta virou
 // "tab5_wifi_pilha_de_pe() || ajustes_wifi()" direto la, sem perder nada.
-
-// Varre e imprime as redes visiveis no console. Diagnostico: separa "o radio
-// nao funciona" (lista vazia) de "a rede nao aparece" (lista com outras redes,
-// sem a sua). Exige que o WiFi ja tenha sido ligado uma vez neste boot - a
-// stack precisa estar de pe.
-void tab5_wifi_varrer(void);
 
 // Troca a rede em uso sem reler o cartao. Chamada por dentro de
 // tab5_wifi_gravar_credenciais() logo apos gravar o arquivo - ler o arquivo de
@@ -187,12 +191,16 @@ bool     tab5_wifi_conhecida(const char* ssid);
 // vazia = rede aberta). Serve a quem quer COPIAR as redes (o Mesh traz as do
 // Tab5 para o Wi-Fi do no). false = indice fora da lista.
 bool     tab5_wifi_rede_guardada(int i, char* ssid, size_t tam_ssid, char* senha, size_t tam_senha);
-// A mesma cifra do wifi.txt (AES com a chave do aparelho), para outros
-// arquivos de credenciais guardarem senha sem texto puro no cartao.
-// 'hex' precisa de TAB5_WIFI_CIFRA_HEX bytes.
+// A mesma cifra do wifi.txt (AES com a chave sorteada deste aparelho, que mora
+// na NVS), para outros lugares guardarem senha sem texto puro.
+// 'hex' precisa de TAB5_WIFI_CIFRA_HEX bytes. 'legado' (opcional) = true se o
+// texto veio na cifra antiga (chave tirada do MAC): regrave com cifrar_texto.
 #define TAB5_WIFI_CIFRA_HEX 200
 bool     tab5_wifi_cifrar_texto(const char* claro, char* hex, size_t tam_hex);
-bool     tab5_wifi_decifrar_texto(const char* hex, char* claro, size_t tam_claro);
+bool     tab5_wifi_decifrar_texto(const char* hex, char* claro, size_t tam_claro, bool* legado = nullptr);
+// Le (ou sorteia e grava, no primeiro boot) a chave das senhas. Grava na
+// flash: chame do boot, antes de qualquer cifra (ajustes_iniciar).
+bool     tab5_wifi_chave_preparar(void);
 uint32_t tab5_wifi_redes_versao(void);   // muda a cada procura ou rede guardada/esquecida
 
 // Conecta numa rede JA CONHECIDA (gravada com tab5_wifi_gravar_credenciais).

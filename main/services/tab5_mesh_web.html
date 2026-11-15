@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tab5 · Mesh</title>
+<style>
+:root { --fundo:#14161c; --painel:#1c1f27; --linha:#2a2e38; --texto:#dfe3ea; --apagado:#8a91a0;
+        --azul:#2f6fb0; --verde:#a6e22e; --laranja:#ff9f43; --erro:#ff6b6b; --balao:#262a34; --ouro:#ffd23f; }
+* { box-sizing:border-box; }
+html, body { height:100%; margin:0; background:var(--fundo); color:var(--texto);
+             font:15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#tudo { display:flex; height:100%; }
+#lado { width:290px; flex:none; background:var(--painel); border-right:1px solid var(--linha); display:flex; flex-direction:column; }
+#topo { padding:12px 14px 8px; border-bottom:1px solid var(--linha); }
+#topo b { display:block; font-size:16px; }
+#topo small { color:var(--apagado); display:block; }
+#malha { font-size:12px; color:var(--apagado); margin-top:4px; }
+.ponto { display:inline-block; width:9px; height:9px; border-radius:50%; background:#555; margin-right:6px; vertical-align:middle; }
+.ponto.ar { background:var(--verde); }
+#abas { display:flex; gap:4px; padding:8px 8px 0; }
+#abas button { flex:1; background:transparent; color:var(--apagado); border-radius:8px 8px 0 0; border-bottom:2px solid transparent; }
+#abas button.atual { color:#fff; border-bottom-color:#5ea2ff; }
+#convs { flex:1; overflow:auto; list-style:none; margin:0; padding:6px; }
+#convs li { padding:9px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px; align-items:center; }
+#convs li:hover { background:var(--linha); }
+#convs li.atual { background:#28344a; }
+.ic { width:34px; height:34px; flex:none; border-radius:50%; display:flex; align-items:center; justify-content:center;
+      font-weight:700; background:#33405a; color:#cfe0ff; font-size:13px; }
+.ic.dm { background:#3d3350; color:#e7d6ff; }
+.meio { flex:1; min-width:0; }
+.meio b, .meio small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.meio small { color:var(--apagado); }
+.badge { background:var(--laranja); color:#000; border-radius:10px; padding:0 7px; font-size:12px; font-weight:700; }
+#lado .rodape { padding:10px; border-top:1px solid var(--linha); }
+button { font:inherit; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; background:#3a3f4c; color:#fff; }
+button:hover { filter:brightness(1.15); }
+button:disabled { opacity:.45; cursor:default; filter:none; }
+button.enviar { background:#2c6fb0; }
+#principal { flex:1; display:flex; flex-direction:column; min-width:0; }
+#cab { padding:10px 16px; border-bottom:1px solid var(--linha); min-height:58px; }
+#cab .l1 b { font-size:16px; } #cab .l1 small { color:var(--apagado); margin-left:8px; }
+#cab .l2 { font-size:12px; color:var(--apagado); margin-top:2px; }
+#cab .l2 a { color:#9ecbff; cursor:pointer; text-decoration:none; }
+#msgs { flex:1; overflow:auto; padding:14px 16px; display:flex; flex-direction:column; gap:8px; }
+.m { max-width:70%; background:var(--balao); padding:7px 11px; border-radius:12px; align-self:flex-start; white-space:pre-wrap; word-wrap:break-word; }
+.m.minha { align-self:flex-end; background:var(--azul); }
+.m .quem { font-size:12px; font-weight:700; color:#9ecbff; margin-bottom:2px; cursor:pointer; }
+.m .info { font-size:11px; color:#b8c0cc; margin-top:3px; text-align:right; }
+.m.minha .info { color:#d6e6ff; }
+.m .falhou { color:var(--erro); }
+.dia { align-self:center; font-size:12px; color:var(--apagado); margin:6px 0; }
+.vazio { margin:auto; color:var(--apagado); }
+#escrever { display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--linha); align-items:flex-end; }
+#texto { flex:1; resize:none; min-height:42px; max-height:140px; border:1px solid var(--linha); border-radius:10px; padding:9px 11px;
+         background:var(--painel); color:var(--texto); font:inherit; outline:none; }
+#conta { font-size:12px; color:var(--apagado); width:54px; text-align:right; padding-bottom:12px; }
+#conta.muito { color:var(--erro); }
+#msg { padding:0 16px; color:var(--laranja); font-size:13px; }
+/* aba Nos */
+#nosVista { flex:1; display:none; flex-direction:column; min-height:0; }
+#nosBarra { display:flex; gap:8px; padding:10px 16px; border-bottom:1px solid var(--linha); align-items:center; flex-wrap:wrap; }
+input.busca { padding:8px 11px; border-radius:8px; border:1px solid var(--linha); background:var(--painel); color:var(--texto); font:inherit; min-width:200px; }
+#nosConta { color:var(--apagado); font-size:13px; }
+#nosTab { flex:1; overflow:auto; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th { position:sticky; top:0; background:var(--fundo); text-align:left; font-weight:600; color:var(--apagado); padding:8px 10px;
+     border-bottom:1px solid var(--linha); cursor:pointer; white-space:nowrap; user-select:none; }
+th.ord::after { content:" ▾"; } th.ord.sobe::after { content:" ▴"; }
+td { padding:7px 10px; border-bottom:1px solid #20242c; white-space:nowrap; }
+tr.no { cursor:pointer; } tr.no:hover td { background:#1e2330; }
+td.fav { color:var(--ouro); width:20px; }
+.fraco { color:var(--apagado); }
+.bom { color:var(--verde); } .medio { color:#e6c34a; } .ruim { color:var(--erro); }
+/* ficha do no */
+#ficha { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; }
+#ficha.aberto, #nova.aberto { display:flex; }
+.caixa { background:var(--painel); width:min(480px,92vw); max-height:84vh; border-radius:12px; display:flex; flex-direction:column; overflow:auto; }
+.caixa h2 { font-size:17px; margin:0; padding:16px 18px 2px; }
+.caixa .sub { color:var(--apagado); padding:0 18px 10px; font-size:13px; }
+.caixa dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:0; padding:6px 18px 12px; font-size:14px; }
+.caixa dt { color:var(--apagado); }
+.caixa dd { margin:0; }
+.caixa .botoes { display:flex; gap:8px; padding:10px 18px 16px; flex-wrap:wrap; }
+#nova { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; }
+#nova input { margin:6px 16px 8px; }
+#nova ul { list-style:none; margin:0; padding:0 8px 8px; overflow:auto; }
+#nova li { padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px; align-items:center; }
+#nova li:hover { background:var(--linha); }
+#nova .sec { color:var(--apagado); font-size:12px; padding:8px 10px 2px; cursor:default; }
+#nova .sec:hover { background:none; }
+@media (max-width:760px) {
+  #lado { width:100%; } #principal { display:none; }
+  body.conversando #lado { display:none; } body.conversando #principal { display:flex; }
+  #voltar { display:inline-block !important; }
+  .opc { display:none; }
+}
+</style>
+</head>
+<body>
+<div id="tudo">
+  <aside id="lado">
+    <div id="topo">
+      <b><span class="ponto" id="ar"></span><span id="eu">Mesh</span></b>
+      <small id="estado">conectando...</small>
+      <div id="malha"></div>
+    </div>
+    <div id="abas"><button id="abaConv" class="atual">Conversas</button><button id="abaNos">Nós</button></div>
+    <ul id="convs"></ul>
+    <div class="rodape"><button id="novaBt">+ Nova conversa</button></div>
+  </aside>
+  <main id="principal">
+    <div id="convVista" style="display:flex;flex-direction:column;flex:1;min-height:0">
+      <div id="cab">
+        <div class="l1"><button id="voltar" style="display:none;margin-right:8px">&lt;</button><b id="titulo">Escolha uma conversa</b><small id="sub"></small></div>
+        <div class="l2" id="cabInfo"></div>
+      </div>
+      <div id="msgs"><div class="vazio">As conversas do Tab5 aparecem à esquerda.</div></div>
+      <div id="msg"></div>
+      <div id="escrever">
+        <textarea id="texto" rows="1" placeholder="Mensagem (Enter envia, Shift+Enter quebra a linha)" disabled></textarea>
+        <span id="conta">0/200</span>
+        <button id="enviar" class="enviar" disabled>Enviar</button>
+      </div>
+    </div>
+    <div id="nosVista">
+      <div id="nosBarra">
+        <input id="nosBusca" class="busca" placeholder="Procurar por nome, id ou placa">
+        <label class="fraco"><input type="checkbox" id="soRadio"> só pelo rádio</label>
+        <label class="fraco"><input type="checkbox" id="soFav"> só favoritos</label>
+        <span id="nosConta"></span>
+      </div>
+      <div id="nosTab"></div>
+    </div>
+  </main>
+</div>
+<div id="ficha"><div class="caixa" id="fichaCaixa"></div></div>
+<div id="nova"><div class="caixa">
+  <h2>Nova conversa</h2>
+  <input id="busca" class="busca" placeholder="Procurar nó pelo nome">
+  <ul id="opcoes"></ul>
+  <div style="padding:10px 16px;text-align:right"><button id="fecharNova">Fechar</button></div>
+</div></div>
+<script>
+"use strict";
+const LIMITE = 200;   // MESH_PAYLOAD_MAX: o teto do protocolo, em bytes
+const $ = (id) => document.getElementById(id);
+const bytes = (s) => new TextEncoder().encode(s).length;
+let atual = null, ultimo = {}, nos = [], porNum = new Map(), aba = "conv", ordem = { col: "visto", sobe: false };
+let nConvMsgs = 0;
+
+async function pedir(metodo, url, corpo) {
+  const r = await fetch(url, { method: metodo, body: corpo, cache: "no-store",
+                               headers: metodo === "GET" ? {} : { "X-Tab5": "1", "Content-Type": "text/plain; charset=utf-8" } });
+  if (r.status === 503 || r.status === 403) throw new Error("o servidor do Tab5 foi desligado - ligue de novo no app Mesh");
+  if (!r.ok) throw new Error(await r.text() || ("erro " + r.status));
+  return r;
+}
+const chave = (c) => c.canal ? "c=1&idx=" + c.idx : "no=" + c.no;
+const mesma = (a, b) => a && b && a.canal === b.canal && (a.canal ? a.idx === b.idx : a.no === b.no);
+function aviso(t) { $("msg").textContent = t || ""; }
+function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
+
+function hora(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000), hoje = new Date();
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === hoje.toDateString() ? hm : d.toLocaleDateString([], { day: "2-digit", month: "2-digit" }) + " " + hm;
+}
+// "ha 5 min" - pela idade que o Tab5 calculou (nao depende do relogio do PC).
+function ha(s) {
+  if (s == null || s < 0) return "";
+  if (s < 60) return "agora";
+  if (s < 3600) return "há " + Math.round(s / 60) + " min";
+  if (s < 86400) return "há " + Math.round(s / 3600) + " h";
+  return "há " + Math.round(s / 86400) + " d";
+}
+function iniciais(nome) { return (nome || "?").replace(/[^\p{L}\p{N}]/gu, "").slice(0, 2).toUpperCase() || "?"; }
+const snr = (x) => (x / 10).toFixed(1).replace(".", ",") + " dB";
+const classeSnr = (x) => x >= 0 ? "bom" : x >= -70 ? "medio" : "ruim";
+function bateria(n) { return n.bat === 101 ? "na tomada" : n.bat ? n.bat + "%" + (n.mv ? " · " + (n.mv / 1000).toFixed(2).replace(".", ",") + " V" : "") : ""; }
+function saltosTxt(n) { return n.mqtt ? "internet" : n.saltos === 255 ? "?" : n.saltos === 0 ? "direto" : n.saltos + (n.saltos === 1 ? " salto" : " saltos"); }
+
+// O estado de entrega de uma mensagem nossa (mesh_envio_t).
+function marca(m) {
+  switch (m.envio) {
+    case 1: return "enviando…";
+    case 2: return "✓✓ entregue";
+    case 3: return "<span class='falhou'>✗ " + esc(m.erro || "falhou") + "</span>";
+    case 4: return "<span class='falhou'>! sem resposta</span>";
+    case 5: return "✓ na malha";
+    default: return "";
+  }
+}
+
+// ---- conversas ---------------------------------------------------------------
+async function conversas() {
+  const l = await (await pedir("GET", "api/conversas")).json();
+  const ul = $("convs");
+  ul.innerHTML = "";
+  for (const c of l) {
+    const li = document.createElement("li");
+    if (mesma(c, atual) && aba === "conv") li.className = "atual";
+    li.innerHTML = "<div class='ic" + (c.canal ? "" : " dm") + "'></div><div class='meio'><b></b><small></small></div>";
+    li.querySelector(".ic").textContent = c.canal ? "#" : iniciais(c.nome);
+    li.querySelector("b").textContent = c.nome;
+    li.querySelector("small").textContent = (c.sub || "") + (c.ultima ? " · " + hora(c.ultima) : "");
+    if (c.nao_lidas && !mesma(c, atual)) {
+      const b = document.createElement("span"); b.className = "badge"; b.textContent = c.nao_lidas; li.appendChild(b);
+    }
+    li.onclick = () => abrir(c);
+    ul.appendChild(li);
+  }
+  if (!l.length) ul.innerHTML = "<li style='cursor:default'><small style='color:var(--apagado)'>nenhuma conversa ainda</small></li>";
+  const a = l.find((c) => mesma(c, atual));
+  if (a) { atual = a; $("titulo").textContent = a.nome; $("sub").textContent = a.sub || ""; }
+}
+
+// A segunda linha do cabecalho: quem e o no (direta) ou o movimento do canal.
+function infoConversa() {
+  const el = $("cabInfo");
+  if (!atual) { el.textContent = ""; return; }
+  if (atual.canal) {
+    el.textContent = "canal " + atual.idx + " · " + nConvMsgs + " mensagens aqui" +
+                     (ultimo.saude && ultimo.saude.total ? " · " + ultimo.saude.online + " de " + ultimo.saude.total + " nós online" : "");
+    return;
+  }
+  const n = porNum.get(atual.no);
+  if (!n) { el.textContent = "nó " + atual.no.toString(16); return; }
+  const p = [n.id, n.hw, saltosTxt(n), n.snr10 && !n.mqtt ? "SNR " + snr(n.snr10) : "", bateria(n), n.idade >= 0 ? "visto " + ha(n.idade) : ""];
+  el.innerHTML = esc(p.filter(Boolean).join(" · ")) + " · <a id='verNo'>ficha do nó</a>";
+  $("verNo").onclick = () => ficha(n);
+}
+
+async function mensagens(rolar) {
+  if (!atual) return;
+  const caixa = $("msgs");
+  const noFim = caixa.scrollHeight - caixa.scrollTop - caixa.clientHeight < 60;
+  const l = await (await pedir("GET", "api/msgs?" + chave(atual))).json();
+  nConvMsgs = l.length;
+  caixa.innerHTML = "";
+  let dia = "";
+  for (const m of l) {
+    const d = m.quando ? new Date(m.quando * 1000).toDateString() : "";
+    if (d && d !== dia) {
+      dia = d;
+      const s = document.createElement("div"); s.className = "dia";
+      s.textContent = new Date(m.quando * 1000).toLocaleDateString([], { weekday: "long", day: "2-digit", month: "long" });
+      caixa.appendChild(s);
+    }
+    const b = document.createElement("div");
+    b.className = "m" + (m.minha ? " minha" : "");
+    if (m.quando) b.title = new Date(m.quando * 1000).toLocaleString();
+    if (!m.minha && atual.canal) {
+      const q = document.createElement("div"); q.className = "quem"; q.textContent = m.nome;
+      q.title = "ver a ficha do nó"; q.onclick = () => { const n = porNum.get(m.de); if (n) ficha(n); };
+      b.appendChild(q);
+    }
+    b.appendChild(document.createTextNode(m.texto));
+    const info = document.createElement("div"); info.className = "info";
+    let extra = "";
+    if (m.minha) extra = marca(m);
+    else if (m.mqtt) extra = "via internet";
+    else {
+      const p = [];
+      if (m.saltos < 255) p.push(m.saltos === 0 ? "direto" : m.saltos + (m.saltos === 1 ? " salto" : " saltos"));
+      if (m.snr10) p.push("SNR " + snr(m.snr10));
+      if (m.rssi) p.push(m.rssi + " dBm");
+      extra = esc(p.join(" · "));
+    }
+    info.innerHTML = esc(hora(m.quando)) + (extra ? " · " + extra : "");
+    b.appendChild(info);
+    caixa.appendChild(b);
+  }
+  if (!l.length) caixa.innerHTML = "<div class='vazio'>Nenhuma mensagem ainda. Escreva a primeira.</div>";
+  if (rolar || noFim) caixa.scrollTop = caixa.scrollHeight;
+  infoConversa();
+}
+
+async function abrir(c) {
+  atual = c;
+  trocarAba("conv");
+  document.body.classList.add("conversando");
+  $("titulo").textContent = c.nome; $("sub").textContent = c.sub || "";
+  $("texto").disabled = false; contar(); $("texto").focus();
+  aviso("");
+  try { await mensagens(true); await conversas(); } catch (e) { aviso(e.message); }
+}
+
+function contar() {
+  const n = bytes($("texto").value);
+  $("conta").textContent = n + "/" + LIMITE;
+  $("conta").className = n > LIMITE ? "muito" : "";
+  $("enviar").disabled = !atual || n === 0 || n > LIMITE;
+  const t = $("texto"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 140) + "px";
+}
+
+async function enviar() {
+  const t = $("texto").value.trim();
+  if (!atual || !t) return;
+  if (bytes(t) > LIMITE) { aviso("A mensagem passa de " + LIMITE + " bytes (o limite do Meshtastic)."); return; }
+  $("enviar").disabled = true;
+  try {
+    const r = await (await pedir("POST", "api/enviar?" + chave(atual), t)).json();
+    if (!r.ok) { aviso(r.erro); return; }
+    $("texto").value = ""; contar(); aviso("");
+    await mensagens(true);
+  } catch (e) { aviso(e.message); }
+  finally { contar(); }
+}
+
+// ---- nos ----------------------------------------------------------------------
+async function carregarNos() {
+  nos = await (await pedir("GET", "api/nos")).json();
+  porNum = new Map(nos.map((n) => [n.num, n]));
+}
+
+const COLS = [
+  { k: "fav",    t: "★",       v: (n) => n.fav ? 1 : 0,              h: (n) => n.fav ? "★" : "", cls: "fav" },
+  { k: "nome",   t: "Nome",    v: (n) => (n.nome || "").toLowerCase(), h: (n) => esc(n.nome) },
+  { k: "longo",  t: "Nome longo", v: (n) => (n.longo || "").toLowerCase(), h: (n) => esc(n.longo), opc: 1 },
+  { k: "id",     t: "Id",      v: (n) => n.id || "",                 h: (n) => "<span class='fraco'>" + esc(n.id) + "</span>", opc: 1 },
+  { k: "hw",     t: "Placa",   v: (n) => n.hw || "",                 h: (n) => esc(n.hw), opc: 1 },
+  { k: "saltos", t: "Saltos",  v: (n) => n.mqtt ? 99 : n.saltos,    h: (n) => esc(saltosTxt(n)) },
+  { k: "snr",    t: "SNR",     v: (n) => n.mqtt ? -9999 : n.snr10,   h: (n) => n.mqtt || !n.snr10 ? "" : "<span class='" + classeSnr(n.snr10) + "'>" + snr(n.snr10) + "</span>" },
+  { k: "bat",    t: "Bateria", v: (n) => n.bat || -1,                h: (n) => esc(n.bat === 101 ? "tomada" : n.bat ? n.bat + "%" : ""), opc: 1 },
+  { k: "visto",  t: "Visto",   v: (n) => n.idade >= 0 ? -n.idade : -1e12, h: (n) => esc(ha(n.idade)) },
+];
+
+function desenharNos() {
+  const f = $("nosBusca").value.toLowerCase(), soRadio = $("soRadio").checked, soFav = $("soFav").checked;
+  const col = COLS.find((c) => c.k === ordem.col);
+  const l = nos.filter((n) => (!soRadio || !n.mqtt) && (!soFav || n.fav) &&
+                            (n.nome + " " + n.longo + " " + n.id + " " + n.hw).toLowerCase().includes(f))
+               .sort((a, b) => { const x = col.v(a), y = col.v(b); return (x < y ? -1 : x > y ? 1 : 0) * (ordem.sobe ? 1 : -1); });
+  $("nosConta").textContent = l.length + " de " + nos.length + " nós";
+  let h = "<table><thead><tr>";
+  for (const c of COLS) h += "<th data-k='" + c.k + "' class='" + (c.opc ? "opc " : "") + (c.k === ordem.col ? "ord" + (ordem.sobe ? " sobe" : "") : "") + "'>" + c.t + "</th>";
+  h += "</tr></thead><tbody>";
+  for (const n of l.slice(0, 400)) {
+    h += "<tr class='no' data-num='" + n.num + "'>";
+    for (const c of COLS) h += "<td class='" + (c.opc ? "opc " : "") + (c.cls || "") + "'>" + c.h(n) + "</td>";
+    h += "</tr>";
+  }
+  h += "</tbody></table>";
+  $("nosTab").innerHTML = h;
+  for (const th of $("nosTab").querySelectorAll("th")) {
+    th.onclick = () => { const k = th.dataset.k; ordem = { col: k, sobe: ordem.col === k ? !ordem.sobe : k === "nome" }; desenharNos(); };
+  }
+  for (const tr of $("nosTab").querySelectorAll("tr.no")) tr.onclick = () => ficha(porNum.get(+tr.dataset.num));
+}
+
+function ficha(n) {
+  const linhas = [
+    ["Id", n.id], ["Número", n.num], ["Placa", n.hw],
+    ["Como chega", saltosTxt(n)], ["SNR", n.mqtt || !n.snr10 ? "" : snr(n.snr10)],
+    ["Bateria", bateria(n)], ["Visto", n.idade >= 0 ? ha(n.idade) + (n.visto ? " (" + new Date(n.visto * 1000).toLocaleString() + ")" : "") : ""],
+    ["Posição", n.lat ? (n.lat / 1e7).toFixed(5) + ", " + (n.lon / 1e7).toFixed(5) : ""],
+  ].filter((l) => l[1] !== "" && l[1] != null);
+  let h = "<h2>" + (n.fav ? "★ " : "") + esc(n.nome) + "</h2><div class='sub'>" + esc(n.longo) + "</div><dl>";
+  for (const [k, v] of linhas) h += "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>";
+  h += "</dl><div class='botoes'><button id='fMsg' class='enviar'>Mensagem direta</button>" +
+       "<button id='fFav'>" + (n.fav ? "Tirar dos favoritos" : "Favorito ★") + "</button>" +
+       (n.lat ? "<button id='fMapa'>Ver no mapa</button>" : "") + "<button id='fFechar'>Fechar</button></div>";
+  $("fichaCaixa").innerHTML = h;
+  $("ficha").classList.add("aberto");
+  $("fFechar").onclick = () => $("ficha").classList.remove("aberto");
+  $("fMsg").onclick = () => { $("ficha").classList.remove("aberto"); abrir({ canal: false, idx: 0, no: n.num, nome: n.nome, sub: n.longo }); };
+  $("fFav").onclick = async () => {
+    try { await pedir("POST", "api/favorito?no=" + n.num + "&sim=" + (n.fav ? 0 : 1), ""); n.fav = !n.fav; ficha(n); if (aba === "nos") desenharNos(); }
+    catch (e) { aviso(e.message); }
+  };
+  if (n.lat) $("fMapa").onclick = () => window.open("https://www.openstreetmap.org/?mlat=" + n.lat / 1e7 + "&mlon=" + n.lon / 1e7 + "#map=14/" + n.lat / 1e7 + "/" + n.lon / 1e7, "_blank", "noopener");
+}
+
+function trocarAba(a) {
+  aba = a;
+  $("abaConv").className = a === "conv" ? "atual" : "";
+  $("abaNos").className = a === "nos" ? "atual" : "";
+  $("convVista").style.display = a === "conv" ? "flex" : "none";
+  $("nosVista").style.display = a === "nos" ? "flex" : "none";
+  if (a === "nos") { document.body.classList.add("conversando"); carregarNos().then(desenharNos).catch((e) => aviso(e.message)); }
+}
+
+// ---- saude e vigia ----------------------------------------------------------
+async function saude() {
+  try {
+    const s = await (await pedir("GET", "api/saude")).json();
+    ultimo.saude = s;
+    const p = [s.enlace];
+    if (s.tem_metricas || s.tem_local) p.push("canal " + (s.uso_canal10 / 10).toFixed(1).replace(".", ",") + "% · TX " + (s.airtime10 / 10).toFixed(1).replace(".", ",") + "%");
+    if (s.total) p.push(s.online + "/" + s.total + " online");
+    if (s.tem_local) p.push("rx " + s.rx + " · tx " + s.tx + (s.ruins ? " · ruins " + s.ruins : ""));
+    $("malha").textContent = p.filter(Boolean).join(" · ");
+  } catch (e) { /* o vigia mostra */ }
+  setTimeout(saude, 15000);
+}
+
+async function vigiar() {
+  try {
+    const e = await (await pedir("GET", "api/estado")).json();
+    $("eu").textContent = e.eu_nome || "Mesh";
+    $("ar").className = "ponto" + (e.no_ar ? " ar" : "");
+    $("estado").textContent = e.no_ar ? "nó no ar" : "sem o nó (cabo, Bluetooth ou internet)";
+    if (e.conv !== ultimo.conv || e.msgs !== ultimo.msgs || e.nao_lidas !== ultimo.nao_lidas) await conversas();
+    if (atual && aba === "conv" && (e.msgs !== ultimo.msgs || e.envios !== ultimo.envios)) await mensagens(false);
+    Object.assign(ultimo, { conv: e.conv, msgs: e.msgs, envios: e.envios, nao_lidas: e.nao_lidas });
+    if ($("msg").textContent.startsWith("o servidor")) aviso("");
+  } catch (err) { aviso(err.message); $("ar").className = "ponto"; }
+  setTimeout(vigiar, 2000);
+}
+
+// ---- nova conversa: um canal escondido ou um no ----------------------------
+let canaisNova = [];
+async function abrirNova() {
+  $("nova").classList.add("aberto"); $("busca").value = ""; $("busca").focus();
+  try {
+    const [cs] = await Promise.all([(await pedir("GET", "api/canais")).json(), carregarNos()]);
+    canaisNova = cs;
+    listarNova();
+  } catch (e) { aviso(e.message); }
+}
+function listarNova() {
+  const f = $("busca").value.toLowerCase(), ul = $("opcoes");
+  ul.innerHTML = "";
+  const sec = (t) => { const li = document.createElement("li"); li.className = "sec"; li.textContent = t; ul.appendChild(li); };
+  const item = (ic, dm, nome, sub, fn) => {
+    const li = document.createElement("li");
+    li.innerHTML = "<div class='ic" + (dm ? " dm" : "") + "'></div><div class='meio'><b></b><small></small></div>";
+    li.querySelector(".ic").textContent = ic; li.querySelector("b").textContent = nome; li.querySelector("small").textContent = sub;
+    li.onclick = fn; ul.appendChild(li);
+  };
+  const cs2 = canaisNova.filter((c) => c.nome.toLowerCase().includes(f));
+  if (cs2.length) { sec("Canais"); for (const c of cs2) item("#", false, c.nome, "canal " + c.idx, () => { fecharNova(); abrir({ canal: true, idx: c.idx, no: 0, nome: c.nome, sub: "canal " + c.idx }); }); }
+  const ns = nos.filter((n) => (n.nome + " " + n.longo).toLowerCase().includes(f))
+                .sort((a, b) => (b.fav - a.fav) || ((a.idade < 0 ? 1e12 : a.idade) - (b.idade < 0 ? 1e12 : b.idade))).slice(0, 80);
+  if (ns.length) {
+    sec("Nós (mensagem direta)");
+    for (const n of ns) {
+      const sub = [n.longo !== n.nome ? n.longo : "", ha(n.idade), saltosTxt(n)].filter(Boolean).join(" · ");
+      item(iniciais(n.nome), true, (n.fav ? "★ " : "") + n.nome, sub, () => { fecharNova(); abrir({ canal: false, idx: 0, no: n.num, nome: n.nome, sub: n.longo }); });
+    }
+  }
+  if (!cs2.length && !ns.length) sec("nada encontrado");
+}
+function fecharNova() { $("nova").classList.remove("aberto"); }
+
+$("texto").addEventListener("input", contar);
+$("texto").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); enviar(); } });
+$("enviar").onclick = enviar;
+$("novaBt").onclick = abrirNova;
+$("fecharNova").onclick = fecharNova;
+$("busca").addEventListener("input", listarNova);
+$("nova").addEventListener("click", (e) => { if (e.target.id === "nova") fecharNova(); });
+$("ficha").addEventListener("click", (e) => { if (e.target.id === "ficha") $("ficha").classList.remove("aberto"); });
+$("voltar").onclick = () => { document.body.classList.remove("conversando"); };
+$("abaConv").onclick = () => trocarAba("conv");
+$("abaNos").onclick = () => trocarAba("nos");
+for (const id of ["nosBusca", "soRadio", "soFav"]) $(id).addEventListener("input", desenharNos);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { fecharNova(); $("ficha").classList.remove("aberto"); } });
+carregarNos().catch(() => {});
+vigiar();
+saude();
+</script>
+</body>
+</html>

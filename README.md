@@ -26,7 +26,9 @@ Versão atual: **0.7.0** (ver [CHANGELOG.md](CHANGELOG.md)).
 - Multitarefa: apps com parte de fundo (continuam depois de fechar a janela),
   worker do sistema para leituras lentas, e registro de dono de cada
   tarefa.
-- Console serial com diagnóstico (`help`).
+- Console serial e app Terminal com os comandos de sempre do Linux (`help`)
+  e os do sistema (`help sistema`), em português e em inglês
+  (`estado` = `status`, `wifi varrer` = `wifi scan`).
 
 **Rádio**
 - **Wi-Fi** pelo ESP32-C6 (esp_hosted, SDIO).
@@ -43,6 +45,7 @@ Versão atual: **0.7.0** (ver [CHANGELOG.md](CHANGELOG.md)).
 | ESP-NOW | Conversa direta entre aparelhos ESP32 |
 | Câmera | Visualização ao vivo e foto em BMP no cartão |
 | Arquivos | Navega pelo cartão: texto, CSV e imagens |
+| Música | Toca MP3 e WAV da pasta `Music` (ou `Música`, `Musicas`...) do cartão, com subpastas, em segundo plano; espectro animado; miniplayer na central de avisos |
 | Energia | Bateria, consumo e gráficos do dia |
 | Tarefas | Tarefas do FreeRTOS, CPU e memória, agrupadas por dono |
 | IMU | Acelerômetro e giroscópio |
@@ -62,7 +65,7 @@ lugar nenhum: o seu app mora ao lado destes.
   certo; à mão é `idf.py build` (v1.x) ou `idf.py -B build_v3 -DM5_CHIP=v3 build`
   (v3.x). As chaves de cada um estão em `sdkconfig.defaults.chip_v1` e `_v3`.
 - Opcional:
-  - cartão microSD em FAT32;
+  - cartão microSD em FAT32 ou exFAT;
   - teclado do ExtPort1;
   - GPS ou nó Meshtastic no Grove.
 
@@ -108,7 +111,7 @@ Sem a atualização, as telas dessas funções dizem "rádio C6 de fábrica:
 atualização opcional", e o resto segue normal.
 
 Para quem quiser os três recursos: o firmware fica na pasta `c6/` (mesma
-versão do esp_hosted do sistema, 3.0.9) e precisa de um gravador serial,
+versão do esp_hosted do sistema, 3.0.10) e precisa de um gravador serial,
 porque o C6 não tem USB próprio.
 
 O C6 não tem USB próprio. É gravado pelo conector de programação da placa,
@@ -133,7 +136,7 @@ com um gravador serial (por exemplo, o M5Stack ESP32 Downloader):
    `/dev/ttyUSB*` no Linux). Para escolher outra: `PORTA=/dev/xxx c6/gravar.sh`.
 
 5. Ligue o Tab5. No log de boot deve aparecer
-   `host=3.0.9 coprocessor=3.0.9 (match)`.
+   `host=3.0.10 coprocessor=3.0.10 (match)`.
 
 Para voltar ao original, grave o backup com
 `esptool.py write_flash 0 backup_c6.bin`, ou use a ferramenta oficial da
@@ -141,9 +144,14 @@ M5Stack.
 
 O que roda no C6 (farejo, CSI, FTM, 802.15.4), quem decide a configuração do
 Wi-Fi dele e o roteiro de verificação depois de gravar estão em
-[RADIO_C6.md](RADIO_C6.md).
+[docs/RADIO_C6.md](docs/RADIO_C6.md).
 
 ## Primeiro uso
+
+Num Tab5 novo (ou gravado pelo M5Burner) o sistema abre um assistente rápido:
+idioma, fuso horário, a malha Meshtastic pela internet (o servidor da sua
+região) e o Wi-Fi. Tudo pode ser mudado depois em Ajustes. Para rever o
+assistente: comando `boasvindas` no console.
 
 - **Wi-Fi:** em Ajustes > Wi-Fi, toque PROCURAR REDES e escolha a rede. A
   senha é pedida na tela e guardada **cifrada** no cartão
@@ -163,8 +171,8 @@ Wi-Fi dele e o roteiro de verificação depois de gravar estão em
 
 A referência das APIs (tela, toque, tarefas, cartão, notificações, energia,
 sensores, Wi-Fi, ESP-NOW, Meshtastic, câmera, console) está em
-[API.md](API.md); o guia de como pensar um app, com os erros que já
-cometemos, em [ESCREVENDO_APPS.md](ESCREVENDO_APPS.md). Para criar um app:
+[docs/API.md](docs/API.md); o guia de como pensar um app, com os erros que já
+cometemos, em [docs/ESCREVENDO_APPS.md](docs/ESCREVENDO_APPS.md). Para criar um app:
 
 1. copie `main/app_exemplo/` para `main/app_<nome>/`;
 2. troque `APP_EXEMPLO` por `APP_<NOME>` (o nome segue a pasta);
@@ -173,19 +181,24 @@ cometemos, em [ESCREVENDO_APPS.md](ESCREVENDO_APPS.md). Para criar um app:
 Um app também pode responder a comandos do console serial
 (`app <app> <comando>`), declarando `.comandos` no `app_t`.
 
-A arquitetura do kernel está em [ARQUITETURA.md](ARQUITETURA.md), e a base de
-tela em [COMPOSITOR.md](COMPOSITOR.md).
+A arquitetura do kernel está em [docs/ARQUITETURA.md](docs/ARQUITETURA.md), e a base de
+tela em [docs/COMPOSITOR.md](docs/COMPOSITOR.md).
 
 ## Estrutura
 
 ```
 main/kernel/      núcleo: laço de interface, compositor, componentes (lista, conversa, teclado)
 main/hal/         hardware: tela, toque, energia, cartão, Wi-Fi, Bluetooth, GPS, câmera, IMU
-main/services/    serviços: ajustes, notificações, log, Meshtastic, ESP-NOW, registro
+main/services/    serviços: ajustes, notificações, log, Meshtastic, ESP-NOW, registro, tocador de música
 main/app_*/       aplicativos
 c6/               firmware do coprocessador ESP32-C6 (ESP-NOW + esp_hosted)
 compartilhado/    contrato de mensagens entre o P4 e o C6
 ferramentas/      geradores (fontes, emoji, tabela de hardware) e utilitários
+components/       o Berry (só a variante berry o compila)
+berry_exemplos/   apps Berry de exemplo (copiar para apps/Berry/ no cartão)
+variantes/        o que muda em cada firmware (completa, sistema, m5burner, berry)
+testes/           testes que rodam no Mac (protobuf do Mesh, apps Berry...)
+docs/             a documentação (API, arquitetura, Berry, variantes...)
 ```
 
 ## Limitações conhecidas
@@ -193,8 +206,9 @@ ferramentas/      geradores (fontes, emoji, tabela de hardware) e utilitários
 - As telas ST7123 e ST7121 e o ESP32-P4 v3.x compilam e seguem o caminho
   conservador (repouso só apaga a luz, relógio do painel de fábrica), mas
   ainda não foram testados num aparelho. Relatos são bem-vindos.
-- A interface e a documentação estão em português, e o fuso horário é fixo
-  (`TAB5_FUSO_S`, UTC−3) em `services/tab5_hora.hpp`.
+- A interface e a documentação estão em português (a tradução vem depois).
+  O fuso horário é escolhido no primeiro uso e em Ajustes > Data e hora, sem
+  horário de verão automático.
 - A curva de bateria (`hal/tab5_power.hpp`) foi calibrada em uma unidade
   (1306,8 mAh medidos). Outras baterias podem pedir recalibração.
 - O Bluetooth é só BLE: o C6 não faz Bluetooth clássico.
@@ -204,4 +218,4 @@ ferramentas/      geradores (fontes, emoji, tabela de hardware) e utilitários
 ## Licença
 
 [MIT](LICENSE). Os componentes de terceiros têm licença própria: ver
-[TERCEIROS.md](TERCEIROS.md).
+[docs/TERCEIROS.md](docs/TERCEIROS.md).

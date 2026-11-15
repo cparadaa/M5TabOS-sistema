@@ -64,9 +64,9 @@ bool tarefa_app_criar(tarefa_app_t* t, tarefa_app_corpo_t corpo,
   return true;
 }
 
-void tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms)
+bool tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms)
 {
-  if (!t->handle) { return; }
+  if (!t->handle) { return true; }   // nao havia tarefa: nada a esperar
 
   t->parar = true;
 
@@ -80,7 +80,7 @@ void tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms)
     t->fim = nullptr;
     t->handle = nullptr;
     t->id = (pool_id_t)POOL_ID_VAZIO;
-    return;
+    return true;
   }
 
   // Nao confirmou no prazo. NAO matamos a tarefa e NAO destruimos o semaphore:
@@ -93,4 +93,5 @@ void tarefa_app_encerrar(tarefa_app_t* t, uint32_t ms)
   t->fim = nullptr;
   t->handle = nullptr;
   t->id = (pool_id_t)POOL_ID_VAZIO;
+  return false;   // o chamador decide o que NAO pode liberar (ver tarefa_app.h)
 }

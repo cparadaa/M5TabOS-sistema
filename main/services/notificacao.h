@@ -17,7 +17,7 @@
 // O MODELO: UMA FONTE, UM ESTADO
 // -------------------------------------------------------------------------
 // Cada servico (ou app) tem UMA fonte registrada e reescreve o estado dela
-// quando quer. Guia de uso para quem publica: ESCREVENDO_APPS.md, secao 8.2.
+// quando quer. Guia de uso para quem publica: docs/ESCREVENDO_APPS.md, secao 8.2.
 // Nao e queue de eventos, e ESTADO ATUAL - "tenho 3 mensagens, uma delas
 // direta". Isso e de proposito:
 //
@@ -39,7 +39,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define NOTIF_MAX_FONTES  8
+#define NOTIF_MAX_FONTES  12
 #define NOTIF_RESUMO      32
 
 // Gravidade. A barra pinta pela PIOR fonte ativa - vermelho ganha de azul,
@@ -83,7 +83,7 @@ static inline void notif_limpar(int id) { notif_publicar(id, 0, NOTIF_INFO, null
 // quantidade/nivel/resumo: a fonte continua publicando e aparecendo na barra
 // e na lista de ativas exatamente igual, so para de contar para o beep (ver
 // notif_houve_novidade_sonora() abaixo). Quem grava a preferencia entre
-// reinicios e o CHAMADOR (ver app_trilha/trilha_fundo.cpp e ajustes.h) - este modulo so
+// reinicios e o CHAMADOR (ver services/tab5_trilha.cpp e ajustes.h) - este modulo so
 // guarda o estado EM RAM, do mesmo jeito que guarda quantidade/nivel.
 void notif_silenciar(int id, bool silenciar);
 
@@ -101,17 +101,6 @@ typedef struct {
   notif_nivel_t nivel;
   char          resumo[NOTIF_RESUMO];
 } notif_item_t;
-
-// A FONTE EM DESTAQUE - a que a barra mostra. E a de maior
-// nivel entre as ATIVAS (quantidade > 0); no empate, a que mudou por ultimo.
-// 'outras' recebe quantas fontes ativas ficaram de fora. false = nada ativo.
-//
-// Substitui o antigo "N avisos" com varias fontes ativas: ele SOMAVA coisas
-// que nao se somam (pontos da Trilha + mensagens do Mesh) - com uma trilha
-// gravando, uma mensagem nova virava "348 avisos" em vez de "1 em LongFast",
-// e sumia no numero. Copia em vez de devolver ponteiro: a tabela muda a
-// qualquer momento, noutra tarefa.
-bool notif_destaque(notif_item_t* saida, int* outras);
 
 // TODAS AS ATIVAS, na ordem em que a barra as mostra: o destaque primeiro
 // (mais grave; no empate, a mais recente) e o resto na mesma regra. Devolve

@@ -30,14 +30,13 @@
 #include <stdbool.h>
 #include "tab5_c6.h"
 
-// Quem pede (um bit cada, como tab5_wifi_manter_acordado): o servico fica
-// ligado enquanto houver um.
+// Quem pede (um bit cada): o servico fica ligado enquanto houver um e declara
+// RECURSO_RADIO_ESCUTA (kernel/recursos.h); o kernel aplica o receptor ligado.
 #define TAB5_CSI_RADAR    (1u << 0)
 #define TAB5_CSI_CONSOLE  (1u << 1)
 
 void tab5_csi_ligar(uint32_t quem);
 void tab5_csi_desligar(uint32_t quem);
-bool tab5_csi_ativo(void);
 
 typedef enum {
   TAB5_CSI_DESLIGADO = 0,

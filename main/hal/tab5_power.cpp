@@ -1,4 +1,5 @@
 #include "tab5_power.hpp"
+#include "esp_rom_sys.h"   // esp_rom_delay_us
 #include "tab5_hora.hpp"   // tab5_agora_ms
 #include "tab5_marcos.hpp"
 #include "tab5_sensores.hpp"
@@ -7,6 +8,7 @@
 
 #include "esp_log.h"
 #include <math.h>
+#include <stdlib.h>   // abs
 #include "esp_attr.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -17,6 +19,32 @@
 
 // Necessario para chegar no handle do painel DPI (ver tab5_power_repouso).
 #include "tab5_painel_dsi_interno.hpp"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+
+// A FAIXA DO CLOCK VARIAVEL NUNCA CRUZA A VELOCIDADE DA PSRAM.
+//
+// No P4, toda troca automatica de frequencia (DFS) que cruza CONFIG_SPIRAM_SPEED
+// (200 MHz) troca tambem a temporizacao da PSRAM - e para isso o IDF PARA O
+// OUTRO NUCLEO (mspi_timing_change_speed_mode_cache_safe ->
+// esp_ipc_isr_stall_other_cpu). Se nesse instante o outro nucleo esta dentro
+// de uma interrupcao que tambem quer trocar a frequencia (esp_pm_impl_isr_hook
+// -> do_switch, com as interrupcoes mascaradas), ele nao atende a parada, os
+// dois se esperam e o watchdog de interrupcao reinicia o aparelho. Pego no
+// core dump em 2026-10-21 (os dois nucleos em do_switch); explica tambem os
+// reinicios por INT_WDT com a Musica tocando de 2026-10-17. Com a faixa de um
+// lado so do limite, o DFS nunca troca a velocidade da PSRAM: acima dele o
+// clock fica fixo no teto; abaixo (o repouso a 40 MHz) segue variando.
+static void faixa_segura(int max_mhz, int* min_mhz)
+{
+#if CONFIG_SPIRAM
+  if (max_mhz >= CONFIG_SPIRAM_SPEED && *min_mhz < CONFIG_SPIRAM_SPEED) { *min_mhz = max_mhz; }
+#else
+  (void)max_mhz; (void)min_mhz;
+#endif
+}
 
 static const char *TAG = "power";
 
@@ -40,6 +68,7 @@ static const char *TAG = "power";
 // E por isso os dois nascem ligados sem ninguem pedir.
 // ---------------------------------------------------------------------------
 static constexpr uint8_t IOE0_CAM_RST     = 6;
+static constexpr uint8_t IOE0_TP_RST      = 5;
 static constexpr uint8_t IOE1_WLAN_PWR_EN = 0;
 
 // BMI270 no barramento interno. O M5Unified tenta 0x69 e 0x68.
@@ -116,8 +145,9 @@ void tab5_power_aplicar(const tab5_perfil_t& perfil)
     // proximo app que quisesse um teto baixo cairia na mesma pegadinha sem
     // pista nenhuma do porque. Mesma correcao: o piso acompanha o teto quando
     // o teto pedido for menor.
-    const int piso = (perfil.cpu_max_mhz < perfil.cpu_min_mhz) ? perfil.cpu_max_mhz
-                                                                : perfil.cpu_min_mhz;
+    int piso = (perfil.cpu_max_mhz < perfil.cpu_min_mhz) ? perfil.cpu_max_mhz
+                                                          : perfil.cpu_min_mhz;
+    faixa_segura(perfil.cpu_max_mhz, &piso);
     esp_pm_config_t pm = {
       .max_freq_mhz       = perfil.cpu_max_mhz,
       .min_freq_mhz       = piso,
@@ -133,9 +163,13 @@ void tab5_power_aplicar(const tab5_perfil_t& perfil)
     }
     else
     {
-      ESP_LOGI(TAG, "clock variavel: %d a %d MHz conforme a carga; dormir quando ocioso: %s",
-               piso, perfil.cpu_max_mhz,
-               perfil.light_sleep_ocioso ? "sim" : "nao");
+      if (piso == perfil.cpu_max_mhz) {
+        ESP_LOGI(TAG, "clock fixo: %d MHz (sem DFS cruzando a velocidade da PSRAM); dormir quando ocioso: %s",
+                 piso, perfil.light_sleep_ocioso ? "sim" : "nao");
+      } else {
+        ESP_LOGI(TAG, "clock variavel: %d a %d MHz conforme a carga; dormir quando ocioso: %s",
+                 piso, perfil.cpu_max_mhz, perfil.light_sleep_ocioso ? "sim" : "nao");
+      }
     }
 #else
     ESP_LOGW(TAG, "pm_dinamico pedido, mas CONFIG_PM_ENABLE nao esta ligado. "
@@ -172,12 +206,18 @@ void tab5_power_grove(bool ligar)
 
 bool tab5_power_grove_ligado(void) { return s_grove_ligado; }
 
+void tab5_power_usb_a(bool ligar)
+{
+  M5.Power.setExtOutput(ligar, m5::ext_USB);
+  ESP_LOGI(TAG, "5V do USB-A: %s", ligar ? "ligado" : "desligado");
+}
+
 void tab5_power_camera(bool ligar)
 {
   M5.getIOExpander(0).digitalWrite(IOE0_CAM_RST, ligar);
 }
 
-bool tab5_power_imu_so_acelerometro(void)
+bool tab5_power_imu_giroscopio(bool ligar)
 {
   // O M5.Imu.sleep() NAO serve aqui: IMU_Base::sleep() e virtual devolvendo
   // false e so o MPU6886 sobrescreve. No BMI270 a chamada nao faz nada.
@@ -187,13 +227,23 @@ bool tab5_power_imu_so_acelerometro(void)
     {
       continue;
     }
-    // PWR_CTRL: bit3 temp | bit2 acc | bit1 gyr | bit0 aux -> so acelerometro.
-    // O giroscopio e quem come a corrente (centenas de uA contra ~20uA do acel).
-    M5.In_I2C.writeRegister8(addr, BMI270_PWR_CTRL, 0x04, 400000);
-    // PWR_CONF: bit0 adv_power_save | bit1 fifo_self_wakeup. O M5Unified deixa
-    // isso em 0x00 no begin(), ou seja, performance maxima o tempo todo.
-    M5.In_I2C.writeRegister8(addr, BMI270_PWR_CONF, 0x03, 400000);
-    ESP_LOGI(TAG, "IMU (BMI270, 0x%02x) em economia: giroscopio desligado", addr);
+    if (ligar) {
+      // PWR_CONF primeiro: com o advanced power save ligado o chip quer ~450
+      // us entre duas escritas (folha de dados, 4.4) - sai dele, espera, e so
+      // entao liga o giroscopio (que leva ~45 ms para dar leitura boa).
+      M5.In_I2C.writeRegister8(addr, BMI270_PWR_CONF, 0x00, 400000);
+      esp_rom_delay_us(1000);
+      // PWR_CTRL: bit3 temp | bit2 acc | bit1 gyr | bit0 aux.
+      M5.In_I2C.writeRegister8(addr, BMI270_PWR_CTRL, 0x0E, 400000);
+    } else {
+      // So acelerometro: o giroscopio e quem come a corrente (centenas de uA
+      // contra dezenas do acelerometro). PWR_CONF bit0 adv_power_save | bit1
+      // fifo_self_wakeup - o M5Unified deixa 0x00 (desempenho maximo sempre).
+      M5.In_I2C.writeRegister8(addr, BMI270_PWR_CTRL, 0x04, 400000);
+      esp_rom_delay_us(1000);
+      M5.In_I2C.writeRegister8(addr, BMI270_PWR_CONF, 0x03, 400000);
+    }
+    ESP_LOGI(TAG, "IMU (BMI270, 0x%02x): giroscopio %s", addr, ligar ? "ligado" : "desligado (economia)");
     return true;
   }
   ESP_LOGW(TAG, "BMI270 nao encontrado (perfil.imu estava false?)");
@@ -344,22 +394,38 @@ static const uint32_t EST_MAGIA     = 0x50C0A7E1u;
 // mesmo sinal de "terminou" que o proprio carregador usa (C/20 a C/10).
 static const float TAB5_CARGA_TERMINO_MA = 100.0f;
 
+// O FIM DE CARGA DESTE CARREGADOR (IP2326), medido no energia.csv de
+// 2026-10-17 em cinco cargas: tensao constante em 8,354-8,365 V, a corrente
+// cai ate ~200-220 mA e ele CORTA de uma vez - a amostra seguinte ja e -2 mA
+// (o cabo alimenta o aparelho, a bateria parada). Nunca passa pelos 100 mA
+// acima: o "cheia" so era reconhecido por acaso, e a tela ficava em 92-99%
+// com a bateria cheia. O sinal de verdade e a QUEDA: estava na fase final
+// (tensao no teto, corrente ja caindo) e parou com o cabo ainda ligado.
+static const float TAB5_CARGA_CV_V        = 8.34f;   // fase de tensao constante
+static const float TAB5_CARGA_FINAL_MA    = 350.0f;  // ... ja na cauda
+static const float TAB5_CABO_PARADO_MA    = -8.0f;   // acima disto o cabo segura o aparelho (= tab5_bateria)
+static const int64_t TAB5_CARGA_CORTE_US  = 30000000; // a queda entre duas leituras (5 s), com folga
+
 RTC_NOINIT_ATTR static struct { uint32_t magia; float soc; } s_rtc_soc;
 
 static bool        s_est_ok      = false;
 static float       s_soc         = 0.0f;     // o estado, em % com fracao
 static int64_t     s_est_us      = 0;
 static int64_t     s_ult_carga_us = 0;
+static int64_t     s_cauda_us    = 0;        // ultima leitura na cauda da carga (ver TAB5_CARGA_CV_V)
 static bool        s_ja_carregou = false;
 static int         s_exibido     = -1;
 static const char* s_est_fonte   = "-";
+static const char* const FONTE_CURVA_BOOT = "curva no boot";
 
+// A RTC_NOINIT sobrevive a todo reinicio em que o chip nao perdeu energia -
+// gravar pela USB (ESP_RST_USB/JTAG/EXT) inclusive, que era o caso mais comum
+// e ficava de fora: o boot recomecava pela curva com o cabo ligado.
 static bool reinicio_de_software(void)
 {
   switch (esp_reset_reason()) {
-    case ESP_RST_SW: case ESP_RST_PANIC: case ESP_RST_INT_WDT:
-    case ESP_RST_TASK_WDT: case ESP_RST_WDT: return true;
-    default: return false;
+    case ESP_RST_POWERON: case ESP_RST_BROWNOUT: case ESP_RST_UNKNOWN: return false;
+    default: return true;
   }
 }
 
@@ -371,12 +437,16 @@ static int estimar_pct(float volts, float mA, int pct_curva)
 
   if (!s_est_ok) {
     s_soc = (float)pct_curva;
-    s_est_fonte = "curva no boot";
-    // A RTC so vale se foi reinicio por software E se ainda e plausivel -
+    s_est_fonte = FONTE_CURVA_BOOT;
+    // A RTC so vale se o chip nao perdeu energia E se ainda e plausivel -
     // 20 pontos de folga cobrem o erro da curva logo depois de uma carga.
+    // CARREGANDO, a curva so erra PARA CIMA (medido: 46% de verdade, curva
+    // 98% a 700 mA): ela nao pode vetar um valor menor que o dela.
+    const bool carregando = mA > 20.0f;
+    const float dif = s_rtc_soc.soc - (float)pct_curva;
+    const bool plausivel = carregando ? (dif <= 20.0f) : (fabsf(dif) <= 20.0f);
     if (reinicio_de_software() && s_rtc_soc.magia == EST_MAGIA
-     && s_rtc_soc.soc >= 0.0f && s_rtc_soc.soc <= 100.0f
-     && fabsf(s_rtc_soc.soc - (float)pct_curva) <= 20.0f) {
+     && s_rtc_soc.soc >= 0.0f && s_rtc_soc.soc <= 100.0f && plausivel) {
       s_soc = s_rtc_soc.soc;
       s_est_fonte = "continuado da RTC";
     }
@@ -395,10 +465,21 @@ static int estimar_pct(float volts, float mA, int pct_curva)
   else if (dt_h >= 0.1f)          { s_soc = (float)pct_curva; s_est_fonte = "curva (lacuna)"; }
 
   if (mA > 20.0f) { s_ult_carga_us = agora; s_ja_carregou = true; }
+  if (mA > 20.0f && mA < TAB5_CARGA_FINAL_MA && volts >= TAB5_CARGA_CV_V) { s_cauda_us = agora; }
 
-  // 3. FIM DE CARGA: o par de sinais que o carregador usa para parar.
+  // 3. FIM DE CARGA: o par de sinais que o carregador usa para parar...
   if (mA > 0.0f && mA < TAB5_CARGA_TERMINO_MA && (int)(volts * 500.0f) >= (int)(CURVA[0].mv * 0.995f)) {
     s_soc = 100.0f;
+  }
+  // ... e o corte deste carregador: estava na cauda, agora nada entra e o
+  // cabo continua (sem cabo a corrente seria o consumo, bem abaixo de -8 mA).
+  bool cheia_agora = false;
+  if (s_cauda_us && agora - s_cauda_us < TAB5_CARGA_CORTE_US
+      && mA <= 20.0f && mA > TAB5_CABO_PARADO_MA) {
+    s_soc = 100.0f;
+    cheia_agora = true;
+    s_cauda_us = 0;
+    s_est_fonte = "fim de carga";
   }
 
   // 2. CORRECAO PELA CURVA, lenta, so onde ela e confiavel.
@@ -413,13 +494,26 @@ static int estimar_pct(float volts, float mA, int pct_curva)
   if (s_soc < 0.0f)   { s_soc = 0.0f; }
   if (s_soc > 100.0f) { s_soc = 100.0f; }
 
-  // 4. Fora da carga, o numero mostrado nao sobe.
+  // 4. Fora da carga, o numero mostrado nao sobe - menos no fim de carga, que
+  //    acontece justamente com a corrente ja em zero.
   int r = (int)lroundf(s_soc);
-  if (mA <= 20.0f && s_exibido >= 0 && r > s_exibido) { r = s_exibido; }
+  if (mA <= 20.0f && !cheia_agora && s_exibido >= 0 && r > s_exibido) { r = s_exibido; }
   s_exibido = r;
 
   s_rtc_soc.magia = EST_MAGIA; s_rtc_soc.soc = s_soc;
   return r;
+}
+
+bool tab5_power_soc_da_curva_no_boot(void) { return s_est_ok && s_est_fonte == FONTE_CURVA_BOOT; }
+
+bool tab5_power_soc_semear(float soc, const char* fonte)
+{
+  if (!tab5_power_soc_da_curva_no_boot() || soc < 0.0f || soc > 100.0f) { return false; }
+  s_soc = soc;
+  s_exibido = (int)lroundf(soc);
+  s_est_fonte = fonte;
+  s_rtc_soc.magia = EST_MAGIA; s_rtc_soc.soc = s_soc;
+  return true;
 }
 
 void tab5_power_soc_debug(float* soc, float* curva, const char** fonte, float* min_desde_carga)
@@ -621,6 +715,39 @@ const char* tab5_painel_nome(void)
 
 bool tab5_painel_toque_gt911(void) { return tab5_painel() == TAB5_PAINEL_ILI9881C; }
 
+// Ver tab5_power.hpp. Sequencia do datasheet do GT911 para o endereco 0x14:
+// INT em ALTO, RST em baixo (>100 us), RST em alto com o INT ainda alto
+// (>5 ms), espera o firmware dele subir (~50 ms) e devolve o INT como
+// entrada. So gpio_set_direction/level: o gpio_config apagaria o tipo de
+// interrupcao que o kernel armou no pino (a ISR do toque).
+static constexpr gpio_num_t TOQUE_INT = GPIO_NUM_23;   // INT do GT911 (e endereco no reset)
+
+bool tab5_toque_reiniciar(void)
+{
+  if (!tab5_painel_toque_gt911()) { return false; }
+  auto& expansor = M5.getIOExpander(0);
+  gpio_set_level(TOQUE_INT, 1);
+  gpio_set_direction(TOQUE_INT, GPIO_MODE_INPUT_OUTPUT);   // dirige o INT e ainda le
+  const bool ok = expansor.digitalWrite(IOE0_TP_RST, false);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  expansor.digitalWrite(IOE0_TP_RST, true);
+  vTaskDelay(pdMS_TO_TICKS(10));                             // INT alto: endereco 0x14
+  // SINCRONIA DO INT (o wakeup() do driver, que o boot faz logo depois do
+  // reset): INT em BAIXO ~58 ms, alto 2 ms, e so entao entrada. Sem este
+  // passo o GT911 volta respondendo no I2C mas NAO reporta toque nenhum -
+  // foi o que a primeira versao deste reinicio fez (14/11/2026): a tela em
+  // repouso parou de acordar com o dedo ate o aparelho reiniciar.
+  gpio_set_level(TOQUE_INT, 0);
+  vTaskDelay(pdMS_TO_TICKS(58));
+  gpio_set_level(TOQUE_INT, 1);
+  vTaskDelay(pdMS_TO_TICKS(2));
+  gpio_set_direction(TOQUE_INT, GPIO_MODE_INPUT);            // o GT911 volta a dirigir o INT
+  gpio_set_pull_mode(TOQUE_INT, GPIO_PULLUP_ONLY);           // como o driver deixa
+  vTaskDelay(pdMS_TO_TICKS(50));                             // o firmware dele sobe
+  ESP_LOGW(TAG, "toque: GT911 reiniciado pelo pino de reset%s", ok ? "" : " (expansor NAO respondeu)");
+  return ok;
+}
+
 // O repouso fundo (SLPIN + desmontar o DSI) so onde o toque sobrevive a ele.
 static bool repouso_fundo(void) { return tab5_painel_toque_gt911(); }
 
@@ -638,10 +765,29 @@ static bool repouso_fundo(void) { return tab5_painel_toque_gt911(); }
 // Quando o teto pedido fica ABAIXO de 40, o piso acompanha (min = max): nao
 // ha mais faixa de DFS para variar, o clock fica fixo naquele valor - que e
 // exatamente a intencao de quem esta testando "meu piso E este numero".
+static int  s_teto_mhz = 0;      // o ultimo teto pedido ao esp_pm (0 = nenhum)
+static bool s_sono_leve = false; // light sleep ligado agora (so em repouso)
+
+// AS FREQUENCIAS QUE O P4 ACEITA: as divisoes do PLL de 360 MHz e o cristal
+// de 40. Pedir outra (200, do Terminal, falhava calado: ESP_ERR_INVALID_ARG e
+// o repouso desistia) sobe para a seguinte valida - nunca abaixo do pedido.
+static int frequencia_valida(int mhz)
+{
+  static const int VALIDAS[] = { 40, 90, 180, 360 };
+  for (int f : VALIDAS) { if (mhz <= f) { return f; } }
+  return 360;
+}
+
 static bool ajustar_teto(int mhz)
 {
 #if CONFIG_PM_ENABLE
-  const int piso = (mhz < 40) ? mhz : 40;
+  mhz = frequencia_valida(mhz);
+  int piso = (mhz < 40) ? mhz : 40;
+  faixa_segura(mhz, &piso);
+  // Mexer no teto desliga o sono leve: quem o quer de volta (o kernel, em
+  // repouso) chama tab5_power_sono_leve() depois.
+  s_sono_leve = false;
+  s_teto_mhz = mhz;
   esp_pm_config_t pm = { .max_freq_mhz = mhz, .min_freq_mhz = piso, .light_sleep_enable = false };
   esp_err_t err = esp_pm_configure(&pm);
   if (err != ESP_OK) {
@@ -655,6 +801,33 @@ static bool ajustar_teto(int mhz)
   return false;
 #endif
 }
+
+bool tab5_power_sono_leve(bool ligar)
+{
+#if CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
+  // So com a tela DESMONTADA: com o DSI de pe a trava dele impede o sono de
+  // qualquer jeito, e no repouso so de luz (TDDI) o painel segue no ar.
+  if (ligar && (!s_em_repouso || !s_desmontado || s_teto_mhz <= 0)) { return false; }
+  if (ligar == s_sono_leve) { return true; }
+  const int mhz  = s_teto_mhz > 0 ? s_teto_mhz : 40;
+  int piso = (mhz < 40) ? mhz : 40;
+  faixa_segura(mhz, &piso);
+  esp_pm_config_t pm = { .max_freq_mhz = mhz, .min_freq_mhz = piso, .light_sleep_enable = ligar };
+  const esp_err_t err = esp_pm_configure(&pm);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "sono leve %s: esp_pm_configure %s", ligar ? "ligar" : "desligar", esp_err_to_name(err));
+    return false;
+  }
+  s_sono_leve = ligar;
+  ESP_LOGI(TAG, "sono leve: %s", ligar ? "ligado (repouso)" : "desligado");
+  return true;
+#else
+  (void)ligar;
+  return false;
+#endif
+}
+
+bool tab5_power_sono_leve_ligado(void) { return s_sono_leve; }
 
 // Ver o aviso grande em tab5_power.hpp. So reaproveita ajustar_teto() - o
 // mesmo caminho que repouso()/retomar() ja usam - MAS sem tocar em painel,
@@ -1025,12 +1198,42 @@ double tab5_power_quadros_por_segundo(void)
   return (l > 0 && a > 0) ? d.dpi_freq_mhz * 1e6 / (l * a) : 0;
 }
 
+// O clock do painel DPI sai de 240 MHz / divisor INTEIRO (mipi_dsi_hal.c usa
+// roundf), entao so existem estes valores "redondos" (tambem ha 34,3 e 26,7,
+// fora da tabela). Pedir 65 dava 60 de verdade. Medido no Tab5 (07/11/2026):
+// 60 real teve underrun (tela azul); 80 real, nenhum.
+static const int RELOGIOS_PAINEL[] = { 80, 60, 48, 40, 30, 24 };
+static const int N_RELOGIOS_PAINEL = (int)(sizeof(RELOGIOS_PAINEL) / sizeof(RELOGIOS_PAINEL[0]));
+
+// Valor da tabela MAIS PROXIMO do pedido (fora da faixa vale a ponta; empate
+// fica com o maior).
+static int relogio_aproximado(int mhz)
+{
+  int melhor = RELOGIOS_PAINEL[0];
+  for (int i = 1; i < N_RELOGIOS_PAINEL; i++)
+  {
+    if (abs(RELOGIOS_PAINEL[i] - mhz) < abs(melhor - mhz)) { melhor = RELOGIOS_PAINEL[i]; }
+  }
+  return melhor;
+}
+
+int tab5_power_relogio_vizinho(int atual, int passo)
+{
+  int i = 0;   // posicao do valor da tabela mais proximo do atual
+  for (int k = 1; k < N_RELOGIOS_PAINEL; k++)
+  {
+    if (abs(RELOGIOS_PAINEL[k] - atual) < abs(RELOGIOS_PAINEL[i] - atual)) { i = k; }
+  }
+  // A tabela vai do maior para o menor: "para cima" e o indice anterior.
+  if (passo > 0 && i > 0)                      { i--; }
+  else if (passo < 0 && i < N_RELOGIOS_PAINEL - 1) { i++; }
+  return RELOGIOS_PAINEL[i];
+}
+
 bool tab5_power_relogio_dpi(int mhz)
 {
-  // Fora da faixa, LIMITA em vez de recusar: quem pede 84 quer
-  // "o maximo", nao um erro. Mesma faixa de AJUSTES_RELOGIO_MIN/MAX.
-  if (mhz > 80) { mhz = 80; }
-  if (mhz < 24) { mhz = 24; }
+  // Qualquer pedido vira o valor real mais proximo (ver a tabela acima).
+  mhz = relogio_aproximado(mhz);
 
   // Tela TDDI: o relogio fica no de fabrica (ver tab5_painel). Pedir o mesmo
   // valor que ja esta e sucesso; qualquer outro, recusa sem mexer em nada.
@@ -1120,6 +1323,54 @@ bool tab5_power_relogio_dpi(int mhz)
   return true;
 }
 
+// VELOCIDADE DO LINK DSI (Mbps por via) - SO PARA TESTE, nao grava. O M5GFX
+// 0.2.32 liga o ILI9881C a 1040 Mbps, o valor das telas novas (ST7123); um
+// relato no M5GFX (issue 334) cita 730 Mbps para o ILI9881C e tremida leve ao
+// usar o ajuste de uma tela na outra. Este caminho deixa comparar sem
+// recompilar: o mesmo desmontar/montar do relogio, com volta sozinha.
+int tab5_power_link_dsi(void)
+{
+  auto* p = tab5_painel_dsi_interno();
+  auto* bus = p ? p->getBusDSI() : nullptr;
+  return bus ? (int)bus->config().lane_mbps : 0;
+}
+
+bool tab5_power_link_dsi(int mbps)
+{
+  if (mbps < 500)  { mbps = 500; }
+  if (mbps > 1500) { mbps = 1500; }
+  if (s_em_repouso) {
+    ESP_LOGE(TAG, "link do painel: a tela esta em repouso - acorde primeiro");
+    return false;
+  }
+  auto* p = tab5_painel_dsi_interno();
+  auto* bus = p ? p->getBusDSI() : nullptr;
+  if (bus == nullptr) { return false; }
+  const uint16_t antigo = bus->config().lane_mbps;
+  if (antigo == (uint16_t)mbps) { return true; }
+  auto trocar = [&](uint16_t v) -> bool {
+    if (!desmontar_tela()) { return false; }   // solta o barramento: o init le a config nova
+    auto cfg = bus->config();
+    cfg.lane_mbps = v;
+    bus->config(cfg);
+    if (!montar_tela()) { return false; }
+    M5.Display.setBrightness(M5.Display.getBrightness());
+    return true;
+  };
+  ESP_LOGI(TAG, "link do painel: %u -> %d Mbps", (unsigned)antigo, mbps);
+  if (!trocar((uint16_t)mbps)) {
+    ESP_LOGE(TAG, "o painel nao subiu a %d Mbps - voltando para %u", mbps, (unsigned)antigo);
+    if (!trocar(antigo)) {
+      ESP_LOGE(TAG, "nem no valor antigo o painel voltou - reiniciando");
+      vTaskDelay(pdMS_TO_TICKS(200));
+      esp_restart();
+    }
+    return false;
+  }
+  tab5_barramento_priorizar_tela(tab5_barramento_priorizado());
+  return true;
+}
+
 void tab5_power_acender(void)
 {
   uint8_t alvo = M5.Display.getBrightness();
@@ -1145,6 +1396,13 @@ void tab5_power_acender(void)
     esmaecer(0, PISO_PARTIDA, 8, 8);
     vTaskDelay(pdMS_TO_TICKS(80));
     esmaecer(PISO_PARTIDA, alvo, 12, 12);
+    // E TERMINA PELO CAMINHO DA BARRA DE AJUSTES. Visto no aparelho: com o
+    // brilho gravado no minimo, a tela acordava forte, e so obedecia depois de
+    // mexer na barra (que aplica por M5.Display.setBrightness). A rampa escreve
+    // direto no painel; a ultima escrita vai pelo mesmo caminho da barra, um
+    // instante depois, para o valor que fica ser exatamente o que ela poria.
+    vTaskDelay(pdMS_TO_TICKS(60));
+    M5.Display.setBrightness(alvo);
     return;
   }
 

@@ -45,6 +45,9 @@
 #include "esp_coex_i154.h"     /* esp_coex_ieee802154_status_disable */
 #endif
 #include "esp_wifi.h"
+#include "esp_private/wifi.h"   /* esp_wifi_internal_tx (o desvio de contagem) */
+#include "eh_cp_feat_wifi.h"     /* eh_cp_feat_wifi_is_station_connected */
+#include "esp_pm.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
@@ -577,6 +580,14 @@ static void vTarefaEnvio(void *arg)
 /* LIGAR O ESP-NOW E DECISAO DO HOST (ele manda quando o WiFi ja subiu), e NADA
  * aqui aborta: falhou, desiste calado - o host pede de novo em 5 s. */
 static bool s_espnow_no_ar = false;
+/* A janela pedida pelo P4 (C6_AJ_ESPNOW_JANELA); reaplicada se o ESP-NOW subir de novo. */
+static uint16_t s_en_intervalo = 0, s_en_janela = 0xFFFF;
+static void espnow_aplicar_janela(void)
+{
+    if (!s_espnow_no_ar) { return; }
+    if (s_en_intervalo) { esp_wifi_connectionless_module_set_wake_interval(s_en_intervalo); }
+    esp_now_set_wake_window(s_en_janela);
+}
 
 static void ligar_espnow(void)
 {
@@ -605,6 +616,7 @@ static void ligar_espnow(void)
             if (s_envio) { xTaskCreate(vTarefaEnvio, "c6envio", 4096, NULL, 4, NULL); }
         }
         s_espnow_no_ar = true;
+        espnow_aplicar_janela();
     }
     /* PRONTO sempre (o host repete o pedido ate ver este aviso). */
     uint8_t canal = 0; wifi_second_chan_t sec;
@@ -934,6 +946,279 @@ static void pedir_farejo(const uint8_t *dados, size_t n)
     if (s_fj_tarefa) { xTaskNotifyGive(s_fj_tarefa); }
 }
 
+/* ===========================================================================
+ * O HOST DORME, O C6 TAMBEM (firmware c6-5, contrato v3)
+ * ===========================================================================
+ * Com a tela do Tab5 apagada o Wi-Fi conectado custava ~30 mA na bateria: o
+ * SDIO e escravo do P4, e com o enlace de pe este chip nao pode entrar em
+ * light sleep (o host falaria sozinho). O esp_hosted ja tem a metade daqui do
+ * "host power save": o P4 manda POWER_SAVE_ON pela interrupcao do SDIO, o
+ * esp_hosted desmonta o escravo e, quando chega trafego para o host, remonta e
+ * pulsa o IO2 (fio ate o G14 do P4) ate o host voltar. A Espressif mede ~1 mA
+ * assim, associado, em MAX_MODEM listen 10.
+ *
+ * O que e NOSSO aqui:
+ *   - A TRAVA. O PM liga o light sleep (app_main), mas uma trava NO_LIGHT_SLEEP
+ *     fica presa enquanto o enlace estiver de pe. So cai quando o SDIO ja foi
+ *     desmontado (on_ready) e volta antes de remontar (off_prepare).
+ *   - O DESPERTAR PELO P4. Nao ha fio do P4 para ca. Com o escravo desmontado,
+ *     a linha CMD do SDIO (GPIO18) fica parada em alto pelo pull-up; o P4 a
+ *     baixa por 2 ms quando quer o enlace de volta (tela acesa, keepalive do
+ *     MQTT), e o nivel baixo tira este chip do sono. A linha so e armada
+ *     SONO_ARMAR_MS depois de desmontar: o proprio P4 ainda passa comandos por
+ *     ela ao desmontar o lado dele, e eles acordariam este chip na hora.
+ *   - OS CONTADORES, que vao no INFO: o P4 nao ve a serial daqui.
+ *
+ * Sem o P4 pedir (POWER_SAVE_ON), nada disto acontece: a trava fica presa e o
+ * comportamento e o de antes. */
+#if CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS
+#include "eh_cp_feat_host_ps.h"
+#include "eh_cp.h"   /* eh_cp_rx_get / eh_cp_rx_register: o filtro de STA */
+#include "eh_cp_feat_host_ps_apis.h"
+#include "driver/gpio.h"
+#include "hal/gpio_ll.h"
+#include "esp_sleep.h"
+#include "soc/sdio_slave_pins.h"
+
+#define SONO_CMD_GPIO   SDIO_SLAVE_SLOT0_IOMUX_PIN_NUM_CMD   /* 18 */
+#define SONO_ARMAR_MS   500
+#define SONO_ACORDAR_MS 3000   /* quanto o pulso no IO2 insiste ate o P4 responder */
+
+static esp_pm_lock_handle_t s_sono_trava = NULL;
+static volatile bool        s_sono_trava_solta = false;
+static volatile uint8_t     s_sono_estado = C6_SONO_SEM;
+static volatile uint32_t    s_sono_n = 0;
+static volatile uint64_t    s_sono_us = 0;
+static volatile uint16_t    s_sono_entradas = 0, s_sono_despertares = 0;
+static TaskHandle_t         s_sono_tarefa = NULL;
+static esp_timer_handle_t   s_sono_armar = NULL;
+static volatile bool        s_sono_cmd_armado = false;
+static volatile bool        s_sono_cmd_disparou = false;   /* a ISR do CMD, nao um ARP */
+
+static esp_err_t IRAM_ATTR sono_saiu(int64_t dormiu_us, void *arg)
+{
+    (void)arg;
+    s_sono_n = s_sono_n + 1;
+    s_sono_us = s_sono_us + (uint64_t)dormiu_us;
+    return ESP_OK;
+}
+
+/* Nivel baixo no CMD: o P4 quer o enlace. Uma vez so (nivel repetiria). */
+static void IRAM_ATTR sono_cmd_isr(void *arg)
+{
+    (void)arg;
+    gpio_ll_intr_disable(&GPIO, SONO_CMD_GPIO);
+    s_sono_cmd_armado = false;
+    s_sono_cmd_disparou = true;
+    BaseType_t acordou = pdFALSE;
+    if (s_sono_tarefa) { vTaskNotifyGiveFromISR(s_sono_tarefa, &acordou); }
+    portYIELD_FROM_ISR(acordou);
+}
+
+static void sono_cmd_desarmar(void)
+{
+    s_sono_cmd_armado = false;
+    gpio_wakeup_disable(SONO_CMD_GPIO);
+    gpio_isr_handler_remove(SONO_CMD_GPIO);
+    gpio_set_intr_type(SONO_CMD_GPIO, GPIO_INTR_DISABLE);
+    /* A funcao do pino (IO_MUX do escravo SDIO) volta no init do escravo. */
+}
+
+/* No esp_timer, SONO_ARMAR_MS depois de o enlace cair. */
+static void sono_cmd_armar(void *arg)
+{
+    (void)arg;
+    if (s_sono_estado != C6_SONO_DORMINDO || s_sono_cmd_armado) { return; }
+    const gpio_config_t io = {
+        .pin_bit_mask = 1ULL << SONO_CMD_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_LOW_LEVEL,
+    };
+    if (gpio_config(&io) != ESP_OK) { return; }
+    gpio_isr_handler_add(SONO_CMD_GPIO, sono_cmd_isr, NULL);
+    gpio_wakeup_enable(SONO_CMD_GPIO, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+    s_sono_cmd_armado = true;
+}
+
+/* RETRATO DAS TRAVAS COM O HOST DORMINDO: o P4 nao fala com o C6 nessa hora,
+ * entao o retrato fica guardado e vai junto da proxima resposta ao C6_AJ_PM. */
+static char               s_pm_dormindo[1024] = "";
+static esp_timer_handle_t s_pm_retrato = NULL;
+static void pm_retratar(void *arg)
+{
+    (void)arg;
+    FILE *f = fmemopen(s_pm_dormindo, sizeof(s_pm_dormindo) - 1, "w");
+    if (f) { esp_pm_dump_locks(f); fclose(f); s_pm_dormindo[sizeof(s_pm_dormindo) - 1] = 0; }
+}
+
+/* O host avisou e o esp_hosted ja desmontou o escravo: daqui pode dormir. */
+static void sono_host_dormiu(void)
+{
+    s_sono_estado = C6_SONO_DORMINDO;
+    s_sono_entradas = s_sono_entradas + 1;
+    if (s_sono_trava && !s_sono_trava_solta) { s_sono_trava_solta = true; esp_pm_lock_release(s_sono_trava); }
+    if (s_sono_armar) { esp_timer_stop(s_sono_armar); esp_timer_start_once(s_sono_armar, SONO_ARMAR_MS * 1000ULL); }
+    if (s_pm_retrato) { esp_timer_stop(s_pm_retrato); esp_timer_start_once(s_pm_retrato, 5000000ULL); }
+}
+
+/* O enlace vai voltar (pelo P4 ou por trafego para ele): acordado antes de
+ * remontar o escravo. Pode vir duas vezes por despertar (o esp_hosted chama
+ * no caminho do pulso e de novo quando o host confirma). */
+static void sono_host_vai_acordar(void)
+{
+    if (s_sono_armar) { esp_timer_stop(s_sono_armar); }
+    sono_cmd_desarmar();
+    if (s_sono_trava && s_sono_trava_solta) { esp_pm_lock_acquire(s_sono_trava); s_sono_trava_solta = false; }
+    if (s_sono_estado == C6_SONO_DORMINDO) { s_sono_despertares = s_sono_despertares + 1; }
+    s_sono_estado = C6_SONO_ACORDADO;
+}
+
+static void responder_arps(void);   /* o filtro, logo abaixo */
+
+static void vTarefaSono(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        responder_arps();
+        if (s_sono_estado != C6_SONO_DORMINDO || s_sono_cmd_armado || !s_sono_cmd_disparou) { continue; }
+        s_sono_cmd_disparou = false;
+        ESP_LOGI(TAG, "sono: o P4 baixou o CMD - remontando o enlace");
+        eh_cp_feat_host_ps_wakeup_host(SONO_ACORDAR_MS);
+    }
+}
+
+/* O FILTRO COM O HOST DORMINDO. Sem ele o sono nao durava: o roteador manda
+ * ~2 ARP por segundo (medido: 131 em 59 s) e cada quadro para o P4 o acordava
+ * e remontava o enlace. Com o host dormindo, este callback (no lugar do RX de
+ * STA do esp_hosted) resolve aqui o que nao precisa dele:
+ *   - ARP perguntando pelo IP do P4 (C6_AJ_IP): o C6 responde;
+ *   - qualquer outro ARP, e todo broadcast/multicast: descarta;
+ *   - o resto (unicast para o P4: MQTT, TCP) segue - e acorda o host.
+ * Com o host acordado, tudo segue direto, como antes. */
+static eh_cp_rx_cb_t        s_rx_padrao = NULL;
+static volatile uint32_t    s_ip_host = 0;           /* ordem da rede */
+static uint8_t              s_mac_sta[6];
+static volatile uint32_t    s_filt_arp = 0, s_filt_desc = 0, s_filt_acordou = 0;
+static QueueHandle_t        s_arp_fila = NULL;
+typedef struct { uint8_t mac[6]; uint8_t ip[4]; } arp_ped_t;
+
+static void rx_soltar(void *buffer, void *eb)
+{
+    if (eb) { esp_wifi_internal_free_rx_buffer(eb); } else { free(buffer); }
+}
+
+static esp_err_t rx_filtro(void *buffer, uint16_t len, void *eb)
+{
+    if (s_sono_estado == C6_SONO_DORMINDO && buffer && len >= 14) {
+        const uint8_t *b = (const uint8_t *)buffer;
+        const uint16_t tipo = (uint16_t)((b[12] << 8) | b[13]);
+        if (tipo == 0x0806) {
+            const uint32_t alvo = len >= 42 ? ((uint32_t)b[38] | (uint32_t)b[39] << 8 | (uint32_t)b[40] << 16 | (uint32_t)b[41] << 24) : 0;
+            if (len >= 42 && b[20] == 0 && b[21] == 1 && s_ip_host && alvo == s_ip_host && s_arp_fila) {
+                arp_ped_t p;
+                memcpy(p.mac, b + 22, 6);
+                memcpy(p.ip, b + 28, 4);
+                if (xQueueSend(s_arp_fila, &p, 0) == pdTRUE && s_sono_tarefa) { xTaskNotifyGive(s_sono_tarefa); }
+                s_filt_arp = s_filt_arp + 1;
+            } else {
+                s_filt_desc = s_filt_desc + 1;
+            }
+            rx_soltar(buffer, eb);
+            return ESP_OK;
+        }
+        if (b[0] & 1) {   /* destino de grupo: broadcast ou multicast */
+            s_filt_desc = s_filt_desc + 1;
+            rx_soltar(buffer, eb);
+            return ESP_OK;
+        }
+        s_filt_acordou = s_filt_acordou + 1;
+    }
+    return s_rx_padrao ? s_rx_padrao(buffer, len, eb) : (rx_soltar(buffer, eb), ESP_OK);
+}
+
+/* Na c6sono (nao no callback do Wi-Fi): a resposta ao ARP pelo IP do P4. */
+static void responder_arps(void)
+{
+    arp_ped_t p;
+    while (s_arp_fila && xQueueReceive(s_arp_fila, &p, 0) == pdTRUE) {
+        uint8_t q[42];
+        memcpy(q, p.mac, 6); memcpy(q + 6, s_mac_sta, 6);
+        q[12] = 0x08; q[13] = 0x06;
+        q[14] = 0x00; q[15] = 0x01; q[16] = 0x08; q[17] = 0x00; q[18] = 6; q[19] = 4;
+        q[20] = 0x00; q[21] = 0x02;                       /* resposta */
+        memcpy(q + 22, s_mac_sta, 6);
+        const uint32_t ip = s_ip_host;
+        memcpy(q + 28, &ip, 4);
+        memcpy(q + 32, p.mac, 6); memcpy(q + 38, p.ip, 4);
+        esp_wifi_internal_tx(WIFI_IF_STA, q, sizeof(q));
+    }
+}
+
+/* Antes do esp_pm_configure: a trava ja presa quando o light sleep ligar. */
+static void sono_trava_criar(void)
+{
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "enlace_p4", &s_sono_trava) == ESP_OK) {
+        esp_pm_lock_acquire(s_sono_trava);
+    } else {
+        s_sono_trava = NULL;
+    }
+}
+
+/* Depois das features (o host_ps sobe antes do peer_data). */
+static void sono_iniciar(void)
+{
+    gpio_install_isr_service(0);   /* ja instalado: ESP_ERR_INVALID_STATE, tudo bem */
+    const esp_timer_create_args_t ta = { .callback = sono_cmd_armar, .name = "sono_cmd" };
+    esp_timer_create(&ta, &s_sono_armar);
+    const esp_timer_create_args_t tr = { .callback = pm_retratar, .name = "sono_pm" };
+    esp_timer_create(&tr, &s_pm_retrato);
+    xTaskCreate(vTarefaSono, "c6sono", 3072, NULL, 5, &s_sono_tarefa);
+    esp_pm_sleep_cbs_register_config_t cb = { .exit_cb = sono_saiu };
+    esp_pm_light_sleep_register_cbs(&cb);
+    static const host_power_save_callbacks_t cbs = {
+        .host_power_save_on_ready_cb    = sono_host_dormiu,
+        .host_power_save_off_prepare_cb = sono_host_vai_acordar,
+    };
+    eh_cp_feat_host_ps_cp__enable(&cbs);
+    s_arp_fila = xQueueCreate(4, sizeof(arp_ped_t));
+    esp_wifi_get_mac(WIFI_IF_STA, s_mac_sta);
+    s_rx_padrao = eh_cp_rx_get(ESP_STA_IF);
+    if (s_rx_padrao) { eh_cp_rx_register(ESP_STA_IF, rx_filtro); }
+    s_sono_estado = C6_SONO_ACORDADO;
+    ESP_LOGI(TAG, "sono: pronto (CMD = GPIO%d, despertar do host = IO%d)", SONO_CMD_GPIO,
+             CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS_HOST_WAKEUP_GPIO);
+}
+#else
+#define s_sono_estado      C6_SONO_SEM
+#define s_sono_n           0
+#define s_sono_us          0
+#define s_sono_entradas    0
+#define s_sono_despertares 0
+#define s_filt_arp         0
+#define s_filt_desc        0
+#define s_filt_acordou     0
+static void sono_trava_criar(void) {}
+static void sono_iniciar(void) {}
+#endif
+
+/* O QUE O P4 MANDA PARA A REDE: toda saida de dados do host passa por
+ * esp_wifi_internal_tx (o esp_hosted chama, eh_cp_core.c). O desvio no link
+ * (c6/main/CMakeLists.txt) so conta - para o INFO mostrar se o quadro chegou
+ * ao Wi-Fi daqui e com que erro. */
+static volatile uint32_t s_tx_wifi_n = 0, s_tx_wifi_erros = 0;
+static volatile int16_t  s_tx_wifi_ultimo = 0;
+esp_err_t __real_esp_wifi_internal_tx(wifi_interface_t ifx, void *buffer, uint16_t len);
+esp_err_t __wrap_esp_wifi_internal_tx(wifi_interface_t ifx, void *buffer, uint16_t len)
+{
+    const esp_err_t r = __real_esp_wifi_internal_tx(ifx, buffer, len);
+    s_tx_wifi_n = s_tx_wifi_n + 1;
+    if (r != ESP_OK) { s_tx_wifi_erros = s_tx_wifi_erros + 1; s_tx_wifi_ultimo = (int16_t)r; }
+    return r;
+}
+
 static void responder_info(void)
 {
     c6_info_t i = { 0 };
@@ -962,6 +1247,18 @@ static void responder_info(void)
 #if CONFIG_IEEE802154_ENABLED
     i.z154_estado = s_z154_lig ? 1 : (s_z154_habilitado ? 2 : 0);
 #endif
+    i.sono_estado = s_sono_estado;
+    i.sono_n = s_sono_n;
+    i.sono_ms = (uint32_t)(s_sono_us / 1000);
+    i.sono_entradas = s_sono_entradas;
+    i.sono_despertares = s_sono_despertares;
+    i.tx_wifi_n = s_tx_wifi_n;
+    i.tx_wifi_erros = s_tx_wifi_erros;
+    i.tx_wifi_ultimo_err = s_tx_wifi_ultimo;
+    i.sta_conectada = eh_cp_feat_wifi_is_station_connected() ? 1 : 0;
+    i.filtro_arp = s_filt_arp;
+    i.filtro_descartes = s_filt_desc;
+    i.filtro_acordou = s_filt_acordou;
     enfileirar(C6_MSG_INFO, (const uint8_t *)&i, sizeof(i));
 }
 
@@ -1367,7 +1664,34 @@ static void do_host(uint32_t msg_id, const uint8_t *dados, size_t n, void *ctx)
         if (n < 1) { return; }
         switch (dados[0]) {
         case C6_AJ_INFO: responder_info(); break;
+        case C6_AJ_PM: {
+            /* Quem segura o C6 acordado: a tabela de travas do PM, em texto. */
+            static char txt[1400];   /* cabe numa mensagem do enlace */
+            FILE *f = fmemopen(txt, sizeof(txt) - 1, "w");
+            if (f) {
+                fprintf(f, "--- agora ---\n");
+                esp_pm_dump_locks(f);
+#if CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS
+                fprintf(f, "--- 5 s depois do ultimo 'host dormiu' ---\n%s", s_pm_dormindo[0] ? s_pm_dormindo : "(ainda nao)\n");
+#endif
+                fclose(f);
+                txt[sizeof(txt) - 1] = 0;
+                enfileirar(C6_MSG_PM, (const uint8_t *)txt, strlen(txt));
+            }
+            break;
+        }
         case C6_AJ_CRU:  s_repassar_cru = (n >= 2 && dados[1]); break;
+#if CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS
+        case C6_AJ_ESPNOW_JANELA:
+            if (n >= 5) {
+                s_en_intervalo = (uint16_t)(dados[1] | (dados[2] << 8));
+                s_en_janela    = (uint16_t)(dados[3] | (dados[4] << 8));
+                espnow_aplicar_janela();
+                ESP_LOGI(TAG, "ESP-NOW: janela %u ms a cada %u ms", (unsigned)s_en_janela, (unsigned)s_en_intervalo);
+            }
+            break;
+        case C6_AJ_IP:   if (n >= 5) { uint32_t ip; memcpy(&ip, dados + 1, 4); s_ip_host = ip; } break;
+#endif
         default: break;   /* chave nova de um P4 mais novo: ignora */
         }
         break;
@@ -1428,6 +1752,22 @@ void app_main(void)
     /* Guarda de imagem nova ANTES de qualquer coisa que possa dar errado. */
     guarda_iniciar();
 
+    /* CLOCK VARIAVEL (DFS) E LIGHT SLEEP SO COM O HOST DORMINDO. Medido no
+     * Tab5 com 'energia ensaio' (2026-10-16): o Wi-Fi conectado custava 28 mA
+     * dos 74 do repouso - sem PM a CPU daqui ficava em 160 MHz o tempo todo.
+     * Com DFS o driver do Wi-Fi solta a trava entre beacons e a CPU cai para
+     * 40 MHz (XTAL). O light sleep fica LIGADO no PM, mas preso pela trava do
+     * enlace (ver "O HOST DORME, O C6 TAMBEM"): o SDIO e escravo do P4, e
+     * dormir com ele de pe deixaria o host falando sozinho. Falhar so loga. */
+    sono_trava_criar();
+    {
+        const esp_pm_config_t pm = { .max_freq_mhz = 160, .min_freq_mhz = 40,
+                                     .light_sleep_enable = CONFIG_ESP_HOSTED_CP_FEAT_HOST_PS ? true : false };
+        const esp_err_t r = esp_pm_configure(&pm);
+        if (r == ESP_OK) { ESP_LOGI(TAG, "PM: clock 40-160 MHz, light sleep %s", pm.light_sleep_enable ? "com o host dormindo" : "fora"); }
+        else             { ESP_LOGW(TAG, "PM: esp_pm_configure %s", esp_err_to_name(r)); }
+    }
+
     s_saida = xRingbufferCreate(SAIDA_RING_BYTES, RINGBUF_TYPE_NOSPLIT);
     if (s_saida) {
         xTaskCreate(vTarefaSaida, "c6saida", 4096, NULL, 5, NULL);
@@ -1478,6 +1818,8 @@ void app_main(void)
     eh_cp_feat_peer_data_register_callback(C6_MSG_HOST_CRU,    do_host, NULL);
     eh_cp_feat_peer_data_register_callback(C6_MSG_HOST_AJUSTE, do_host, NULL);
     eh_cp_feat_peer_data_register_callback(C6_MSG_HOST_RADIO,  do_host, NULL);  /* 8o: tabela cheia */
+
+    sono_iniciar();
 
     ESP_LOGI(TAG, "pronto - esperando o host mandar ligar o ESP-NOW");
 }

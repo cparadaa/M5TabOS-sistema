@@ -27,6 +27,11 @@ CONFIG_SPIRAM=y
 # (tabela de nos do Mesh, dreno do log, historico do monitor...) - a SRAM
 # interna e a memoria mais disputada do sistema.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# A secao noinit da PSRAM existe para a GUARDA DO HEAP (main/main.cpp): o
+# IDF poe o heap da PSRAM logo depois dela, e a guarda alinhada faz o heap
+# comecar numa linha de cache so dele. Sem isto o boot caia de vez em quando
+# no M5.begin() com o heap estragado (ver o comentario em main.cpp).
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
 
 
 # --- nomes de arquivo no cartao -------------------------------------------
@@ -46,6 +51,21 @@ CONFIG_FATFS_MAX_LFN=128
 # O NOME DO CARTAO (rotulo do volume) - o app Arquivos mostra o nome que o
 # cartao tem no computador, em vez de "Cartao". So leitura (f_getlabel).
 CONFIG_FATFS_USE_LABEL=y
+
+# NOMES EM UTF-8. O padrao do IDF entrega o nome longo convertido para a
+# pagina de codigo (CP437) - e letra que o CP437 nao tem (ã, õ, Á, Ú) nao
+# vira nada: o FAT devolvia o nome CURTO ("CANCAO~1.MP3" no lugar de
+# "Canção.mp3"). Em UTF-8 o readdir() entrega o nome como o computador
+# gravou, e o fopen() aceita o mesmo texto que a tela mostra. A pagina 437
+# continua valendo so para os nomes curtos 8.3.
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# --- USB-A (host) ----------------------------------------------------------
+# O pendrive no USB-A (services/tab5_usb). Os buffers de DMA do controlador
+# vao para a PSRAM: a RAM interna e a mais disputada (ver a auditoria de
+# memoria), e o que passa por aqui (musica, arquivos) nao precisa da ultima
+# gota de velocidade.
+CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
 
 # --- console -------------------------------------------------------------
 # UART como principal e USB-Serial-JTAG como secundario (o default do P4).
@@ -86,13 +106,27 @@ CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES=2
 # drivers pegam sem avisar. Ver tab5_power.hpp.
 CONFIG_PM_ENABLE=y
 
-# PASSO 2 - light sleep automatico no idle. NAO ligue junto com o passo 1:
-# e onde mora o risco de interacao com PSRAM e painel DSI, e voce quer saber
-# qual dos dois passos quebrou, se quebrar.
+# PASSO 2 - light sleep automatico no idle, LIGADO em 2026-10-16. Tickless em
+# todo o tempo (acordado ele so pula ticks); o SONO LEVE de verdade so vale no
+# repouso, com a tela desmontada (tab5_power_sono_leve, chamado pelo kernel) -
+# as travas de PM em repouso mostram o caminho livre ('energia travas').
+# Medido antes: P4 97,8% ocioso em repouso, acordado a 40 MHz a toa.
 # Lembrete do silicio: PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP depende de
 # !ESP32P4_SELECTS_REV_LESS_V3, ou seja, NAO existe neste chip - a CPU so tem o
 # clock parado no light sleep, nao fica sem energia.
-# CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
+
+# PASSO 3 - CABO NO PC SEGURA O SONO LEVE (2026-11-11). No P4 o USB do console
+# (USB Serial/JTAG) nao funciona no sono leve nem depois dele: com o cabo
+# ligado ao computador, o repouso dormia de verdade e o aparelho TRAVAVA ate o
+# watchdog reiniciar (reinicio "outro watchdog", sem core dump). O servico da
+# bateria nao serve para isso: ele ve o cabo pela corrente, e com a bateria
+# cheia a corrente zera e ele solta a "tomada" com o cabo ainda no PC.
+# Com esta opcao o proprio driver olha os pacotes SOF que o computador manda a
+# cada 1 ms e, enquanto chegam, segura uma trava ESP_PM_NO_LIGHT_SLEEP. Um
+# carregador de parede (sem dados) nao manda SOF: o sono leve segue valendo.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 
 # Diagnostico, para quando a frequencia NAO cair: faz o esp_pm_dump_locks()
 # imprimir quem criou cada trava e quanto tempo segurou. E o instrumento para
@@ -248,7 +282,40 @@ CONFIG_LCD_DSI_ISR_CACHE_SAFE=y
 # dor), e um watchpoint de hardware a menos para quem usar JTAG/gdb. Este
 # projeto depura pelo console proprio (ver console.cpp), nao por JTAG, entao
 # o watchpoint nao faz falta para mais nada.
-CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+#
+# DESLIGADO EM 06/11/2026 - ERA O TRAVAMENTO "DESLIGADO SOZINHO". Pego no ato
+# pelo JTAG (OpenOCD) com o aparelho travado: a cada troca de tarefa o FreeRTOS
+# arma o watchpoint com esp_cpu_set_watchpoint(), que pergunta ao hardware se
+# ha depurador (assist_debug_ll_is_debugger_active). Com o bit ligado sem
+# depurador de verdade (visto com o cabo USB no Mac), ele usa semihosting - um
+# ebreak que ninguem atende - e da panico na tarefa IDLE0 (core dump: mcause 3,
+# PC em esp_cpu_set_watchpoint). A protecao contra estouro de pilha continua:
+# o canario do FreeRTOS (CHECK_STACKOVERFLOW_CANARY) e o -fstack-protector.
+# A sentinela do heap (tab5_heap_psram.cpp) arma os slots 0 e 1 so no boot.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=n
+
+# PANICO SILENCIOSO: grava o core dump e reinicia sem imprimir. O relatorio do
+# panico ia para a USB caractere a caractere, ate 50 ms cada, alimentando os
+# watchdogs: com o cabo no Mac e ninguem lendo a porta, o aparelho ficava
+# "desligado" (tela apagada) por horas sem reiniciar (06/11/2026). O boot ja
+# mostra o travamento a partir do core dump (services/tab5_log.cpp,
+# 'travamento' no console), com a tarefa, o PC e a pilha.
+CONFIG_ESP_SYSTEM_PANIC_SILENT_REBOOT=y
+
+# ESTOURO DE BUFFER E CORRUPCAO DE MEMORIA (item da lista de melhorias).
+#
+# Canario na pilha (-fstack-protector): toda funcao com vetor local ganha um
+# valor sentinela entre o vetor e o endereco de volta; um snprintf/memcpy que
+# passa do vetor derruba o sistema NA VOLTA da funcao, com o nome dela no
+# backtrace - em vez de seguir com a pilha corrompida e cair longe dali.
+# Custo medido (27/10): ver o CHANGELOG; poucos % de codigo, nada de RAM.
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+#
+# Envenenamento LEVE do heap: cada bloco ganha uma marca antes e depois (8 B
+# por alocacao). Quem escreve fora do proprio bloco e pego no free() ou no
+# heap_caps_check_integrity (o comando 'mem' do console). O COMPLETO tambem
+# preenche a memoria livre e custa CPU em cada malloc/free - fica de fora.
+CONFIG_HEAP_POISONING_LIGHT=y
 
 # LINHA DE CACHE L2 DE 128 BYTES - achado na caca ao frame azul.
 # Cada falta/descarga de cache vira UMA rajada na PSRAM do tamanho da linha, e
@@ -361,3 +428,76 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 # CONFIG_CAMERA_SC202CS_DEFAULT_IPA_JSON_CONFIGURATION_FILE is not set
 CONFIG_CAMERA_SC202CS_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE=y
 CONFIG_CAMERA_SC202CS_CUSTOMIZED_IPA_JSON_CONFIGURATION_FILE_PATH="main/hal/sc202cs_tab5.json"
+
+# Contadores de pacotes do transporte do esp_hosted (7 inteiros): e o que o
+# power save dinamico do Wi-Fi (hal/tab5_wifi.cpp, TELA ACESA) le para saber se
+# ha trafego. O log periodico dele e de debug: uma vez por hora.
+CONFIG_ESP_HOSTED_HOST_PKT_STATS=y
+CONFIG_ESP_HOSTED_HOST_PKT_STATS_INTERVAL_SEC=3600
+
+# WATCHDOG DA INTERFACE: 10 s. Em repouso a tarefa ui espera ate 5 s por volta
+# (o ritmo de economia, kernel/core.cpp MEDIDA_MS); com o padrao de 5 s o
+# watchdog vencia a cada volta ("task_wdt: - ui (CPU 1)" a cada 10 s no log).
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# CORE DUMP NA FLASH (particao 'coredump', partitions.csv): o travamento deixa
+# o retrato gravado, e o boot seguinte anota no log do cartao a tarefa, o PC
+# e o RA (services/tab5_log). ELF: e o formato que tem o resumo
+# (esp_core_dump_get_summary) e que o 'idf.py coredump-info' le.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+
+# --- O C6 DORMINDO ASSOCIADO (hal/tab5_c6_sono) ------------------------------
+# Liga o ramo "o host voltou do power save" da subida do SDIO (refaz o cartao
+# sem resetar o C6). SEM a auto-inicializacao: ela arma no G14 uma interrupcao
+# que REINICIA o P4 - feita para host em deep sleep. Quem escuta o G14 aqui e
+# hal/tab5_c6_sono.cpp.
+CONFIG_ESP_HOSTED_HOST_FEAT_POWER_SAVE=y
+CONFIG_ESP_HOSTED_HOST_FEAT_POWER_SAVE_AUTO_INIT=n
+
+# --- SERVIDOR WEB COM WEBSOCKET (services/tab5_web) --------------------------
+# O terminal no navegador (o SSH compartilhado) manda e recebe tecla a tecla:
+# WebSocket. O gancho antes do aperto de mao e onde o porteiro confere rede
+# local, senha e a ORIGEM (o cabecalho X-Tab5 nao existe no WebSocket).
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+# Uma conexao WebSocket fica aberta o tempo todo; com SSH, MQTT e NTP usando
+# tambem, 10 sockets ficavam apertados (o httpd reserva 3).
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# JANELA TCP (06/11/2026): a padrao de 5760 B (4 pacotes) limitava o download a
+# janela / ida-e-volta = 5760 / ~75 ms = ~77 KB/s - exatamente o medido da
+# Cloudflare. Medido no Tab5: 16 pacotes (23040) deram 334 KB/s mas o minimo da
+# RAM interna caiu de ~138 para ~80 KB (os buffers de DMA do SDIO com o C6
+# crescem com a janela; mandar o lwIP para a PSRAM nao mudou isso). 8 pacotes e
+# o meio-termo. A fila de recepcao precisa caber a janela.
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# --- CODIGO DO IDF FORA DA IRAM (plano de otimizacao, Fase 1, 12/11/2026) -------
+# A IRAM e a mesma SRAM interna do heap: cada KB de codigo que sai dela vira
+# heap, e no COMECO da regiao - aumenta o maior bloco, nao so a soma. Aqui so
+# as opcoes que o proprio IDF da como seguras: funcoes que NAO sao chamadas de
+# interrupcao (as versoes ...FromISR continuam na IRAM). Com a cache desligada
+# (gravacao na flash) so o IDF roda, e ele nao usa estas.
+# - FreeRTOS: ate 8 KB (xTaskCreate, filas, semaforos - as de tarefa).
+# - ringbuf : as funcoes de tarefa do buffer em anel (UART, USB do console);
+#             as de interrupcao ficam.
+# NAO ligados (de proposito): HEAP_PLACE_FUNCTION_INTO_FLASH - exige que
+# nenhuma ISR na IRAM chame malloc/free, e drivers de terceiros (esp_hosted,
+# M5GFX) nao foram conferidos.
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# --- SEM A RESERVA INTERNA DE 32 KB (Fase 1, 12/11/2026) -----------------------
+# O IDF separa 32 KB da SRAM interna "para emergencia" (DMA e pilhas, caso o
+# malloc encha a interna). Medido com 'mem mapa' no boot, na Musica, no Video
+# e na home: a reserva vira uma regiao propria com 0 KB usados - nunca foi
+# tocada (o minimo ja visto da interna fica acima de 100 KB). E ela e tirada
+# da regiao GRANDE (a "alta", 0x4FF40000), partindo-a: era o maior motivo do
+# "maior bloco" pequeno. Sem a reserva, os 32 KB voltam para a regiao grande.
+# Quem precisa de garantia na interna (arena do H.264, piso de 80 KB) ja
+# confere o proprio piso; o monitor mostra o minimo da interna.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0

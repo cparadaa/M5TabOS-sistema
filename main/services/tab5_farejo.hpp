@@ -58,7 +58,6 @@ void tab5_farejo_ouvinte(tab5_farejo_ouvinte_t cb);
 // Tabela. Copia (o lote chega em outra tarefa). Ordem: a de chegada.
 int      tab5_farejo_n(void);
 bool     tab5_farejo_item(int i, farejo_item_t* out);
-bool     tab5_farejo_achar(const uint8_t mac[6], farejo_item_t* out);
 uint32_t tab5_farejo_lotes(void);      // so sobe: "chegou lote novo desde que olhei"
 uint32_t tab5_farejo_perdidos(void);   // MACs que nao couberam no C6, acumulado
 void     tab5_farejo_limpar(void);

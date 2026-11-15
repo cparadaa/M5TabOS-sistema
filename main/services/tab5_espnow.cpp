@@ -18,7 +18,9 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -74,12 +76,14 @@ static inline void destravar(void) { xSemaphoreGive(s_trava); }
 typedef struct {
   uint32_t tipo;                         // C6_MSG_* recebido, ou EV_ENVIAR
   uint16_t n;
+  uint8_t  mac[6];                       // destino de EV_ENVIAR/EV_VARRER (FF.. = difusao)
   uint8_t  dados[7 + C6_TEXTO_MAX + 1];
 } evento_t;
 
 #define EV_ENVIAR 0x1000
 #define EV_CANAL  0x1001   // dados[0] = canal fixo (0 = o do roteador)
 #define EV_NADA   0x1002   // so acorda o loop (reavaliar o receptor)
+#define EV_VARRER 0x1003   // mac = destino, dados = texto: envia nos canais 1 a 13
 
 static volatile uint8_t s_canal_fixo = 0;
 static int s_notif_canal = -1;   // pastilha cinza enquanto o WiFi esta solto do roteador
@@ -140,7 +144,9 @@ static void gravar_no_cartao(const espnow_msg_t* m)
   static char txt[sizeof(m->texto)];   // estatico: so a tarefa do servico chama
   size_t k = 0;
   for (const char* c = m->texto; *c && k < sizeof(txt) - 1; ++c) {
-    txt[k++] = (*c == '\t' || *c == '\n' || *c == '\r') ? ' ' : *c;
+    // O registro e de UMA linha: tabulacao vira espaco e a quebra de linha
+    // (a conversa tem linhas) vai como 0x1F, que volta a ser \n na leitura.
+    txt[k++] = *c == '\n' ? '\x1f' : (*c == '\t' || *c == '\r') ? ' ' : *c;
   }
   txt[k] = 0;
   static char linha[sizeof(txt) + 64];
@@ -201,6 +207,10 @@ static void carregar_do_cartao(void)
       snprintf(m.texto, sizeof(m.texto), "%s", linha + pos);
       const size_t n = strlen(m.texto);
       if (n && m.texto[n - 1] == '\n') { m.texto[n - 1] = 0; }
+      for (char* c = m.texto; *c; ++c) { if (*c == '\x1f') { *c = '\n'; } }   // a quebra de linha (ver gravar_no_cartao)
+      // O cartao so guarda o texto: o "bruto" do que veio de la e o proprio texto.
+      m.n = (uint16_t)strlen(m.texto);
+      memcpy(m.bruto, m.texto, m.n);
       travar();
       guardar(&m);
       destravar();
@@ -249,6 +259,94 @@ static void falhar_pendentes(void)
   }
 }
 
+// De volta ao roteador: o canal passa a ser o dele (o loop confere).
+static void voltar_ao_roteador(void)
+{
+  tab5_wifi_modo_so_radio(false);
+  notif_limpar(s_notif_canal);
+  ESP_LOGI(TAG, "canal: o do roteador");
+}
+
+// Poe o radio no canal c (1 a 13) e devolve se o C6 confirmou. Nao grava o
+// ajuste nem mexe no canal "fixo" do usuario: quem chama decide (EV_CANAL
+// grava, EV_VARRER so passa).
+static bool ir_para_canal(uint8_t c)
+{
+  // O radio so muda de canal SOLTO do roteador: pede e espera soltar.
+  tab5_wifi_modo_so_radio(true);
+  for (int k = 0; k < 30 && tab5_wifi_estado() == TAB5_WIFI_CONECTADO; ++k) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  // CONFERE NO C6, e repete. Pedido no meio de uma
+  // reconexao (toque rapido roteador -> 1), o C6 recusa a troca calado e
+  // o radio fica no canal anterior - visto no log: "canal 1 -> 11". A
+  // unica verdade e o canal que o C6 diz que esta.
+  uint8_t real = 0; wifi_second_chan_t sec;
+  for (int tent = 0; tent < 5; ++tent) {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    eh_host_peer_data_send(C6_MSG_HOST_CANAL, &c, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (esp_wifi_get_channel(&real, &sec) == ESP_OK && real == c) { break; }
+  }
+  s_canal = real ? real : c;
+  if (real == c) { ESP_LOGI(TAG, "canal fixo %u (WiFi solto do roteador)", (unsigned)c); }
+  else           { ESP_LOGW(TAG, "canal fixo %u pedido, mas o C6 ficou no %u", (unsigned)c, (unsigned)real); }
+  return real == c;
+}
+
+// VISIVEL NO SISTEMA: sem isto, o WiFi solto parecia WiFi quebrado.
+static void publicar_canal_solto(void)
+{
+  char resumo[NOTIF_RESUMO];
+  snprintf(resumo, sizeof(resumo), "canal %u - sem WiFi", (unsigned)s_canal);
+  notif_publicar(s_notif_canal, 1, NOTIF_ESTADO, resumo);
+}
+
+// O C6 nem recebeu o pedido de envio: nao vai haver ESTADO, entao a mensagem
+// pendente mais antiga vira falha pelo mesmo caminho do ESTADO.
+static void falhar_envio(void)
+{
+  static evento_t falha;
+  memset(&falha, 0, sizeof(falha));
+  falha.tipo = C6_MSG_ESTADO;
+  falha.n = 7;
+  memset(falha.dados, 0xFF, 6);
+  falha.dados[6] = 0;
+  tratar(&falha);
+}
+
+// Guarda no historico a mensagem que vai sair (destino em ev->mac, texto em
+// ev->dados). Pendente; ja falhada se o ESP-NOW esta fora do ar.
+static void guardar_envio(const evento_t* ev, espnow_msg_t* m)
+{
+  static const uint8_t TODOS[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+  memset(m, 0, sizeof(*m));
+  memcpy(m->mac, ev->mac, 6);
+  m->minha = true;
+  m->difusao = memcmp(ev->mac, TODOS, 6) == 0;
+  m->quando = agora_epoch();
+  snprintf(m->texto, sizeof(m->texto), "%.*s", (int)ev->n, (const char*)ev->dados);
+  m->n = (uint16_t)strlen(m->texto);
+  memcpy(m->bruto, m->texto, m->n);
+  m->envio = s_pronto ? ESPNOW_ENVIO_PENDENTE : ESPNOW_ENVIO_FALHOU;
+  s_ultimo_tx_us = esp_timer_get_time();
+
+  travar();
+  guardar(m);
+  destravar();
+  sistema_avisar(AVISO_ESPNOW);
+}
+
+// Pede ao C6 o envio (MAC destino + texto). false = o pedido nem chegou nele.
+static bool mandar_ao_c6(const uint8_t mac[6], const char* texto)
+{
+  static uint8_t buf[6 + C6_TEXTO_MAX];
+  memcpy(buf, mac, 6);
+  const size_t t = strlen(texto);
+  memcpy(buf + 6, texto, t);
+  return eh_host_peer_data_send(C6_MSG_HOST_ENVIAR, buf, 6 + t) == ESP_OK;
+}
+
 static void tratar(const evento_t* ev)
 {
   switch (ev->tipo) {
@@ -293,6 +391,10 @@ static void tratar(const evento_t* ev)
       if (t > C6_TEXTO_MAX) { t = C6_TEXTO_MAX; }
       memcpy(m.texto, ev->dados + 7, t);
       m.texto[t] = 0;
+      // Os bytes como chegaram, ANTES do tratamento abaixo (que apaga controles
+      // e corta no '\0'): e o que o 'espnow msgs' mostra em hexa.
+      m.n = (uint16_t)t;
+      memcpy(m.bruto, ev->dados + 7, t);
       // Texto de outro aparelho pode vir com lixo no fim (um '\0' do C, uma
       // quebra de linha do teclado dele): o que nao e imprimivel no final sai.
       size_t n = strlen(m.texto);
@@ -313,7 +415,9 @@ static void tratar(const evento_t* ev)
       publicar_notif();
       destravar();
       gravar_no_cartao(&m);
-      ESP_LOGI(TAG, "de %02X%02X: %s", m.mac[4], m.mac[5], m.texto);
+      // O texto nao vai ao log: o log diario mora no cartao, e a conversa ja
+      // tem o historico dela (gravar_no_cartao).
+      ESP_LOGI(TAG, "de %02X%02X: %u letra(s)", m.mac[4], m.mac[5], (unsigned)strlen(m.texto));
       sistema_avisar(AVISO_ESPNOW);
       break;
     }
@@ -342,39 +446,34 @@ static void tratar(const evento_t* ev)
 
     case EV_ENVIAR: {
       static espnow_msg_t m;
-      memset(&m, 0, sizeof(m));
-      memset(m.mac, 0xFF, 6);   // difusao
-      m.minha = true;
-      m.difusao = true;
-      m.quando = agora_epoch();
-      snprintf(m.texto, sizeof(m.texto), "%.*s", (int)ev->n, (const char*)ev->dados);
-      m.envio = s_pronto ? ESPNOW_ENVIO_PENDENTE : ESPNOW_ENVIO_FALHOU;
-      s_ultimo_tx_us = esp_timer_get_time();
-
-      travar();
-      guardar(&m);
-      destravar();
-      sistema_avisar(AVISO_ESPNOW);
-
-      if (s_pronto) {
-        static uint8_t buf[6 + C6_TEXTO_MAX];
-        memset(buf, 0xFF, 6);
-        const size_t t = strlen(m.texto);
-        memcpy(buf + 6, m.texto, t);
-        if (eh_host_peer_data_send(C6_MSG_HOST_ENVIAR, buf, 6 + t) != ESP_OK) {
-          // O C6 nem recebeu o pedido: nao vai haver ESTADO para este envio.
-          static evento_t falha;
-          memset(&falha, 0, sizeof(falha));
-          falha.tipo = C6_MSG_ESTADO;
-          falha.n = 7;
-          memset(falha.dados, 0xFF, 6);
-          falha.dados[6] = 0;
-          tratar(&falha);
-          return;
-        }
-      } else {
-        gravar_no_cartao(&m);
+      guardar_envio(ev, &m);
+      if (!s_pronto) { gravar_no_cartao(&m); break; }
+      if (!mandar_ao_c6(ev->mac, m.texto)) {
+        falhar_envio();   // o C6 nem recebeu o pedido: nao vai haver ESTADO
+        return;
       }
+      break;
+    }
+
+    case EV_VARRER: {
+      static espnow_msg_t m;
+      guardar_envio(ev, &m);   // UMA mensagem no historico, nao 13
+      if (!s_pronto) { gravar_no_cartao(&m); break; }
+      // O canal de antes: 0 = o do roteador. NAO grava o ajuste - a varredura e
+      // de passagem, o que o usuario escolheu continua valendo.
+      const uint8_t antes = s_canal_fixo;
+      int enviados = 0;
+      for (uint8_t c = 1; c <= 13; ++c) {
+        // Sem o C6 confirmar o canal, o envio sairia no canal errado: pula.
+        if (!ir_para_canal(c)) { continue; }
+        if (mandar_ao_c6(ev->mac, m.texto)) { ++enviados; }
+        vTaskDelay(pdMS_TO_TICKS(60));   // o frame sai antes de o radio trocar de canal
+      }
+      if (antes == 0) { voltar_ao_roteador(); }
+      else            { ir_para_canal(antes); publicar_canal_solto(); }
+      ESP_LOGI(TAG, "varredura 1-13: %d canais enviados", enviados);
+      if (enviados == 0) { falhar_envio(); }
+      sistema_avisar(AVISO_ESPNOW);
       break;
     }
 
@@ -383,34 +482,10 @@ static void tratar(const evento_t* ev)
       s_canal_fixo = c;
       ajustes_definir_espnow_canal(c);   // sobrevive ao reinicio (so grava se mudou)
       if (c == 0) {
-        // De volta ao roteador: o canal passa a ser o dele (o loop confere).
-        tab5_wifi_modo_so_radio(false);
-        notif_limpar(s_notif_canal);
-        ESP_LOGI(TAG, "canal: o do roteador");
+        voltar_ao_roteador();
       } else {
-        // O radio so muda de canal SOLTO do roteador: pede e espera soltar.
-        tab5_wifi_modo_so_radio(true);
-        for (int k = 0; k < 30 && tab5_wifi_estado() == TAB5_WIFI_CONECTADO; ++k) {
-          vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        // CONFERE NO C6, e repete. Pedido no meio de uma
-        // reconexao (toque rapido roteador -> 1), o C6 recusa a troca calado e
-        // o radio fica no canal anterior - visto no log: "canal 1 -> 11". A
-        // unica verdade e o canal que o C6 diz que esta.
-        uint8_t real = 0; wifi_second_chan_t sec;
-        for (int tent = 0; tent < 5; ++tent) {
-          vTaskDelay(pdMS_TO_TICKS(200));
-          eh_host_peer_data_send(C6_MSG_HOST_CANAL, &c, 1);
-          vTaskDelay(pdMS_TO_TICKS(100));
-          if (esp_wifi_get_channel(&real, &sec) == ESP_OK && real == c) { break; }
-        }
-        s_canal = real ? real : c;
-        if (real == c) { ESP_LOGI(TAG, "canal fixo %u (WiFi solto do roteador)", (unsigned)c); }
-        else           { ESP_LOGW(TAG, "canal fixo %u pedido, mas o C6 ficou no %u", (unsigned)c, (unsigned)real); }
-        // VISIVEL NO SISTEMA: sem isto, o WiFi solto parecia WiFi quebrado.
-        char resumo[NOTIF_RESUMO];
-        snprintf(resumo, sizeof(resumo), "canal %u - sem WiFi", (unsigned)s_canal);
-        notif_publicar(s_notif_canal, 1, NOTIF_ESTADO, resumo);
+        ir_para_canal(c);
+        publicar_canal_solto();
       }
       sistema_avisar(AVISO_ESPNOW);
       break;
@@ -497,13 +572,24 @@ static void vTaskEspnow(void*)
     }
 
     // O pedido so vai ao WiFi quando MUDA (a API ja ignora repeticao).
-    tab5_wifi_manter_acordado(TAB5_ACORDADO_ESPNOW, quer_receptor_ligado());
+    sistema_recurso(RECURSO_RADIO_ESCUTA, "ESP-NOW", quer_receptor_ligado());
 
     // SEM ENLACE COM O C6 (Wi-Fi nunca subiu, ou o C6 nao tem o firmware
     // nosso) nada aqui muda ate a pilha subir - e o Wi-Fi avisa nessa hora
     // (tab5_wifi_ao_subir -> espnow_cutucar). Entao dorme 30 s em vez de
     // acordar todo segundo para perguntar.
-    const uint32_t espera_ms = enlace ? 1000 : 30000;
+    uint32_t espera_ms = enlace ? 1000 : 30000;
+    // NO REPOUSO, COM O ESP-NOW PRONTO: o canal so e conferido acordado e o
+    // REPEDIR so vale sem PRONTO - o unico prazo que sobra e o fim da
+    // conversa viva (o receptor volta a cochilar). Dorme ate ele, no maximo
+    // 30 s, em vez de acordar todo segundo. Mensagem, envio e o Wi-Fi subindo
+    // chegam pela fila e acordam na hora.
+    if (enlace && s_pronto && tab5_power_em_repouso()) {
+      espera_ms = 30000;
+      const int64_t ult = (s_ultimo_rx_us > s_ultimo_tx_us) ? s_ultimo_rx_us : s_ultimo_tx_us;
+      const int64_t falta_us = ult ? ult + CONVERSA_VIVA_US - esp_timer_get_time() : 0;
+      if (falta_us > 0 && falta_us / 1000 + 1 < espera_ms) { espera_ms = (uint32_t)(falta_us / 1000 + 1); }
+    }
     if (xQueueReceive(s_fila, &ev, pdMS_TO_TICKS(espera_ms)) == pdTRUE) { tratar(&ev); }
   }
 }
@@ -620,16 +706,44 @@ bool tab5_espnow_definir_canal(uint8_t canal)
   return xQueueSend(s_fila, &ev, 0) == pdTRUE;
 }
 
-bool tab5_espnow_enviar(const char* texto)
+// Uma so logica de enfileirar: o destino e o texto vao no evento.
+static bool enfileirar(uint32_t tipo, const uint8_t* mac_ou_null, const char* texto)
 {
   if (!s_fila || !texto || !texto[0]) { return false; }
   evento_t ev;   // local: ver tab5_espnow_definir_canal
-  ev.tipo = EV_ENVIAR;
+  ev.tipo = tipo;
+  if (mac_ou_null) { memcpy(ev.mac, mac_ou_null, 6); }
+  else             { memset(ev.mac, 0xFF, 6); }   // difusao
   size_t n = strlen(texto);
   if (n > C6_TEXTO_MAX) { n = C6_TEXTO_MAX; }
   ev.n = (uint16_t)n;
   memcpy(ev.dados, texto, n);
   return xQueueSend(s_fila, &ev, 0) == pdTRUE;
+}
+
+bool tab5_espnow_enviar_para(const uint8_t mac[6], const char* texto)
+{
+  return mac && enfileirar(EV_ENVIAR, mac, texto);
+}
+
+bool tab5_espnow_enviar(const char* texto) { return enfileirar(EV_ENVIAR, nullptr, texto); }
+
+bool tab5_espnow_enviar_todos_canais(const uint8_t* mac_ou_null, const char* texto)
+{
+  return enfileirar(EV_VARRER, mac_ou_null, texto);
+}
+
+bool tab5_espnow_mac_de_texto(const char* txt, uint8_t mac[6])
+{
+  if (!txt || strlen(txt) != 17) { return false; }
+  for (int i = 0; i < 6; ++i) {
+    const char* p = txt + i * 3;
+    if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1])) { return false; }
+    if (i < 5 && p[2] != ':' && p[2] != '-') { return false; }
+    char par[3] = { p[0], p[1], 0 };
+    mac[i] = (uint8_t)strtoul(par, nullptr, 16);
+  }
+  return true;
 }
 
 int tab5_espnow_nao_lidas(void) { return s_nao_lidas; }

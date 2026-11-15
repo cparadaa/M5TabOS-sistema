@@ -1,5 +1,6 @@
 // Diario de reinicios do no - ver o aviso em tab5_mesh_diario.hpp.
 #include "tab5_mesh_diario.hpp"
+#include "idioma.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -187,18 +188,18 @@ void mesh_diario_limpar(void)
 const char* mesh_diario_veredito(const mesh_reinicio_t* r)
 {
   switch (r->origem) {
-    case MESH_REI_BASE:    return "ponto de partida (primeira leitura)";
-    case MESH_REI_PEDIDO:  return "pedido pelo Tab5 (gravar configuração ou reiniciar)";
-    case MESH_REI_AUSENTE: return "reiniciou com o Tab5 desconectado - sem como saber";
+    case MESH_REI_BASE:    return N_("ponto de partida (primeira leitura)");
+    case MESH_REI_PEDIDO:  return N_("pedido pelo Tab5 (gravar configuração ou reiniciar)");
+    case MESH_REI_AUSENTE: return N_("reiniciou com o Tab5 desconectado - sem como saber");
     default: break;
   }
-  if (r->grove_s >= 0 && r->grove_s <= JANELA_S) { return "o Tab5 mexeu no 5V do Grove na hora - provável causa"; }
-  if (r->perfil_s >= 0 && r->perfil_s <= JANELA_S) { return "o Tab5 reaplicou o perfil de energia na hora - suspeito"; }
+  if (r->grove_s >= 0 && r->grove_s <= JANELA_S) { return N_("o Tab5 mexeu no 5V do Grove na hora - provável causa"); }
+  if (r->perfil_s >= 0 && r->perfil_s <= JANELA_S) { return N_("o Tab5 reaplicou o perfil de energia na hora - suspeito"); }
   if (r->envio_s >= 0 && r->envio_s <= 10) {
     return r->envio_tipo == MESH_ENV_ADMIN ? "logo depois de um comando de admin do Tab5 - suspeito"
          : r->envio_tipo == MESH_ENV_CONFIG ? "logo depois do pedido de configuração do Tab5 - suspeito"
          : "logo depois de um pacote enviado pelo Tab5 - suspeito";
   }
-  if (r->centivolts && r->centivolts < 650) { return "bateria do Tab5 baixa na hora - veja a alimentação"; }
-  return "sem indício do lado do Tab5: falha do próprio nó (firmware ou energia do módulo)";
+  if (r->centivolts && r->centivolts < 650) { return N_("bateria do Tab5 baixa na hora - veja a alimentação"); }
+  return N_("sem indício do lado do Tab5: falha do próprio nó (firmware ou energia do módulo)");
 }

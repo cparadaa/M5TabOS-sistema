@@ -26,10 +26,11 @@
 // Nenhum toque pede passada completa: cada regiao limpa o proprio retangulo.
 
 #include "app.h"
+#include "idioma.h"
 #include "tab5_tela.hpp"
 #include "pintura.hpp"
-#include "tab5_sd.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
 #include "tab5_hora.hpp"
 #include "trabalho.hpp"
 #include "registro.h"
@@ -44,23 +45,24 @@
 
 typedef enum { SERIE_BATERIA = 0, SERIE_CORRENTE, SERIE_POTENCIA, SERIE_TENSAO, SERIE_TEMP } serie_t;
 #define N_SERIES 5
-static const char* SERIE_TITULO[N_SERIES] = { "Nível da bateria (%)", "Corrente (mA)", "Potência (W)", "Tensão (V)", "Temperatura P4 (°C)" };
-static const char* SERIE_CARTAO[N_SERIES] = { "Bateria", "Corrente", "Potência", "Tensão", "Temp P4" };
+static const char* SERIE_TITULO[N_SERIES] = { N_("Nível da bateria (%)"), N_("Corrente (mA)"), N_("Potência (W)"), N_("Tensão (V)"), N_("Temperatura P4 (°C)") };
+static const char* SERIE_CARTAO[N_SERIES] = { N_("Bateria"), N_("Corrente"), N_("Potência"), N_("Tensão"), N_("Temp P4") };
+// Cores de DADO (uma por serie), nos tons de mesma luz do tema.
 static const uint16_t SERIE_COR[N_SERIES] = {
-  lgfx::color565( 90, 170, 255),   // bateria: azul, para nao se confundir com o verde da carga
-  TFT_ORANGE,
-  TFT_GREENYELLOW,
-  lgfx::color565(190, 150, 255),
-  lgfx::color565(255,  90,  80),
+  TEMA_APP_AZUL,       // bateria: azul, para nao se confundir com o verde da carga
+  TEMA_APP_LARANJA,
+  TEMA_APP_LIMA,
+  TEMA_APP_ROXO,
+  TEMA_APP_VERMELHO,
 };
 
-#define COR_CARGA        lgfx::color565( 60, 200,  90)   // carga: o mesmo verde em todo o app
+#define COR_CARGA        TEMA_SUCESSO   // carga: o mesmo verde em todo o app
 #define COR_CARGA_FUNDO  lgfx::color565( 14,  50,  26)   // tinta das horas de carga atras da curva
-#define COR_GASTO_TELA   TFT_ORANGE
+#define COR_GASTO_TELA   TEMA_APP_LARANJA
 #define COR_GASTO_REP    lgfx::color565(130,  75,  20)
-#define COR_CARTAO       lgfx::color565( 26,  26,  34)
-#define COR_CARTAO_SEL   lgfx::color565( 42,  42,  56)
-#define COR_EIXO         lgfx::color565(110, 110, 124)
+#define COR_CARTAO       TEMA_SUPERFICIE
+#define COR_CARTAO_SEL   TEMA_SUPERFICIE_ALTA
+#define COR_EIXO         TEMA_TEXTO_3
 
 static serie_t s_serie   = SERIE_BATERIA;
 static bool    s_24h     = true;      // grafico 1: true = 24 H (cartao + RAM); false = 30 MIN (RAM)
@@ -76,13 +78,8 @@ static pintura_t s_p;
 // ultima sendo a hora corrente (parcial). Alinhar na hora do relogio e o que
 // deixa as barras do grafico 2 com rotulos "14h", "15h" em vez de fatias de
 // 60 min que comecam num minuto qualquer.
-#define MIN_DIA 1440
-typedef struct {
-  uint32_t t0;                 // epoch UTC do slot 0 (0 = sem relogio)
-  float    v[MIN_DIA], ma[MIN_DIA], temp[MIN_DIA];
-  int8_t   pct[MIN_DIA];       // a % que o sistema mostrava (estimador), -1 = sem
-  uint8_t  tem[MIN_DIA];       // 0 = sem amostra, 1 = acordado, 2 = em repouso
-} dia_t;
+#define MIN_DIA REGISTRO_MIN_DIA
+typedef registro_dia_t dia_t;   // o dia em minutos, como o registro entrega
 
 // Uma fonte de pontos: n pontos, x de 0..1, os valores, e o instante 't'
 // (24 H: o slot, minuto desde t0; 30 MIN: segundos antes de agora).
@@ -96,7 +93,7 @@ typedef struct {
 } pontos_t;
 
 // Um vertice por coluna de pixel do grafico 1 (ver montar_vertices).
-#define VERT_MAX 720
+#define VERT_MAX 1280   // a largura deitada (teclado fisico); em pe usa 720
 typedef struct {
   int     n;
   int16_t px[VERT_MAX];
@@ -120,7 +117,6 @@ static memoria_t* s_m = nullptr;
 
 static dia_t*        s_dia = nullptr;      // o que a tela mostra
 static dia_t*        s_carga = nullptr;    // onde o worker escreve
-static char          s_carga_nome[2][40];  // ontem e hoje (podem ser o mesmo)
 static uint32_t      s_carga_t0 = 0;
 static volatile bool s_carga_pronta = false;
 static bool          s_carga_pedida = false;
@@ -137,34 +133,10 @@ static uint32_t janela_t0(void)
   return agora - (uint32_t)(lt.tm_min * 60 + lt.tm_sec) - 23u * 3600u;
 }
 
-static void ler_arquivo(dia_t* d, const char* nome)
-{
-  FILE* f = tab5_sd_abrir(TAB5_SD_ENERGIA, nome, "r");
-  if (!f) { return; }
-  char linha[160];
-  while (fgets(linha, sizeof(linha), f)) {
-    unsigned long ep; char hora[8]; float v, ma, mw, temp; int pct, mhz, rep;
-    if (sscanf(linha, "ENE3,%lu,%7[^,],%f,%f,%f,%d,%d,%d,%f", &ep, hora, &v, &ma, &mw, &pct, &mhz, &rep, &temp) < 9) { continue; }
-    if (ep < d->t0) { continue; }
-    const uint32_t m = ((uint32_t)ep - d->t0) / 60;
-    if (m >= MIN_DIA) { continue; }
-    d->tem[m] = rep ? 2 : 1;
-    d->v[m] = v; d->ma[m] = ma; d->temp[m] = temp;
-    d->pct[m] = (int8_t)((pct >= 0 && pct <= 100) ? pct : -1);
-  }
-  fclose(f);
-}
-
 static void trabalho_24h(void*)
 {
-  dia_t* d = s_carga;
-  memset(d, 0, sizeof(*d));
-  d->t0 = s_carga_t0;
-  if (d->t0 && tab5_sd_montar()) {
-    ler_arquivo(d, s_carga_nome[0]);
-    if (strcmp(s_carga_nome[0], s_carga_nome[1]) != 0) { ler_arquivo(d, s_carga_nome[1]); }
-    tab5_sd_desmontar();
-  }
+  // Quem le e interpreta os arquivos e o registro; aqui so chega o dia pronto.
+  registro_ler_dia(s_carga, s_carga_t0);
   s_carga_pronta = true;
 }
 
@@ -172,11 +144,6 @@ static void pedir_24h(void)
 {
   if (s_carga_pedida || !s_carga) { return; }
   s_carga_t0 = janela_t0();
-  s_carga_nome[0][0] = s_carga_nome[1][0] = 0;
-  if (s_carga_t0) {
-    tab5_hora_nome_do_dia(s_carga_t0, "energia-", ".csv", s_carga_nome[0], sizeof(s_carga_nome[0]));
-    tab5_hora_nome_do_dia((uint32_t)time(nullptr), "energia-", ".csv", s_carga_nome[1], sizeof(s_carga_nome[1]));
-  }
   s_carga_pronta = false;
   s_carga_pedida = sistema_trabalho(trabalho_24h, nullptr);
 }
@@ -220,10 +187,18 @@ static void ao_fechar(void)
 // GEOMETRIA (relativa a area, 720 x 1144 em retrato; termina em ~1120) - a mesma para desenho e toque
 // ---------------------------------------------------------------------------
 static const int M = 16;                               // margem lateral
-static const int HERO_Y = 8, HERO_A = 76;              // % grande + estado
+// O CABECALHO DO AJUSTES: o Energia mora dentro dele (a linha Energia abre
+// este app), entao < VOLTAR e o titulo como nas paginas de la - e o VOLTAR
+// devolve ao Ajustes, nao a tela inicial.
+static const int VOLTAR_L = 200, VOLTAR_A = 64;
+static const int BARRA_A = 16 + VOLTAR_A + 12;
+static const int HERO_Y = BARRA_A + 8, HERO_A = 76;    // % grande + estado
 static const int CART_Y = HERO_Y + HERO_A + 8;         // indice: 3 x 2 cartoes
 static const int CART_A = 92, CART_V = 12;             // altura e vao entre cartoes
-static const int TOPO_A = CART_Y + 2 * CART_A + CART_V;
+// UMA LINHA sob os cartoes: o que segura o repouso agora (kernel/recursos.h) -
+// a resposta para "por que esta gastando com a tela apagada".
+static const int REC_Y = CART_Y + 2 * CART_A + CART_V + 10, REC_A = 30;
+static const int TOPO_A = REC_Y + REC_A;
 static const int EIXO_L = 64;                          // coluna dos numeros do eixo Y
 
 static const int G1_Y = TOPO_A + 20;                   // titulo + 30 MIN | 24 H
@@ -235,6 +210,12 @@ static const int G2_Y = G1_FIM + 22;                   // titulo + legenda
 static const int G2_PLOT_Y = G2_Y + 48, G2_A = 216;
 static const int G2_FAIXA = 8;                         // faixa verde de carga sob as barras
 static const int G2_DET_Y = G2_PLOT_Y + G2_A + G2_FAIXA + 40;   // duas linhas de detalhe
+
+// Onde o conteudo termina (as duas linhas de detalhe sob o grafico de barras).
+static const int CONTEUDO_A = G2_DET_Y + 70;
+
+// Em pe cabe (1144 px); deitada (teclado fisico, ~584 px) o sistema rola.
+static int altura_agora(const area_t& a) { return a.altura < CONTEUDO_A ? CONTEUDO_A : 0; }
 
 static int cart_l(int larg) { return (larg - 2 * M - 2 * CART_V) / 3; }
 static int seg_x(int larg)  { return larg - M - SEG_L; }
@@ -256,16 +237,10 @@ static uint16_t escurecer(uint16_t c, int f)
 
 static uint16_t cor_nivel(int pct)
 {
-  return pct < 0 ? (uint16_t)TFT_DARKGREY : pct < 20 ? (uint16_t)TFT_RED
-       : pct < 50 ? (uint16_t)TFT_YELLOW : (uint16_t)COR_CARGA;
+  return pct < 0 ? (uint16_t)TEMA_TEXTO_3 : pct < 20 ? (uint16_t)TEMA_PERIGO
+       : pct < 50 ? (uint16_t)TEMA_ALERTA : (uint16_t)COR_CARGA;
 }
 
-static void duracao(char* out, size_t tam, float horas)
-{
-  const int min = (int)(horas * 60.0f + 0.5f);
-  if (min < 60) { snprintf(out, tam, "%d min", min); }
-  else          { snprintf(out, tam, "%d h %02d min", min / 60, min % 60); }
-}
 
 // ---------------------------------------------------------------------------
 // SERIES
@@ -439,22 +414,22 @@ static void montar_vertices(const pontos_t* p, serie_t s, int gx, int gl)
 static void icone_bateria(lgfx::LovyanGFX& d, int x, int y, int l, int a, int pct, bool carregando)
 {
   const uint16_t cor = cor_nivel(pct);
-  d.fillRoundRect(x, y, l, a, 7, TFT_LIGHTGREY);
-  d.fillRoundRect(x + 3, y + 3, l - 6, a - 6, 5, TFT_BLACK);
-  d.fillRoundRect(x + l + 2, y + a / 2 - 7, 5, 14, 2, TFT_LIGHTGREY);
+  d.fillRoundRect(x, y, l, a, 7, TEMA_TEXTO_2);
+  d.fillRoundRect(x + 3, y + 3, l - 6, a - 6, 5, TEMA_FUNDO);
+  d.fillRoundRect(x + l + 2, y + a / 2 - 7, 5, 14, 2, TEMA_TEXTO_2);
   const int cheio = pct < 0 ? 0 : (l - 12) * (pct > 100 ? 100 : pct) / 100;
   if (cheio > 0) { d.fillRoundRect(x + 6, y + 6, cheio, a - 12, 3, cor); }
   if (carregando) {
     const int cx = x + l / 2, cy = y + a / 2;
-    d.fillTriangle(cx + 4, cy - 14, cx - 9, cy + 2, cx + 1, cy + 2, TFT_WHITE);
-    d.fillTriangle(cx - 4, cy + 14, cx + 9, cy - 2, cx - 1, cy - 2, TFT_WHITE);
+    d.fillTriangle(cx + 4, cy - 14, cx - 9, cy + 2, cx + 1, cy + 2, TEMA_TEXTO);
+    d.fillTriangle(cx - 4, cy + 14, cx + 9, cy - 2, cx - 1, cy - 2, TEMA_TEXTO);
   }
 }
 
 static void desenhar_topo(lgfx::LovyanGFX& d, const area_t& a)
 {
   const tab5_medida_t m = tab5_power_ultima();
-  tab5_tela_limpar(a.x, a.y, a.largura, TOPO_A, TFT_BLACK);
+  tab5_tela_limpar(a.x, a.y, a.largura, TOPO_A, TEMA_FUNDO);
   char buf[64], dur[24];
 
   // HEROI. O estado vem da corrente do instante (a mesma regra de tres
@@ -465,9 +440,15 @@ static void desenhar_topo(lgfx::LovyanGFX& d, const area_t& a)
   if (n >= 4) { media = 0; for (int i = 0; i < n; ++i) { media += s_m->ram[i].mA; } media /= n; }
   const bool carregando = m.mA > 20.0f, na_bateria = m.mA < -20.0f;
 
+  tab5_botao(d, a.x + 16, a.y + 16, VOLTAR_L, VOLTAR_A, tr("< VOLTAR"), TEMA_SUPERFICIE_ALTA, TEMA_TEXTO);
+  tab5_titulo(d, 40);
+  d.setTextDatum(middle_left);
+  d.setTextColor(TEMA_TEXTO, TEMA_FUNDO);
+  d.drawString(tr("Energia"), a.x + 16 + VOLTAR_L + 28, a.y + 16 + VOLTAR_A / 2);
+
   const int y = a.y + HERO_Y;
   fn(d, 56); d.setTextDatum(top_left);
-  d.setTextColor(cor_nivel(m.pct), TFT_BLACK);
+  d.setTextColor(cor_nivel(m.pct), TEMA_FUNDO);
   if (m.pct < 0) { snprintf(buf, sizeof(buf), "--"); } else { snprintf(buf, sizeof(buf), "%d%%", m.pct); }
   d.drawString(buf, a.x + M, y);
   const int fim_pct = a.x + M + d.textWidth(buf);
@@ -477,25 +458,25 @@ static void desenhar_topo(lgfx::LovyanGFX& d, const area_t& a)
 
   const char* estado; uint16_t cor_estado; buf[0] = 0;
   if (carregando) {
-    estado = "Carregando"; cor_estado = COR_CARGA;
+    estado = tr("Carregando"); cor_estado = COR_CARGA;
     if (media > 20.0f && m.pct >= 0 && m.pct < 100) {
-      duracao(dur, sizeof(dur), (100 - m.pct) / 100.0f * TAB5_CAPACIDADE_MAH / media);
-      snprintf(buf, sizeof(buf), "cheia em ~%s", dur);
+      tab5_duracao((uint32_t)(((100 - m.pct) / 100.0f * TAB5_CAPACIDADE_MAH / media) * 3600.0f + 30.0f), dur, sizeof(dur));
+      snprintf(buf, sizeof(buf), tr("cheia em ~%s"), dur);
     }
   } else if (na_bateria) {
-    estado = "Na bateria"; cor_estado = TFT_WHITE;
+    estado = tr("Na bateria"); cor_estado = TEMA_TEXTO;
     if (media < -20.0f && m.pct >= 0) {
       const float h = m.pct / 100.0f * TAB5_CAPACIDADE_MAH / -media;
-      if (h < 100.0f) { duracao(dur, sizeof(dur), h); snprintf(buf, sizeof(buf), "dura ~%s neste ritmo", dur); }
+      if (h < 100.0f) { tab5_duracao((uint32_t)((h) * 3600.0f + 30.0f), dur, sizeof(dur)); snprintf(buf, sizeof(buf), tr("dura ~%s neste ritmo"), dur); }
     }
   } else {
-    estado = "Na tomada"; cor_estado = COR_CARGA;
-    snprintf(buf, sizeof(buf), "carga completa");
+    estado = tr("Na tomada"); cor_estado = COR_CARGA;
+    snprintf(buf, sizeof(buf), tr("carga completa"));
   }
   const int xr = a.x + a.largura - M;
-  fn(d, 32); d.setTextDatum(top_right); d.setTextColor(cor_estado, TFT_BLACK);
+  fn(d, 32); d.setTextDatum(top_right); d.setTextColor(cor_estado, TEMA_FUNDO);
   d.drawString(estado, xr, y + 2);
-  fc(d, 24); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  fc(d, 24); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
   d.drawString(buf, xr, y + 42);
 
   // INDICE: seis cartoes. Os cinco primeiros sao as series - tocar escolhe o
@@ -506,25 +487,40 @@ static void desenhar_topo(lgfx::LovyanGFX& d, const area_t& a)
     const int cx = a.x + M + (i % 3) * (cl + CART_V), cy = a.y + CART_Y + (i / 3) * (CART_A + CART_V);
     const bool sel = (i < N_SERIES && (int)s_serie == i);
     const uint16_t fundo = sel ? COR_CARTAO_SEL : COR_CARTAO;
-    d.fillRoundRect(cx, cy, cl, CART_A, 12, fundo);
+    d.fillRoundRect(cx, cy, cl, CART_A, TEMA_RAIO_M, fundo);
     if (sel) {
-      d.drawRoundRect(cx, cy, cl, CART_A, 12, SERIE_COR[i]);
-      d.drawRoundRect(cx + 1, cy + 1, cl - 2, CART_A - 2, 11, SERIE_COR[i]);
+      d.drawRoundRect(cx, cy, cl, CART_A, TEMA_RAIO_M, SERIE_COR[i]);
+      d.drawRoundRect(cx + 1, cy + 1, cl - 2, CART_A - 2, TEMA_RAIO_M - 1, SERIE_COR[i]);
     }
-    uint16_t cor = (i < N_SERIES) ? SERIE_COR[i] : (uint16_t)TFT_WHITE;
+    uint16_t cor = (i < N_SERIES) ? SERIE_COR[i] : (uint16_t)TEMA_TEXTO;
     switch (i) {
       case SERIE_BATERIA:  if (m.pct < 0) { snprintf(buf, sizeof(buf), "--"); } else { snprintf(buf, sizeof(buf), "%d %%", m.pct); } break;
       case SERIE_CORRENTE: snprintf(buf, sizeof(buf), "%+.0f mA", (double)m.mA); cor = m.mA > 20.0f ? (uint16_t)COR_CARGA : cor; break;
       case SERIE_POTENCIA: snprintf(buf, sizeof(buf), "%.2f W", (double)(m.mW / 1000.0f)); break;
       case SERIE_TENSAO:   snprintf(buf, sizeof(buf), "%.2f V", (double)m.volts); break;
       case SERIE_TEMP:     if (tem_temp) { snprintf(buf, sizeof(buf), "%.1f °C", (double)temp); } else { snprintf(buf, sizeof(buf), "--"); } break;
-      default:             if (s_dia && s_dia->t0) { snprintf(buf, sizeof(buf), "%.0f mAh", (double)s_m->tot_gasto); } else { snprintf(buf, sizeof(buf), "--"); } break;
+      default:             if (s_dia && s_dia->t0) { snprintf(buf, sizeof(buf), tr("%.0f mAh"), (double)s_m->tot_gasto); } else { snprintf(buf, sizeof(buf), "--"); } break;
     }
     fc(d, 21); d.setTextDatum(top_left);
-    d.setTextColor(sel ? TFT_WHITE : TFT_LIGHTGREY, fundo);
-    d.drawString(i < N_SERIES ? SERIE_CARTAO[i] : "Gasto 24 h", cx + 14, cy + 10);
+    d.setTextColor(sel ? TEMA_TEXTO : TEMA_TEXTO_2, fundo);
+    d.drawString(i < N_SERIES ? tr(SERIE_CARTAO[i]) : tr("Gasto 24 h"), cx + 14, cy + 10);
     fn(d, 36); d.setTextColor(cor, fundo);
     d.drawString(buf, cx + 14, cy + 40);
+  }
+
+  // O QUE SEGURA O REPOUSO: cada recurso em uso e quem o declarou. Nenhum = a
+  // tela apagada desce a 40 MHz com sono leve, o menor gasto possivel.
+  {
+    recurso_uso_t u[RECURSOS_MAX];
+    const int nr = sistema_recursos(u, RECURSOS_MAX);
+    char rr[160];
+    int k = snprintf(rr, sizeof(rr), "%s", nr ? tr("Segura o repouso: ") : tr("Nada segura o repouso: a tela apagada gasta o mínimo"));
+    for (int j = 0; j < nr && k < (int)sizeof(rr); ++j) {
+      k += snprintf(rr + k, sizeof(rr) - k, "%s%s (%s)", j ? ", " : "", tr(sistema_recurso_nome(u[j].r)), u[j].quem);
+    }
+    fc(d, 21); d.setTextDatum(top_left);
+    d.setTextColor(nr ? TEMA_ALERTA : TEMA_TEXTO_3, TEMA_FUNDO);
+    d.drawString(rr, a.x + M, a.y + REC_Y);
   }
   d.setTextDatum(top_left);
 }
@@ -536,13 +532,13 @@ static void eixo_tempo(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga, bool 
 {
   const int divs = h24 ? 4 : 2;     // 24 H: a cada 6 h; 30 MIN: a cada 15 min
   if (grade) { for (int k = 1; k < divs; ++k) { d.drawFastVLine(gx + (gl * k) / divs, gy, ga, TAB5_GRAFICO_COR_GRADE); } }
-  fc(d, 21); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  static const char* T[3] = { "-30 min", "-15 min", "agora" };
+  fc(d, 21); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+  static const char* T[3] = { N_("-30 min"), N_("-15 min"), N_("agora") };
   char buf[12];
   for (int k = 0; k <= divs; ++k) {
-    const char* txt = T[k < 3 ? k : 2];
+    const char* txt = tr(T[k < 3 ? k : 2]);
     if (h24) {
-      if (k == divs) { txt = "agora"; }
+      if (k == divs) { txt = tr("agora"); }
       else {
         struct tm lt; tab5_hora_local(s_dia->t0 + (uint32_t)k * 6u * 3600u, &lt);
         snprintf(buf, sizeof(buf), "%dh", lt.tm_hour); txt = buf;
@@ -556,7 +552,7 @@ static void eixo_tempo(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga, bool 
 
 static void aviso_no_grafico(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga, const char* txt)
 {
-  fc(d, 24); d.setTextColor(TFT_DARKGREY, TFT_BLACK); d.setTextDatum(middle_center);
+  fc(d, 24); d.setTextColor(TEMA_TEXTO_3, TEMA_FUNDO); d.setTextDatum(middle_center);
   d.drawString(txt, gx + gl / 2, gy + ga / 2);
   d.setTextDatum(top_left);
 }
@@ -564,7 +560,7 @@ static void aviso_no_grafico(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga,
 static void desenhar_eixo_y(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga, float lo, float hi, float passo, bool so_meio_cheio)
 {
   char buf[16];
-  fc(d, 21); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.setTextDatum(middle_right);
+  fc(d, 21); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO); d.setTextDatum(middle_right);
   const int n = (int)((hi - lo) / passo + 0.5f);
   for (int k = 0; k <= n; ++k) {
     const float v = lo + k * passo;
@@ -583,23 +579,23 @@ static void desenhar_eixo_y(lgfx::LovyanGFX& d, int gx, int gl, int gy, int ga, 
 static void desenhar_grafico1(lgfx::LovyanGFX& d, const area_t& a)
 {
   const int gx = a.x + plot_x(), gl = plot_l(a.largura), gy = a.y + G1_PLOT_Y, ga = G1_A;
-  tab5_tela_limpar(a.x, a.y + G1_Y, a.largura, G1_FIM - G1_Y, TFT_BLACK);
+  tab5_tela_limpar(a.x, a.y + G1_Y, a.largura, G1_FIM - G1_Y, TEMA_FUNDO);
   char buf[48];
 
   // Cabecalho: o que e o grafico (com unidade) e o periodo.
-  fn(d, 28); d.setTextDatum(middle_left); d.setTextColor(SERIE_COR[s_serie], TFT_BLACK);
-  d.drawString(SERIE_TITULO[s_serie], a.x + M, a.y + G1_Y + SEG_A / 2);
+  fn(d, 28); d.setTextDatum(middle_left); d.setTextColor(SERIE_COR[s_serie], TEMA_FUNDO);
+  d.drawString(tr(SERIE_TITULO[s_serie]), a.x + M, a.y + G1_Y + SEG_A / 2);
   const int sx = a.x + seg_x(a.largura), sy = a.y + G1_Y, meio = SEG_L / 2;
-  tab5_botao(d, sx,        sy, meio, SEG_A, "30 MIN", s_24h ? (uint16_t)TFT_BLACK : (uint16_t)TFT_WHITE,
-             s_24h ? (uint16_t)TFT_LIGHTGREY : (uint16_t)TFT_BLACK, TAM_BOTAO);
-  tab5_botao(d, sx + meio, sy, meio, SEG_A, "24 H",   s_24h ? (uint16_t)TFT_WHITE : (uint16_t)TFT_BLACK,
-             s_24h ? (uint16_t)TFT_BLACK : (uint16_t)TFT_LIGHTGREY, TAM_BOTAO);
-  d.drawRoundRect(sx, sy, SEG_L, SEG_A, 10, TFT_LIGHTGREY);
+  tab5_botao(d, sx,        sy, meio, SEG_A, tr("30 MIN"), s_24h ? (uint16_t)TEMA_SUPERFICIE_ALTA : (uint16_t)TEMA_DESTAQUE,
+             s_24h ? (uint16_t)TEMA_TEXTO_2 : (uint16_t)TEMA_SOBRE_DESTAQUE, TAM_BOTAO);
+  tab5_botao(d, sx + meio, sy, meio, SEG_A, "24 H",   s_24h ? (uint16_t)TEMA_DESTAQUE : (uint16_t)TEMA_SUPERFICIE_ALTA,
+             s_24h ? (uint16_t)TEMA_SOBRE_DESTAQUE : (uint16_t)TEMA_TEXTO_2, TAM_BOTAO);
+  d.drawRoundRect(sx, sy, SEG_L, SEG_A, TEMA_RAIO_M, TEMA_LINHA);
   d.setTextDatum(top_left);
 
   if (s_24h && (!s_dia || !s_dia->t0)) {
     d.drawFastHLine(gx, gy + ga - 1, gl, COR_EIXO);
-    aviso_no_grafico(d, gx, gl, gy, ga, s_carga_pedida ? "lendo o cartão..." : "24 H precisa do relógio (GPS, malha ou NTP)");
+    aviso_no_grafico(d, gx, gl, gy, ga, s_carga_pedida ? tr("lendo o cartão...") : tr("24 H precisa do relógio (GPS, malha ou NTP)"));
     return;
   }
   const pontos_t* p = s_24h ? &s_m->p24 : &s_m->p30;
@@ -608,7 +604,7 @@ static void desenhar_grafico1(lgfx::LovyanGFX& d, const area_t& a)
   vertices_t* v = &s_m->vt;
   if (v->n < 2) {
     d.drawFastHLine(gx, gy + ga - 1, gl, COR_EIXO);
-    aviso_no_grafico(d, gx, gl, gy, ga, s_24h ? "ainda sem pontos (1 por minuto)" : "juntando dados (1 ponto a cada 30 s)...");
+    aviso_no_grafico(d, gx, gl, gy, ga, s_24h ? tr("ainda sem pontos (1 por minuto)") : tr("juntando dados (1 ponto a cada 30 s)..."));
     return;
   }
 
@@ -653,7 +649,7 @@ static void desenhar_grafico1(lgfx::LovyanGFX& d, const area_t& a)
       else if (y > y_base) { d.drawFastVLine(x, y_base + 1, y - y_base, fill); }
     }
   }
-  if (s_serie == SERIE_CORRENTE) { d.drawFastHLine(gx, y_base, gl, TFT_LIGHTGREY); }
+  if (s_serie == SERIE_CORRENTE) { d.drawFastHLine(gx, y_base, gl, TEMA_TEXTO_2); }
 
   // 4) A LINHA por cima (~3 px, borda suavizada). Ponto isolado vira bolinha.
   for (int i = 0; i < v->n; ++i) {
@@ -668,8 +664,8 @@ static void desenhar_grafico1(lgfx::LovyanGFX& d, const area_t& a)
     int k = 0;
     for (int i = 1; i < v->n; ++i) { if (abs(v->px[i] - alvo) < abs(v->px[k] - alvo)) { k = i; } }
     const int cx = v->px[k], cy = YV(v->val[k]);
-    d.drawFastVLine(cx, gy, ga, TFT_WHITE);
-    d.fillCircle(cx, cy, 7, TFT_WHITE);
+    d.drawFastVLine(cx, gy, ga, TEMA_TEXTO);
+    d.fillCircle(cx, cy, 7, TEMA_TEXTO);
     d.fillCircle(cx, cy, 4, cor);
     char val[24];
     snprintf(val, sizeof(val), formato(s_serie), (double)v->val[k]);
@@ -678,17 +674,17 @@ static void desenhar_grafico1(lgfx::LovyanGFX& d, const area_t& a)
       snprintf(buf, sizeof(buf), "%02d:%02d   %s", lt.tm_hour, lt.tm_min, val);
     } else {
       const int s = v->t[k];
-      if (s < 60) { snprintf(buf, sizeof(buf), "agora   %s", val); }
-      else        { snprintf(buf, sizeof(buf), "há %d min   %s", s / 60, val); }
+      if (s < 60) { snprintf(buf, sizeof(buf), tr("agora   %s"), val); }
+      else        { snprintf(buf, sizeof(buf), tr("há %d min   %s"), s / 60, val); }
     }
     fn(d, 24);
     const int bl = d.textWidth(buf) + 24, ba = 40;
     int bx = cx + 12;
     if (bx + bl > gx + gl) { bx = cx - 12 - bl; }
     if (bx < gx) { bx = gx; }
-    d.fillRoundRect(bx, gy + 6, bl, ba, 8, COR_CARTAO_SEL);
-    d.drawRoundRect(bx, gy + 6, bl, ba, 8, cor);
-    d.setTextDatum(middle_left); d.setTextColor(TFT_WHITE, COR_CARTAO_SEL);
+    d.fillRoundRect(bx, gy + 6, bl, ba, TEMA_RAIO_P, COR_CARTAO_SEL);
+    d.drawRoundRect(bx, gy + 6, bl, ba, TEMA_RAIO_P, cor);
+    d.setTextDatum(middle_left); d.setTextColor(TEMA_TEXTO, COR_CARTAO_SEL);
     d.drawString(buf, bx + 12, gy + 6 + ba / 2);
     d.setTextDatum(top_left);
   }
@@ -702,7 +698,7 @@ static void quadradinho(lgfx::LovyanGFX& d, int* xr, int ym, uint16_t cor, const
 {
   // Legenda escrita da direita para a esquerda: devolve em *xr onde a proxima termina.
   const int w = d.textWidth(txt);
-  d.setTextDatum(middle_right); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  d.setTextDatum(middle_right); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
   d.drawString(txt, *xr, ym);
   d.fillRoundRect(*xr - w - 22, ym - 8, 16, 16, 3, cor);
   *xr -= w + 22 + 20;
@@ -711,21 +707,21 @@ static void quadradinho(lgfx::LovyanGFX& d, int* xr, int ym, uint16_t cor, const
 static void desenhar_grafico2(lgfx::LovyanGFX& d, const area_t& a)
 {
   const int gx = a.x + plot_x(), gl = plot_l(a.largura), gy = a.y + G2_PLOT_Y, ga = G2_A;
-  tab5_tela_limpar(a.x, a.y + G2_Y, a.largura, a.altura - G2_Y, TFT_BLACK);
+  tab5_tela_limpar(a.x, a.y + G2_Y, a.largura, a.altura - G2_Y, TEMA_FUNDO);
   char buf[96], dur[24];
 
-  fn(d, 28); d.setTextDatum(middle_left); d.setTextColor(COR_GASTO_TELA, TFT_BLACK);
-  d.drawString("Gasto por hora (mAh)", a.x + M, a.y + G2_Y + 18);
+  fn(d, 28); d.setTextDatum(middle_left); d.setTextColor(COR_GASTO_TELA, TEMA_FUNDO);
+  d.drawString(tr("Gasto por hora (mAh)"), a.x + M, a.y + G2_Y + 18);
   fc(d, 18);
   int xr = a.x + a.largura - M;
-  quadradinho(d, &xr, a.y + G2_Y + 18, COR_CARGA, "carga");
-  quadradinho(d, &xr, a.y + G2_Y + 18, COR_GASTO_REP, "repouso");
-  quadradinho(d, &xr, a.y + G2_Y + 18, COR_GASTO_TELA, "tela");
+  quadradinho(d, &xr, a.y + G2_Y + 18, COR_CARGA, tr("carga"));
+  quadradinho(d, &xr, a.y + G2_Y + 18, COR_GASTO_REP, tr("repouso"));
+  quadradinho(d, &xr, a.y + G2_Y + 18, COR_GASTO_TELA, tr("tela"));
   d.setTextDatum(top_left);
 
   if (!s_dia || !s_dia->t0) {
     d.drawFastHLine(gx, gy + ga - 1, gl, COR_EIXO);
-    aviso_no_grafico(d, gx, gl, gy, ga, s_carga_pedida ? "lendo o cartão..." : "precisa do relógio (GPS, malha ou NTP)");
+    aviso_no_grafico(d, gx, gl, gy, ga, s_carga_pedida ? tr("lendo o cartão...") : tr("precisa do relógio (GPS, malha ou NTP)"));
     return;
   }
 
@@ -757,25 +753,25 @@ static void desenhar_grafico2(lgfx::LovyanGFX& d, const area_t& a)
   if (s_hora_sel >= 0) {
     const hora_t* hr = &s_m->horas[s_hora_sel];
     struct tm lt; tab5_hora_local(s_dia->t0 + (uint32_t)s_hora_sel * 3600u, &lt);
-    snprintf(buf, sizeof(buf), "%dh - %dh: gastou %.0f mAh · carregou %.0f mAh",
+    snprintf(buf, sizeof(buf), tr("%dh - %dh: gastou %.0f mAh · carregou %.0f mAh"),
              lt.tm_hour, (lt.tm_hour + 1) % 24, (double)(hr->tela + hr->repouso), (double)hr->carga);
-    fn(d, 24); d.setTextColor(TFT_WHITE, TFT_BLACK); d.drawString(buf, a.x + M, y1);
+    fn(d, 24); d.setTextColor(TEMA_TEXTO, TEMA_FUNDO); d.drawString(buf, a.x + M, y1);
     if (hr->tem) {
-      snprintf(buf, sizeof(buf), "tela acesa %d min (%.0f mAh)   repouso %.0f mAh",
+      snprintf(buf, sizeof(buf), tr("tela acesa %d min (%.0f mAh)   repouso %.0f mAh"),
                hr->min_tela, (double)hr->tela, (double)hr->repouso);
     } else {
-      snprintf(buf, sizeof(buf), "sem registro nesta hora (aparelho desligado)");
+      snprintf(buf, sizeof(buf), tr("sem registro nesta hora (aparelho desligado)"));
     }
-    fc(d, 24); d.setTextColor(TFT_LIGHTGREY, TFT_BLACK); d.drawString(buf, a.x + M, y2);
+    fc(d, 24); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO); d.drawString(buf, a.x + M, y2);
   } else {
-    snprintf(buf, sizeof(buf), "24 h: gastou %.0f mAh (%.2f Wh) · carregou %.0f mAh",
+    snprintf(buf, sizeof(buf), tr("24 h: gastou %.0f mAh (%.2f Wh) · carregou %.0f mAh"),
              (double)s_m->tot_gasto, (double)s_m->tot_wh, (double)s_m->tot_carga);
-    fn(d, 24); d.setTextColor(TFT_WHITE, TFT_BLACK); d.drawString(buf, a.x + M, y1);
-    duracao(dur, sizeof(dur), s_m->tot_min_tela / 60.0f);
+    fn(d, 24); d.setTextColor(TEMA_TEXTO, TEMA_FUNDO); d.drawString(buf, a.x + M, y1);
+    tab5_duracao((uint32_t)((s_m->tot_min_tela / 60.0f) * 3600.0f + 30.0f), dur, sizeof(dur));
     uint32_t falhas; registro_estado(nullptr, nullptr, &falhas);
-    if (falhas) { snprintf(buf, sizeof(buf), "tela acesa %s   registro: %lu falhas no cartão", dur, (unsigned long)falhas); }
-    else        { snprintf(buf, sizeof(buf), "tela acesa %s   toque numa barra para ver a hora", dur); }
-    fc(d, 24); d.setTextColor(falhas ? TFT_ORANGE : TFT_LIGHTGREY, TFT_BLACK); d.drawString(buf, a.x + M, y2);
+    if (falhas) { snprintf(buf, sizeof(buf), tr("tela acesa %s   registro: %lu falhas no cartão"), dur, (unsigned long)falhas); }
+    else        { snprintf(buf, sizeof(buf), tr("tela acesa %s   toque numa barra para ver a hora"), dur); }
+    fc(d, 24); d.setTextColor(falhas ? TEMA_ALERTA : TEMA_TEXTO_2, TEMA_FUNDO); d.drawString(buf, a.x + M, y2);
   }
 }
 
@@ -791,7 +787,7 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   uint32_t grav; registro_estado(nullptr, &grav, nullptr);
   if (grav != s_gravadas_lidas || (s_dia && janela_t0() != s_dia->t0)) { s_gravadas_lidas = grav; pedir_24h(); }
 
-  if (tudo) { tab5_tela_limpar(a.x, a.y, a.largura, a.altura, TFT_BLACK); }
+  if (tudo) { tab5_tela_limpar(a.x, a.y, a.largura, a.altura, TEMA_FUNDO); }
 
   // Os graficos so mudam quando chega dado (anel a cada TAB5_HIST_SEG, cartao
   // a cada carga) ou quando um toque mudou a selecao.
@@ -818,11 +814,12 @@ static void ao_tocar(int x, int y)
   const area_t a = sistema_area();
   const int cl = cart_l(a.largura);
   const int gx = plot_x(), gl = plot_l(a.largura);
+  if (tab5_dentro(x, y, 16, 16, VOLTAR_L, VOLTAR_A)) { sistema_abrir_app("Ajustes"); return; }
   if (y >= HERO_Y && y < HERO_Y + HERO_A) {
     s_serie = SERIE_BATERIA; s_cursor = -1;
   }
   // Um cartao do indice: escolhe a serie do grafico 1 (o sexto so informa).
-  else if (y >= CART_Y && y < TOPO_A && x >= M) {
+  else if (y >= CART_Y && y < REC_Y && x >= M) {   // a linha dos recursos nao e cartao
     const int col = (x - M) / (cl + CART_V), lin = (y - CART_Y) / (CART_A + CART_V);
     const int i = lin * 3 + (col > 2 ? 2 : col);
     if (i >= N_SERIES) { return; }
@@ -890,7 +887,6 @@ extern const app_t APP_ENERGIA = {
   // Perfil: so o brilho. Todo o resto vem dos defaults do tab5_perfil_t,
   // que sao 'desligado' - por isso nao precisa listar o que nao se usa.
   .perfil = { },
-  .piso_repouso_mhz = 0,  // sem trabalho de fundo: pode descer ao minimo
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -898,5 +894,9 @@ extern const app_t APP_ENERGIA = {
   .periodo_ms = 1000,     // o topo acompanha a medida de 1Hz do kernel
   .avisos = AVISO_TRABALHO,
   .ao_aviso = ao_aviso,
+  .altura_agora = altura_agora,
   .icone = icone_energia,
+  // Mora dentro do Ajustes (a linha "Energia" abre este app): sem icone na home.
+  .fora_da_home = true,
+  .fundo_tema = true,
 };

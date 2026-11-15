@@ -29,7 +29,7 @@ static void na_carona(void)
   if (!s_gravar_pend) { return; }
   s_gravar_pend = false;
   // Copia da lista com a trava e escreve fora dela (cartao e lento).
-  static mesh_wifi_rede_t copia[MESH_WIFI_REDES_MAX];
+  EXT_RAM_BSS_ATTR static mesh_wifi_rede_t copia[MESH_WIFI_REDES_MAX];
   int n;
   taskENTER_CRITICAL(&s_mux);
   n = s_n;

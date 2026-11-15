@@ -5,7 +5,7 @@
 // (comp_invalidar). Home, barras e todos os apps desenham aqui, sem saber de
 // nada disso.
 //
-// MODO DIRETO (COMPOSITOR.md): o rastreador escreve na PAGINA DE TRAS do
+// MODO DIRETO (docs/COMPOSITOR.md): o rastreador escreve na PAGINA DE TRAS do
 // painel. A primeira escrita de cada volta abre o quadro (comp_abrir: espera a
 // troca anterior e sincroniza), e so entao o pixel e escrito. Ate a etapa 3a
 // isto era um canvas de 1,84 MB na PSRAM que o compositor copiava para a
@@ -37,6 +37,18 @@ void tela_virtual_seguir_rotacao(void);
 // tinha de atrasado ali nao precisa vir da frente. E o que o fillRect ja diz
 // sozinho; serve para quem cobre com imagem (pushSprite) em vez de cor.
 void tela_virtual_cobrir(int x, int y, int w, int h);
+
+// Texto suave transparente, depressa: mistura a mascara de cinza (w x h,
+// 'passo' bytes por linha) na cor dada, DIRETO na pagina de tras - so os
+// pixels de tinta sao tocados. O retangulo ja vem recortado. false = 'gfx'
+// nao e este objeto (quem chama segue pelo caminho comum).
+bool tela_virtual_misturar_mascara(lgfx::LGFXBase* gfx, int x, int y, int w, int h,
+                                   const uint8_t* mascara, int passo, uint32_t cor888);
+
+// Cola uma imagem RGB565 ('passo' pixels por linha) em (x, y), w x h, DIRETO
+// na pagina de tras, como coberta inteira. O retangulo ja vem recortado.
+// false = 'gfx' nao e este objeto.
+bool tela_virtual_colar(lgfx::LGFXBase* gfx, int x, int y, int w, int h, const uint16_t* src, int passo);
 
 // Pede a tela inteira no proximo quadro (qualquer tarefa).
 void tela_virtual_invalidar_tudo(void);

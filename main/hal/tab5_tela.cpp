@@ -18,7 +18,7 @@ static int       s_altura    = 0;
 static int       s_frente    = 0;         // qual pagina o DSI esta varrendo
 static bool      s_pronto    = false;
 static uint32_t  s_geracao   = 0;
-volatile uint32_t g_tab5_tela_epoca = 0;
+std::atomic<uint32_t> g_tab5_tela_epoca{0};
 
 static lgfx::LovyanGFX* s_alvo = nullptr;
 static inline lgfx::LovyanGFX& alvo(void) { return s_alvo ? *s_alvo : (lgfx::LovyanGFX&)M5.Display; }

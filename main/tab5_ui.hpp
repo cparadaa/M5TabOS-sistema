@@ -16,10 +16,14 @@
 // um dia ele tiver bug, o conserto vale para todo app de uma vez, em vez de
 // precisar lembrar de visitar cada copia.
 //
-// Ver ESCREVENDO_APPS.md para o resto do contrato.
+// Ver docs/ESCREVENDO_APPS.md para o resto do contrato.
 #pragma once
 
 #include <M5Unified.h>
+#include "tab5_tema.hpp"
+
+// A cor de fundo da area agora (kernel/app.h): o fundo padrao do texto.
+uint16_t sistema_cor_fundo(void);
 
 // HISTORICO DAS FONTES: Font0 -> Font4 -> DejaVu24 -> FreeSans12pt7b (13 a
 // tudo bitmap de 1 bit escalado por fracao) -> Roboto suavizada em
@@ -109,7 +113,7 @@ void tab5_fonte_corpo_negrito(lgfx::LovyanGFX& d);
 // vezes: (26,26,32) -> (44,44,54) (sumia no escuro do painel) ->
 // (64,64,78). Um valor so, os dois graficos (Energia e Tarefas) acompanham
 // juntos da proxima vez que mudar.
-#define TAB5_GRAFICO_COR_GRADE  lgfx::color565(64, 64, 78)
+#define TAB5_GRAFICO_COR_GRADE  TEMA_LINHA   // a divisoria do tema
 
 // Retangulo arredondado preenchido com texto centralizado - o "botao" padrao
 // deste sistema. Salva e restaura o estilo de texto sozinho.
@@ -124,6 +128,17 @@ void tab5_fonte_corpo_negrito(lgfx::LovyanGFX& d);
 void tab5_botao(lgfx::LovyanGFX& d, int x, int y, int l, int a,
                const char* txt, uint16_t fundo,
                uint16_t tinta = TFT_BLACK, float tamanho_texto = TAB5_BOTAO_TEXTO_PADRAO);
+
+// MONOESPACADO COM ACENTO. A FreeMono12pt7b (Terminal, editor de codigo) so
+// tem ASCII: "ã" saia como quadrado. Aqui o ASCII vai na mono e o resto (acento,
+// simbolo) na fonte do corpo, centrado na mesma celula - a grade nao muda.
+// Desenha ate 'cols' caracteres (codepoints) a partir de 'x' com a linha de
+// base em 'y_base' e devolve onde parou (para quebrar a linha). Cor: a atual.
+const char* tab5_mono(lgfx::LovyanGFX& d, const char* t, int x, int y_base, int cw, int cols);
+
+// Tamanho legivel: "512 B", "3.4 KB", "12.0 MB", "1.9 GB". Um so para todo
+// app e para o console (antes cada um tinha o seu, cada um de um jeito).
+void tab5_bytes_txt(char* out, size_t n, uint64_t bytes);
 
 // Celula de painel: rotulo pequeno em cima, valor grande embaixo, subtexto
 // opcional por baixo dele - o mesmo desenho usado na tela inicial
@@ -164,6 +179,15 @@ inline bool tab5_dentro(int x, int y, int rx, int ry, int rl, int ra)
 size_t tab5_cortar_ao_caber(lgfx::LovyanGFX& d, char* t, int max_l);
 // O mesmo, terminando em "..." quando cortou ('tam' = tamanho do buffer).
 size_t tab5_cortar_com_reticencias(lgfx::LovyanGFX& d, char* t, size_t tam, int max_l);
+
+// TEXTO NUMA ALTURA DE FONTE EXATA (a fonte suave de 'px'), cortado com "..."
+// em 'max_l' px (0 = sem corte). Devolve a fonte de corpo e o top_left no fim:
+// quem desenha depois nao herda nada.
+// DURACAO para mostrar: "45 s", "12 min", "2 h 05 min" (no idioma atual).
+void tab5_duracao(uint32_t segundos, char* out, size_t n);
+
+void tab5_escrever(lgfx::LovyanGFX& d, const char* t, int x, int y, int px, bool negrito,
+                   uint16_t cor, uint16_t fundo = sistema_cor_fundo(), uint8_t datum = top_left, int max_l = 0);
 
 // SPRITE (M5Canvas) SEMPRE NA PSRAM. Use no lugar de new M5Canvas +
 // createSprite: sem setPsram(true) o M5GFX pede MALLOC_CAP_DMA, e na P4 a

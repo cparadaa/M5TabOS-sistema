@@ -1,4 +1,6 @@
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
+#include "idioma.h"
 #include "fontes/fontes_suaves.hpp"
 #include "tab5_glifos.hpp"
 #include "esp_memory_utils.h"   // esp_ptr_external_ram
@@ -94,7 +96,7 @@ void tab5_botao(lgfx::LovyanGFX& d, int x, int y, int l, int a,
   // Copia POR VALOR: getTextStyle() devolve referencia para o membro interno.
   const lgfx::TextStyle estilo = d.getTextStyle();
 
-  d.fillRoundRect(x, y, l, a, 12, fundo);
+  d.fillRoundRect(x, y, l, a, TEMA_RAIO_M, fundo);   // o canto do tema central
   d.setTextDatum(middle_center);
   d.setTextColor(tinta, fundo);
   // NEGRITO e DO TAMANHO DO BOTAO. O texto era um
@@ -128,16 +130,19 @@ void tab5_celula(lgfx::LovyanGFX& d, int cx, int y0,
 
   tab5_fonte_corpo(d);
   tab5_texto(d, 2);
-  d.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  // O fundo do texto e o da area (sistema_cor_fundo): preto nos apps ainda
+  // nao migrados, TEMA_FUNDO nos que ja estao no tema.
+  const uint16_t fundo = sistema_cor_fundo();
+  d.setTextColor(TEMA_TEXTO_3, fundo);   // rotulo: o mais apagado
   d.drawString(rotulo, cx, y0);
 
   tab5_texto(d, 4);
-  d.setTextColor(cor_valor, TFT_BLACK);
+  d.setTextColor(cor_valor, fundo);
   d.drawString(valor, cx, y0 + 22);
 
   if (subtexto && subtexto[0]) {
     tab5_texto(d, 2);
-    d.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    d.setTextColor(TEMA_TEXTO_2, fundo);   // subtexto: texto secundario
     d.drawString(subtexto, cx, y0 + 66);
   }
 
@@ -281,4 +286,73 @@ size_t tab5_cortar_com_reticencias(lgfx::LovyanGFX& d, char* t, size_t tam, int 
   }
   memcpy(t + k, "...", 4);
   return k + 3;
+}
+
+void tab5_duracao(uint32_t s, char* out, size_t n)
+{
+  if (s >= 3600)    { snprintf(out, n, tr("%lu h %02lu min"), (unsigned long)(s / 3600), (unsigned long)((s % 3600) / 60)); }
+  else if (s >= 60) { snprintf(out, n, tr("%lu min"), (unsigned long)(s / 60)); }
+  else              { snprintf(out, n, tr("%lu s"), (unsigned long)s); }
+}
+
+void tab5_escrever(lgfx::LovyanGFX& d, const char* t, int x, int y, int px, bool negrito,
+                   uint16_t cor, uint16_t fundo, uint8_t datum, int max_l)
+{
+  char b[256];
+  snprintf(b, sizeof(b), "%s", t ? t : "");
+  d.setFont(tab5_fonte_suave(negrito, px));
+  d.setTextSize(1);
+  if (max_l > 0) { tab5_cortar_com_reticencias(d, b, sizeof(b), max_l); }
+  d.setTextDatum(datum);
+  d.setTextColor(cor, fundo);
+  d.drawString(b, x, y);
+  d.setTextDatum(top_left);
+  tab5_fonte_corpo(d);
+}
+
+void tab5_bytes_txt(char* out, size_t n, uint64_t b)
+{
+  if      (b >= 1024ULL * 1024 * 1024) { snprintf(out, n, "%.1f GB", b / (1024.0 * 1024 * 1024)); }
+  else if (b >= 1024ULL * 1024)        { snprintf(out, n, "%.1f MB", b / (1024.0 * 1024)); }
+  else if (b >= 1024ULL)               { snprintf(out, n, "%.1f KB", b / 1024.0); }
+  else                                 { snprintf(out, n, "%llu B", (unsigned long long)b); }
+}
+
+const char* tab5_mono(lgfx::LovyanGFX& d, const char* t, int x, int y_base, int cw, int cols)
+{
+  char run[129];
+  int  n = 0, col0 = 0, col = 0;
+  d.setFont(&fonts::FreeMono12pt7b);
+  d.setTextSize(1);
+  d.setTextDatum(baseline_left);
+  auto soltar = [&]() {
+    if (n) { run[n] = 0; d.drawString(run, x + col0 * cw, y_base); n = 0; }
+  };
+  while (*t && col < cols) {
+    const uint8_t c = (uint8_t)*t;
+    if (c < 0x80) {
+      if (!n) { col0 = col; }
+      run[n++] = (char)c;
+      if (n == (int)sizeof(run) - 1) { soltar(); }
+      ++t; ++col;
+      continue;
+    }
+    soltar();
+    int k = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 1;
+    char g[5];
+    int m = 0;
+    for (; m < k && t[m]; ++m) { g[m] = t[m]; }
+    g[m] = 0;
+    t += m;
+    tab5_fonte_corpo(d);
+    tab5_texto(d, 2.2f);
+    d.setTextDatum(baseline_center);
+    d.drawString(g, x + col * cw + cw / 2, y_base);
+    d.setFont(&fonts::FreeMono12pt7b);
+    d.setTextSize(1);
+    d.setTextDatum(baseline_left);
+    ++col;
+  }
+  soltar();
+  return t;
 }

@@ -5,6 +5,10 @@
 #include "tab5_teclado.hpp"
 #include "tab5_hora.hpp"
 #include "tab5_emoji.hpp"
+#include "transferencia.h"
+#include "tab5_unicode.hpp"
+#include "idioma.h"
+#include "tab5_tema.hpp"
 
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -25,13 +29,14 @@ static const float TAM_NOME    = 2.415f;
 static const float TAM_META    = 1.955f;
 static const float TAM_ESCRITA = 3.2f;
 static const int   LINHA_STEP  = 34;    // acompanha TAM_MSG
-static const int   DIVISOR_A   = 40;
+static const int   DIVISOR_A   = 52;    // acompanha TAM_DIVISOR (pilula de 42 px)
+static const float TAM_DIVISOR = 2.4f;  // "HOJE": 1,7 era pequeno demais (pedido do usuario)
 static const int   VAO_BALAO   = 8;
 // A HORA EMBAIXO DO BALAO ("14:32"), do lado de quem falou. So quando a
 // mensagem tem data de verdade - sem ela (relogio nao acertado) nao ha o que
 // dizer, e a faixa nem existe.
-static const float TAM_HORA    = 1.7f;
-static const int   HORA_A      = 22;
+static const float TAM_HORA    = 2.3f;  // 1,7 era pequeno demais (pedido do usuario)
+static const int   HORA_A      = 28;    // acompanha TAM_HORA (glifo ~19 px + respiro)
 static const int   ESCRITA_A   = 80;
 static const int   ENV_L       = 110;   // botao de enviar + margem
 static const int   MARCA_L     = 26;    // marca de envio, a esquerda do balao
@@ -50,8 +55,11 @@ struct conversa_balao_s {
 };
 typedef struct conversa_balao_s balao_t;
 
-static uint16_t fundo(lgfx::LovyanGFX& d)            { return d.color565(13, 17, 23); }
-static uint16_t cor_balao(lgfx::LovyanGFX& d, bool m) { return m ? d.color565(22, 33, 26) : d.color565(24, 28, 36); }
+// Fundo da area de conversa: o da area do app (o sistema sabe qual e), para os
+// baloes combinarem com o que esta embaixo mesmo em app ainda no preto.
+static uint16_t fundo(lgfx::LovyanGFX&)               { return sistema_cor_fundo(); }
+// Balao meu em destaque suave; o dos outros numa superficie um degrau acima do fundo.
+static uint16_t cor_balao(lgfx::LovyanGFX&, bool m)   { return m ? TEMA_DESTAQUE_SUAVE : TEMA_SUPERFICIE_ALTA; }
 
 // ---------------------------------------------------------------------------
 // QUEBRA DE LINHAS
@@ -63,8 +71,16 @@ int conversa_quebrar_linhas(lgfx::LovyanGFX& d, const char* txt, int largura_px,
   char atual[CONVERSA_LINHA_BYTES] = "";
   const char* p = txt;
   while (*p && n < max_linhas) {
+    // LINHA NOVA no texto (Shift+Enter, a tecla de nova linha): fecha a linha
+    // aqui, mesmo vazia.
+    if (*p == '\n') {
+      snprintf(linhas[n++], CONVERSA_LINHA_BYTES, "%s", atual);
+      atual[0] = 0;
+      ++p;
+      continue;
+    }
     const char* fim = p;
-    while (*fim && *fim != ' ') { ++fim; }
+    while (*fim && *fim != ' ' && *fim != '\n') { ++fim; }
     size_t tam = (size_t)(fim - p);
     // Palavra maior que o buffer de uma linha: entra so o que couber (sem
     // partir um caractere UTF-8), e o resto volta pelo loop como "a proxima
@@ -129,8 +145,8 @@ static int dia_local(uint32_t epoch)
 static void formatar_dia(uint32_t epoch, char* out, size_t tam)
 {
   if (const uint32_t agora = tab5_hora_epoch()) {
-    if (dia_local(epoch) == dia_local(agora))          { snprintf(out, tam, "HOJE");  return; }
-    if (dia_local(epoch) == dia_local(agora - 86400u)) { snprintf(out, tam, "ONTEM"); return; }
+    if (dia_local(epoch) == dia_local(agora))          { snprintf(out, tam, tr("HOJE"));  return; }
+    if (dia_local(epoch) == dia_local(agora - 86400u)) { snprintf(out, tam, tr("ONTEM")); return; }
   }
   struct tm t;
   tab5_hora_local(epoch, &t);
@@ -141,14 +157,14 @@ static void desenhar_divisor(lgfx::LovyanGFX& d, int x0, int larg, int y, uint32
 {
   char txt[16];
   formatar_dia(epoch, txt, sizeof(txt));
-  tab5_texto(d, 1.7f);
+  tab5_texto(d, TAM_DIVISOR);
   const int pl = (int)d.textWidth(txt) + 32;
   const int pa = DIVISOR_A - 10;
-  const uint16_t pilula = d.color565(38, 42, 50);
+  const uint16_t pilula = TEMA_SUPERFICIE_ALTA;
   d.fillRect(x0, y, larg, DIVISOR_A, fundo(d));
   d.fillRoundRect(x0 + (larg - pl) / 2, y + 5, pl, pa, pa / 2, pilula);
   d.setTextDatum(middle_center);
-  d.setTextColor(TFT_LIGHTGREY, pilula);
+  d.setTextColor(TEMA_TEXTO_2, pilula);
   d.drawString(txt, x0 + larg / 2, y + DIVISOR_A / 2);
   d.setTextDatum(top_left);
 }
@@ -158,35 +174,35 @@ static void marca_envio(lgfx::LovyanGFX& d, int cx, int cy, uint8_t envio)
 {
   d.fillRect(cx - MARCA_L / 2, cy - 12, MARCA_L, 24, fundo(d));
   if (envio == CONVERSA_ENVIO_PENDENTE) {
-    for (int k = -1; k <= 1; ++k) { d.fillCircle(cx + k * 7, cy, 2, TFT_DARKGREY); }
+    for (int k = -1; k <= 1; ++k) { d.fillCircle(cx + k * 7, cy, 2, TEMA_TEXTO_3); }
   } else if (envio == CONVERSA_ENVIO_OK) {
-    d.drawLine(cx - 8, cy, cx - 3, cy + 6, TFT_GREENYELLOW);
-    d.drawLine(cx - 8, cy + 1, cx - 3, cy + 7, TFT_GREENYELLOW);
-    d.drawLine(cx - 3, cy + 6, cx + 8, cy - 7, TFT_GREENYELLOW);
-    d.drawLine(cx - 3, cy + 7, cx + 8, cy - 6, TFT_GREENYELLOW);
+    d.drawLine(cx - 8, cy, cx - 3, cy + 6, TEMA_SUCESSO);
+    d.drawLine(cx - 8, cy + 1, cx - 3, cy + 7, TEMA_SUCESSO);
+    d.drawLine(cx - 3, cy + 6, cx + 8, cy - 7, TEMA_SUCESSO);
+    d.drawLine(cx - 3, cy + 7, cx + 8, cy - 6, TEMA_SUCESSO);
   } else if (envio == CONVERSA_ENVIO_OUVIDO) {
     // O mesmo visto, em cinza: saiu e a rede ouviu, mas quem devia
     // confirmar (o destinatario) ainda nao confirmou.
-    d.drawLine(cx - 8, cy, cx - 3, cy + 6, TFT_DARKGREY);
-    d.drawLine(cx - 8, cy + 1, cx - 3, cy + 7, TFT_DARKGREY);
-    d.drawLine(cx - 3, cy + 6, cx + 8, cy - 7, TFT_DARKGREY);
-    d.drawLine(cx - 3, cy + 7, cx + 8, cy - 6, TFT_DARKGREY);
+    d.drawLine(cx - 8, cy, cx - 3, cy + 6, TEMA_TEXTO_3);
+    d.drawLine(cx - 8, cy + 1, cx - 3, cy + 7, TEMA_TEXTO_3);
+    d.drawLine(cx - 3, cy + 6, cx + 8, cy - 7, TEMA_TEXTO_3);
+    d.drawLine(cx - 3, cy + 7, cx + 8, cy - 6, TEMA_TEXTO_3);
   } else if (envio == CONVERSA_ENVIO_SEM_RESPOSTA) {
     // Cinza, circulo e "?": nao e falha, e nao saber.
-    d.drawCircle(cx, cy, 9, TFT_DARKGREY);
-    d.drawCircle(cx, cy, 8, TFT_DARKGREY);
+    d.drawCircle(cx, cy, 9, TEMA_TEXTO_3);
+    d.drawCircle(cx, cy, 8, TEMA_TEXTO_3);
     const auto e = d.getTextStyle();
     d.setFont(tab5_fonte_suave(true, 16));
     d.setTextDatum(middle_center);
-    d.setTextColor(TFT_DARKGREY);
+    d.setTextColor(TEMA_TEXTO_3);
     d.drawString("?", cx, cy + 1);
     d.setTextStyle(e);
     tab5_fonte_corpo(d);
   } else if (envio == CONVERSA_ENVIO_FALHOU) {
-    d.drawLine(cx - 6, cy - 6, cx + 6, cy + 6, TFT_RED);
-    d.drawLine(cx - 6, cy + 6, cx + 6, cy - 6, TFT_RED);
-    d.drawLine(cx - 5, cy - 6, cx + 7, cy + 6, TFT_RED);
-    d.drawLine(cx - 5, cy + 6, cx + 7, cy - 6, TFT_RED);
+    d.drawLine(cx - 6, cy - 6, cx + 6, cy + 6, TEMA_PERIGO);
+    d.drawLine(cx - 6, cy + 6, cx + 6, cy - 6, TEMA_PERIGO);
+    d.drawLine(cx - 5, cy - 6, cx + 7, cy + 6, TEMA_PERIGO);
+    d.drawLine(cx - 5, cy + 6, cx + 7, cy - 6, TEMA_PERIGO);
   }
 }
 
@@ -204,6 +220,14 @@ static void marca_envio(lgfx::LovyanGFX& d, int cx, int cy, uint8_t envio)
 // Devolve true quando a ESTRUTURA mudou (quantidade ou altura de algum balao):
 // ai a lista inteira se reorganiza. Senao, so os baloes que mudaram (a marca
 // de envio, tipicamente) sao anotados para repintar.
+// O TAMANHO DA LETRA dos baloes (conversa_t.escala; 0 = 1). O passo de linha
+// acompanha a fonte, como manda a regra das MEDIDAS acima.
+static float esc(const conversa_t* c)        { return c->escala > 0 ? c->escala : 1.0f; }
+static float tam_msg(const conversa_t* c)    { return TAM_MSG * esc(c); }
+static float tam_nome(const conversa_t* c)   { return TAM_NOME * esc(c); }
+static float tam_meta(const conversa_t* c)   { return TAM_META * esc(c); }
+static int   linha_step(const conversa_t* c) { return (int)(LINHA_STEP * esc(c) + 0.5f); }
+
 static int hora_a(const balao_t* b) { return tab5_hora_valida(b->quando) ? HORA_A : 0; }
 
 static uint32_t assinatura(const conversa_msg_t* m, int larg)
@@ -233,11 +257,11 @@ static bool medir(conversa_t* c, lgfx::LovyanGFX& d, int larg)
   c->n = n;
 
   const auto estilo = d.getTextStyle();
-  tab5_texto(d, TAM_NOME);
+  tab5_texto(d, tam_nome(c));
   const int alt_nome = d.fontHeight();
-  tab5_texto(d, TAM_META);
+  tab5_texto(d, tam_meta(c));
   const int alt_meta = d.fontHeight();
-  const int respiro = LINHA_STEP / 4;
+  const int respiro = linha_step(c) / 4;
 
   bool estrutura = (n != n_antes);
   int dia_ant = 0;
@@ -253,7 +277,7 @@ static bool medir(conversa_t* c, lgfx::LovyanGFX& d, int larg)
     b->quando = m.quando;
     b->cor_nome = m.cor_nome;
     b->cor_meta = m.cor_meta;
-    const uint32_t as = assinatura(&m, larg);
+    const uint32_t as = assinatura(&m, larg ^ ((int)(esc(c) * 100) << 16));   // a escala tambem mede
     if (i < n_antes && b->assin == as) {
       // Mesmo conteudo: medidas valem. So o divisor de dia, que depende do vizinho.
       b->inicio_dia = false;
@@ -278,7 +302,7 @@ static bool medir(conversa_t* c, lgfx::LovyanGFX& d, int larg)
 
     char txt[CONVERSA_TEXTO];
     tab5_emoji_preparar(m.texto, txt, sizeof(txt));
-    tab5_texto(d, TAM_MSG);
+    tab5_texto(d, tam_msg(c));
     b->n_linhas = (uint8_t)conversa_quebrar_linhas(d, txt, teto - 24, b->linhas, CONVERSA_MAX_LINHAS);
 
     int bl = 24;
@@ -287,12 +311,12 @@ static bool medir(conversa_t* c, lgfx::LovyanGFX& d, int larg)
       if (lw > bl) { bl = lw; }
     }
     if (b->nome[0]) {
-      tab5_texto(d, TAM_NOME);
+      tab5_texto(d, tam_nome(c));
       const int lw = (int)d.textWidth(b->nome) + 24;
       if (lw > bl) { bl = lw; }
     }
     if (b->meta[0]) {
-      tab5_texto(d, TAM_META);
+      tab5_texto(d, tam_meta(c));
       const int lw = (int)d.textWidth(b->meta) + 24;
       if (lw > bl) { bl = lw; }
     }
@@ -301,7 +325,7 @@ static bool medir(conversa_t* c, lgfx::LovyanGFX& d, int larg)
     b->nome_a = b->nome[0] ? (int16_t)(alt_nome + respiro) : 0;
     b->meta_a = b->meta[0] ? (int16_t)(alt_meta + respiro) : 0;
     b->bl = (int16_t)bl;
-    b->ba = (int16_t)(24 + b->n_linhas * LINHA_STEP + b->nome_a + b->meta_a);
+    b->ba = (int16_t)(24 + b->n_linhas * linha_step(c) + b->nome_a + b->meta_a);
 
     // Divisor antes da primeira mensagem de cada dia. Sem data (relogio nao
     // acertado quando ela chegou) nao abre dia - senao virava 31/12/1969.
@@ -335,7 +359,9 @@ static void balao_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int larg, v
 
   const int bx = b->minha ? (x0 + larg - b->bl - 16) : (x0 + 16);
   const uint16_t cor = cor_balao(d, b->minha);
-  d.fillRoundRect(bx, y, b->bl, b->ba, 10, cor);
+  // Balao alto leva o canto grande; o baixo (uma linha) o medio, para nao virar pilula.
+  const int raio = (b->ba >= 4 * TEMA_RAIO_G) ? TEMA_RAIO_G : TEMA_RAIO_M;
+  d.fillRoundRect(bx, y, b->bl, b->ba, raio, cor);
 
   // Recorte no proprio balao (dentro do da faixa): um emoji no fim da linha
   // nao pinta o vao ate o proximo.
@@ -350,18 +376,18 @@ static void balao_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int larg, v
     d.setTextDatum(top_left);
     int cur = y + 14;
     if (b->nome[0]) {
-      tab5_texto(d, TAM_NOME);
-      d.setTextColor(b->cor_nome ? b->cor_nome : (uint16_t)TFT_SKYBLUE, cor);
+      tab5_texto(d, tam_nome(c));
+      d.setTextColor(b->cor_nome ? b->cor_nome : (uint16_t)TEMA_DESTAQUE, cor);
       d.drawString(b->nome, bx + 12, cur);
       cur += b->nome_a;
     }
-    tab5_texto(d, TAM_MSG);
-    d.setTextColor(TFT_WHITE, cor);
-    for (int k = 0; k < b->n_linhas; ++k) { d.drawString(b->linhas[k], bx + 12, cur + k * LINHA_STEP); }
-    cur += b->n_linhas * LINHA_STEP + LINHA_STEP / 4;
+    tab5_texto(d, tam_msg(c));
+    d.setTextColor(TEMA_TEXTO, cor);
+    for (int k = 0; k < b->n_linhas; ++k) { d.drawString(b->linhas[k], bx + 12, cur + k * linha_step(c)); }
+    cur += b->n_linhas * linha_step(c) + linha_step(c) / 4;
     if (b->meta[0]) {
-      tab5_texto(d, TAM_META);
-      d.setTextColor(b->cor_meta ? b->cor_meta : (uint16_t)TFT_DARKGREY, cor);
+      tab5_texto(d, tam_meta(c));
+      d.setTextColor(b->cor_meta ? b->cor_meta : (uint16_t)TEMA_TEXTO_2, cor);
       d.drawString(b->meta, bx + 12, cur);
     }
     d.setClipRect(cx, cy, cl, ca);
@@ -376,7 +402,7 @@ static void balao_desenhar(lgfx::LovyanGFX& d, int i, int x0, int y, int larg, v
     const int hy = y + b->ba;
     d.fillRect(x0, hy, larg, HORA_A, fundo(d));
     tab5_texto(d, TAM_HORA);
-    d.setTextColor(TFT_DARKGREY, fundo(d));
+    d.setTextColor(TEMA_TEXTO_3, fundo(d));
     d.setTextDatum(b->minha ? top_right : top_left);
     d.drawString(hora, b->minha ? bx + b->bl - 6 : bx + 6, hy + 3);
     d.setTextDatum(top_left);
@@ -396,7 +422,6 @@ void conversa_abrir(conversa_t* c, pintura_t* p, conversa_contar_t contar, conve
   c->bal = bal; c->cap = cap;
   c->contar = contar; c->ler = ler; c->enviar = enviar; c->ctx = ctx; c->p = p;
   c->medir = true;
-  tecvirt_frase(&c->kb, true);   // texto corrido: maiuscula no inicio de frase
   c->barra_base = c->barra_modo = c->barra_larg = c->barra_cursor = c->barra_topo = c->barra_env = -1;
   lista_definir(&c->lista, ROLAGEM_FIM, 0, balao_altura, balao_desenhar, c);
 }
@@ -409,6 +434,15 @@ void conversa_fechar(conversa_t* c)
 }
 
 void conversa_mudou(conversa_t* c) { c->medir = true; sistema_pedir_redesenho(); }
+
+void conversa_escala(conversa_t* c, float escala)
+{
+  if (escala == c->escala) { return; }
+  c->escala = escala;
+  c->medir = true;   // a assinatura de cada balao leva a escala: todos re-medem
+  if (c->p) { pintura_pedir(c->p); }
+  sistema_pedir_redesenho_completo();
+}
 
 bool conversa_teclado_aberto(const conversa_t* c) { return tecvirt_aberto(&c->kb); }
 
@@ -445,21 +479,8 @@ void conversa_trocar(conversa_t* c)
 // ---------------------------------------------------------------------------
 // EDICAO DO RASCUNHO - sempre no cursor, sempre em fronteira de caractere UTF-8
 // ---------------------------------------------------------------------------
-static int utf8_anterior(const char* s, int i)
-{
-  if (i <= 0) { return 0; }
-  --i;
-  while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) { --i; }
-  return i;
-}
-
-static int utf8_seguinte(const char* s, int i)
-{
-  if (!s[i]) { return i; }
-  ++i;
-  while (s[i] && ((unsigned char)s[i] & 0xC0) == 0x80) { ++i; }
-  return i;
-}
+static int utf8_anterior(const char* s, int i) { return tab5_utf8_anterior(s, i); }
+static int utf8_seguinte(const char* s, int i) { return tab5_utf8_seguinte(s, i); }
 
 static void cursor_ajustar(conversa_t* c)
 {
@@ -531,7 +552,7 @@ static int quebrar_offsets(lgfx::LovyanGFX& d, const char* s, int largura_px, in
     int j = i;
     for (;;) {
       int fim = j;
-      while (s[fim] && s[fim] != ' ') { ++fim; }
+      while (s[fim] && s[fim] != ' ' && s[fim] != '\n') { ++fim; }
       int prox = fim;
       while (s[prox] == ' ') { ++prox; }
       if (fim == j && !s[fim]) { j = len; break; }
@@ -543,6 +564,8 @@ static int quebrar_offsets(lgfx::LovyanGFX& d, const char* s, int largura_px, in
         memcpy(teste, s + i, tam); teste[tam] = 0;
         cabe = (int)d.textWidth(teste) <= largura_px;
       }
+      // A linha nova (o \n) termina a linha e fica nela.
+      if (cabe && s[fim] == '\n') { bom = fim + 1; break; }
       if (cabe) { bom = prox; j = prox; if (!s[prox]) { break; } }
       else { break; }
     }
@@ -565,6 +588,8 @@ static int quebrar_offsets(lgfx::LovyanGFX& d, const char* s, int largura_px, in
     i = bom;
     if (i < len) { ini[n++] = (int16_t)i; }
   }
+  // Texto terminando em \n: o cursor do fim fica numa linha nova, vazia.
+  if (len > 0 && s[len - 1] == '\n' && n < max) { ini[n++] = (int16_t)len; }
   ini[n] = (int16_t)len;
   return n;
 }
@@ -582,8 +607,8 @@ static void botao_enviar(lgfx::LovyanGFX& d, int x, int y, int l, int a, uint16_
   tab5_tela_limpar(x, y, l, a, fundo);
   const int raio = (l < a ? l : a) / 2;
   const int cx = x + l / 2, cy = y + a / 2;
-  d.fillCircle(cx, cy, raio, aceso ? cor : d.color565(60, 64, 72));
-  const uint16_t tinta = aceso ? d.color565(44, 45, 60) : d.color565(120, 126, 138);
+  d.fillCircle(cx, cy, raio, aceso ? cor : (uint16_t)TEMA_SUPERFICIE_ALTA);
+  const uint16_t tinta = aceso ? (uint16_t)TEMA_SOBRE_DESTAQUE : (uint16_t)TEMA_TEXTO_3;
   // Proporcoes em fracao do raio; a ponta puxa o desenho 1/12 para a direita
   // para ele parecer centrado (o peso visual fica atras, no entalhe).
   const int ox = cx + raio / 12;
@@ -615,8 +640,8 @@ void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,
   if (c->n == 0 && completo) {
     tab5_texto(d, 3.0f);
     d.setTextDatum(middle_center);
-    d.setTextColor(TFT_DARKGREY, FUNDO);
-    d.drawString("nenhuma mensagem ainda", r.x + r.largura / 2, r.y + (base - r.y) / 2);
+    d.setTextColor(TEMA_TEXTO_3, FUNDO);
+    d.drawString(tr("nenhuma mensagem ainda"), r.x + r.largura / 2, r.y + (base - r.y) / 2);
     d.setTextDatum(top_left);
   }
 
@@ -625,7 +650,7 @@ void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,
                     : c->rascunho[0] ? c->rascunho
                     // A dica diz a verdade do caso: com teclado encaixado o toque
                     // nao abre nada (nao rouba meia tela).
-                    : (tab5_teclado_presente() ? "digite no teclado; ENTER envia" : "toque para escrever");
+                    : (tab5_teclado_presente() ? tr("digite no teclado; ENTER envia") : tr("toque para escrever"));
   const int campo_l = r.largura - 24 - ENV_L;
   const bool eh_rascunho = pode_escrever && c->rascunho[0];
   c->disp = &d;
@@ -673,11 +698,11 @@ void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,
     const bool env  = tudo || m8;
     if (tudo) { tab5_tela_limpar(r.x, base, r.largura, ESCRITA_A, FUNDO); }
     else      { tab5_tela_limpar(r.x, base, r.largura - ENV_L, ESCRITA_A, FUNDO); }
-    d.fillRoundRect(r.x + 12, base + 6, campo_l, ESCRITA_A - 12, 10, pode_escrever ? TFT_DARKGREY : FUNDO);
-    if (!pode_escrever) { d.drawRoundRect(r.x + 12, base + 6, campo_l, ESCRITA_A - 12, 10, TFT_DARKGREY); }
+    d.fillRoundRect(r.x + 12, base + 6, campo_l, ESCRITA_A - 12, TEMA_RAIO_M, pode_escrever ? TEMA_SUPERFICIE_ALTA : FUNDO);
+    d.drawRoundRect(r.x + 12, base + 6, campo_l, ESCRITA_A - 12, TEMA_RAIO_M, TEMA_LINHA);
     tab5_texto(d, TAM_ESCRITA);
     d.setTextDatum(top_left);
-    d.setTextColor(pode_escrever ? TFT_WHITE : TFT_DARKGREY, pode_escrever ? TFT_DARKGREY : FUNDO);
+    d.setTextColor(pode_escrever ? (uint16_t)TEMA_TEXTO : (uint16_t)TEMA_TEXTO_3, pode_escrever ? (uint16_t)TEMA_SUPERFICIE_ALTA : FUNDO);
     // Linhas centradas no campo pela altura REAL da fonte (uma linha so fica
     // no meio; duas dividem o campo) - o passo fixo antigo deixava a segunda
     // encostada na borda de baixo.
@@ -692,6 +717,7 @@ void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,
       const int ini = c->bar_ini[topo + k], fim = c->bar_ini[topo + k + 1];
       int tam = fim - ini;
       if (tam >= CONVERSA_LINHA_BYTES) { tam = CONVERSA_LINHA_BYTES - 1; }
+      while (tam > 0 && fonte[ini + tam - 1] == '\n') { --tam; }   // a linha nova nao se desenha
       memcpy(lin, fonte + ini, tam); lin[tam] = 0;
       d.drawString(lin, r.x + 24, y0 + k * passo);
     }
@@ -705,13 +731,13 @@ void conversa_desenhar(conversa_t* c, lgfx::LovyanGFX& d, const area_t& r,
       memcpy(pre, fonte + ini, tam); pre[tam] = 0;
       int cx = r.x + 24 + (int)d.textWidth(pre) + 2;
       if (cx > r.x + 12 + campo_l - 6) { cx = r.x + 12 + campo_l - 6; }
-      d.fillRect(cx, y0 + k * passo, 3, fa, TFT_GREENYELLOW);
+      d.fillRect(cx, y0 + k * passo, 3, fa, TEMA_DESTAQUE);
     }
     // Sem botao de enviar quando nao da para enviar: um botao que nao funciona e pior que
     // a ausencia dele.
     if (pode_escrever && env) {
       botao_enviar(d, r.x + r.largura - ENV_L, base + 6, ENV_L - 14, ESCRITA_A - 12,
-                   c->cor_enviar ? c->cor_enviar : (uint16_t)TFT_GREENYELLOW, eh_rascunho, FUNDO);
+                   c->cor_enviar ? c->cor_enviar : (uint16_t)TEMA_DESTAQUE, eh_rascunho, FUNDO);
     }
   }
 
@@ -737,6 +763,8 @@ static void aplicar_tecla(conversa_t* c, int acao)
     return;
   }
   if (acao == TECVIRT_APAGAR) { apagar_antes(c); contexto(c); sistema_pedir_redesenho(); return; }
+  // A tecla de acao e NOVA LINHA, como no WhatsApp: quem envia e o botao da barra.
+  if (acao == TECVIRT_LINHA)  { inserir(c, "\n", 1); contexto(c); sistema_pedir_redesenho(); return; }
   if (acao == TECVIRT_ENVIAR) { enviar_rascunho(c); }
   if (acao == TECVIRT_ENVIAR || acao == TECVIRT_FECHAR) { fechar_teclado(c); }
 }
@@ -749,6 +777,45 @@ static void para_tela(int x, int y, int* xs, int* ys)
   *ys = a.y + y;
 }
 
+// Onde comeca a barra de escrita (tela): sobe junto com o teclado aberto.
+static int base_escrita(const conversa_t* c)
+{
+  return c->ret.y + c->ret.altura - ESCRITA_A - (tecvirt_aberto(&c->kb) ? tecvirt_altura(area_tec(c)) : 0);
+}
+
+// COLAR: o texto da area de transferencia entra no cursor. A quebra de linha
+// fica (a conversa tem linhas); tabulacao e os outros controles viram espaco.
+static void colar(conversa_t* c)
+{
+  char t[CONVERSA_TEXTO];
+  const size_t n = transf_colar(t, sizeof(t));
+  if (!n) { return; }
+  for (size_t i = 0; i < n; ++i) { if ((unsigned char)t[i] < 0x20 && t[i] != '\n') { t[i] = ' '; } }
+  inserir(c, t, n);
+  contexto(c);
+  sistema_recado(tr("Colado"));
+  sistema_pedir_redesenho();
+}
+
+// SEGURAR: num balao copia o texto da mensagem; na barra de escrita, cola.
+static void segurar(conversa_t* c, int x, int y)
+{
+  int xs, ys;
+  para_tela(x, y, &xs, &ys);
+  if (tecvirt_contem(&c->kb, xs, ys)) { return; }
+  sistema_consumir_toque();
+  if (ys >= base_escrita(c)) {
+    if (c->pode_escrever) { colar(c); }
+    return;
+  }
+  static conversa_msg_t m;   // so a tarefa de interface
+  const int i = lista_item_em(&c->lista, x, y, nullptr);
+  if (i >= 0 && c->ler(i, &m, c->ctx) && m.texto[0]) {
+    transf_copiar(m.texto);
+    sistema_recado(tr("Copiado"));
+  }
+}
+
 // O teclado (dedos, retorno da tecla, soltura) e do sistema: aqui so se
 // aplicam as teclas que ele confirmou nesta amostra.
 void conversa_tocar_nivel(conversa_t* c, int x, int y, bool pressionado)
@@ -756,6 +823,7 @@ void conversa_tocar_nivel(conversa_t* c, int x, int y, bool pressionado)
   int acoes[8];
   const int n = tecvirt_nivel(&c->kb, acoes, 8);
   for (int i = 0; i < n && tecvirt_aberto(&c->kb); ++i) { aplicar_tecla(c, acoes[i]); }
+  if (toque_longo(&c->lp, x, y, pressionado)) { segurar(c, x, y); }
 
   // Rolagem dos baloes (a janela da lista ja termina acima da barra e do teclado).
   if (lista_arrastar(&c->lista, x, y, pressionado)) { sistema_pedir_redesenho(); }
@@ -776,7 +844,7 @@ static void cursor_no_toque(conversa_t* c, int xs, int ys)
   // Nas linhas que nao sao a ultima, o espaco de quebra e da linha mas o
   // cursor depois dele seria desenhado na linha de baixo: para no ultimo
   // caractere visivel.
-  if (lin + 1 < c->bar_n) { while (fim > ini && c->rascunho[fim - 1] == ' ') { --fim; } }
+  if (lin + 1 < c->bar_n) { while (fim > ini && (c->rascunho[fim - 1] == ' ' || c->rascunho[fim - 1] == '\n')) { --fim; } }
 
   lgfx::LovyanGFX& d = *c->disp;
   tab5_texto(d, TAM_ESCRITA);
@@ -815,7 +883,7 @@ void conversa_tocar(conversa_t* c, int x, int y)
 
   // Barra de escrita: o botao da seta envia; o campo abre o teclado virtual (so sem o
   // fisico encaixado - com ele, nao roubamos meia tela).
-  const int base = r.y + r.altura - ESCRITA_A - (tecvirt_aberto(&c->kb) ? tecvirt_altura(area_tec(c)) : 0);
+  const int base = base_escrita(c);
   if (ys >= base && ys < base + ESCRITA_A && c->pode_escrever) {
     if (xs >= r.x + r.largura - ENV_L) {
       enviar_rascunho(c);
@@ -823,7 +891,7 @@ void conversa_tocar(conversa_t* c, int x, int y)
     } else if (tecvirt_aberto(&c->kb)) {
       cursor_no_toque(c, xs, ys);
     } else if (!tab5_teclado_presente()) {
-      tecvirt_abrir(&c->kb);            // trava o INICIO; o dedo que abriu nao digita
+      tecvirt_abrir(&c->kb, TECVIRT_PARAGRAFO);   // nova linha na tecla verde; envia pelo botao da barra
       cursor_no_toque(c, xs, ys);       // o mesmo toque que abre ja posiciona o cursor
       contexto(c);                      // rascunho vazio: ja abre com a maiuscula armada
       pedir_completo(c);
@@ -890,7 +958,7 @@ static void linha_vizinha(conversa_t* c, bool baixo)
   int fim = c->bar_ini[alvo + 1];
   // O espaco da quebra pertence a linha mas o cursor depois dele cairia na
   // linha de baixo: para no ultimo caractere visivel (como no toque).
-  if (alvo + 1 < n) { while (fim > i && c->rascunho[fim - 1] == ' ') { --fim; } }
+  if (alvo + 1 < n) { while (fim > i && (c->rascunho[fim - 1] == ' ' || c->rascunho[fim - 1] == '\n')) { --fim; } }
   for (int k2 = 0; k2 < col && i < fim; ++k2) { i = utf8_seguinte(c->rascunho, i); }
   c->cursor = i;
 }
@@ -900,7 +968,10 @@ void conversa_teclar(conversa_t* c, const char* texto, uint8_t codigo, uint8_t m
   if (!c->pode_escrever) { return; }
   const bool ctrl = (mod & TAB5_TECLA_CTRL) != 0;
   switch (codigo) {
-    case TAB5_TECLA_ENTER:  enviar_rascunho(c); fechar_teclado(c); return;
+    // Enter envia (como no PC); Shift+Enter e linha nova.
+    case TAB5_TECLA_ENTER:
+      if (mod & TAB5_TECLA_SHIFT) { inserir(c, "\n", 1); contexto(c); sistema_pedir_redesenho(); return; }
+      enviar_rascunho(c); fechar_teclado(c); return;
     case TAB5_TECLA_APAGAR: apagar_antes(c);  sistema_pedir_redesenho(); return;
     case TAB5_TECLA_DEL:    apagar_depois(c); sistema_pedir_redesenho(); return;
     // Esc limpa o rascunho inteiro (o cursor volta ao comeco).
@@ -928,6 +999,7 @@ void conversa_teclar(conversa_t* c, const char* texto, uint8_t codigo, uint8_t m
     default: break;
   }
   // Com Ctrl ou Alt e atalho, nao texto: um "Ctrl+c" nao pode virar um "c".
+  if (ctrl && texto && (texto[0] == 'v' || texto[0] == 'V')) { colar(c); return; }
   if (mod & (TAB5_TECLA_CTRL | TAB5_TECLA_ALT)) { return; }
   // Controle nao vira caractere. Uma sequencia acentuada vem com mais de um
   // byte e entra inteira (ou nao entra) - inserir() nunca corta no meio dela.

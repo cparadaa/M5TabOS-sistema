@@ -1,4 +1,4 @@
-// LISTA ROLAVEL - o primeiro componente padrao da nova base (COMPOSITOR.md,
+// LISTA ROLAVEL - o primeiro componente padrao da nova base (docs/COMPOSITOR.md,
 // etapa 3b). Mesma ideia da lista da LVGL e de qualquer sistema de celular:
 //
 //   O ITEM E MEDIDO UMA VEZ, QUANDO MUDA. A LISTA GUARDA O RESULTADO.
@@ -14,7 +14,7 @@
 // media TODAS as mensagens a cada passo de rolagem (quebra de linha, emoji,
 // mutex do servico) so para descobrir alturas que nao tinham mudado.
 //
-// Uso (TODA lista rolavel do sistema segue isto - ver ESCREVENDO_APPS.md):
+// Uso (TODA lista rolavel do sistema segue isto - ver docs/ESCREVENDO_APPS.md):
 //   static lista_t s_l;
 //   // ao abrir:  lista_definir(&s_l, ROLAGEM_INICIO, n_itens, altura_de, desenhar_item, ctx);
 //   // itens mudaram (entrou, saiu, re-medido):  lista_itens_mudaram(&s_l, n);
@@ -95,3 +95,6 @@ bool lista_arrastar(lista_t* l, int x, int y, bool pressionado);
 // dentro do item, o dedo caiu (0 = topo do item), para botoes dentro do item.
 #define LISTA_ARRASTE (-2)
 int  lista_item_tocado(lista_t* l, int x, int y, int* dy);
+// O item sob (x, y) agora, sem a regra do arraste - para o toque longo, com o
+// dedo ainda na tela. -1 = nenhum.
+int  lista_item_em(lista_t* l, int x, int y, int* dy);

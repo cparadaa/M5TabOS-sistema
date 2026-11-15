@@ -89,12 +89,6 @@ typedef struct {
   uint8_t mod;      // TAB5_TECLA_CTRL/SHIFT/ALT
 } tab5_tecla_t;
 
-// Vontade do usuario (Ajustes), empurrada de fora - HAL nao pergunta a
-// nenhum servico sozinho (ver o aviso grande sobre s_habilitado no .cpp).
-// Chamar ANTES de tab5_teclado_iniciar() no boot, e de novo sempre que o
-// Ajustes mudar o ajuste em tempo de execucao.
-void tab5_teclado_habilitar(bool ligado);
-
 // Reaponta o I2C externo e coloca o teclado em modo HID. Devolve false se
 // ninguem responder em 0x6D - sem teclado o sistema segue normal.
 // Chamar da tarefa de interface (e ela quem manda no I2C).
@@ -112,7 +106,8 @@ bool tab5_teclado_ler(tab5_tecla_t* ev);
 bool tab5_teclado_segurando(void);
 
 // PARA ACORDAR DO REPOUSO: ha tecla esperando na fila? (uma transacao I2C,
-// nao consome nada). false sem teclado.
+// nao consome nada). Sem teclado conhecido e com o G50 em baixo, procura um
+// recem-encaixado antes. false sem teclado.
 bool tab5_teclado_pendente(void);
 
 // Joga fora a fila inteira e o que estava a meio (tecla morta, tecla
@@ -124,9 +119,6 @@ void tab5_teclado_descartar(void);
 // senha com apostrofo seguido de vogal nao pode virar letra acentuada e
 // sumir. Texto sem composicao sai igual.
 void tab5_teclado_ascii(const char* texto, char* saida, size_t tam);
-
-// Brilho da luz de fundo do teclado, 0..255.
-void tab5_teclado_brilho(uint8_t v);
 
 // Versao de firmware do STM32 do teclado (0 se nao leu).
 uint8_t tab5_teclado_versao(void);

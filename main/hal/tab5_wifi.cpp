@@ -1,4 +1,5 @@
 #include "tab5_wifi.hpp"
+#include "idioma.h"
 #include "tab5_donos.hpp"
 
 #include <string.h>
@@ -22,10 +23,14 @@
 #include "esp_mac.h"
 #include <unistd.h>
 #include "esp_random.h"
+#include "esp_timer.h"
+#include "esp_memory_utils.h"   // esp_ptr_external_ram
+#include "nvs.h"
 
 #include "tab5_power.hpp"
 #include "tab5_sd.hpp"
 #include "tab5_monitor.hpp"   // tab5_mem_marco
+#include <atomic>
 
 static const char *TAG = "wifi";
 
@@ -42,7 +47,7 @@ static const char *TAG = "wifi";
 // possivel, justamente no aparelho onde autonomia e o problema.
 #define MAX_TENTATIVAS      5
 
-enum comando_t { CMD_LIGAR, CMD_DESLIGAR, CMD_VARRER, CMD_SO_RADIO, CMD_ROTEADOR, CMD_ECONOMIA, CMD_PILHA, CMD_PROCURAR, CMD_TROCAR, CMD_RECONECTAR };
+enum comando_t { CMD_LIGAR, CMD_DESLIGAR, CMD_SO_RADIO, CMD_ROTEADOR, CMD_ECONOMIA, CMD_PILHA, CMD_PROCURAR, CMD_TROCAR, CMD_RECONECTAR };
 
 static QueueHandle_t s_fila     = nullptr;
 static esp_netif_t*  s_netif    = nullptr;
@@ -63,7 +68,7 @@ static volatile bool s_c6_nosso    = false;   // o C6 respondeu ao peer_data: fi
 static bool          s_c6_enlace   = false;
 static volatile tab5_wifi_estado_t s_estado = TAB5_WIFI_DESLIGADO;
 static volatile int8_t s_rssi   = TAB5_WIFI_RSSI_DESCONHECIDO;
-static volatile int s_tentativas = 0;   // tarefa do Wi-Fi e tarefa de eventos
+static std::atomic<int> s_tentativas = 0;   // tarefa do Wi-Fi e tarefa de eventos
 // O USUARIO QUER WIFI. Liga em tab5_wifi_ligar/conectar e desliga SO em
 // tab5_wifi_desligar (Ajustes, Radar) - a desistencia longe do roteador para o
 // radio mas NAO mexe aqui. E o que separa "desligado de proposito" de "desistiu
@@ -79,11 +84,17 @@ static volatile bool s_querer = false;
 #define RETOMAR_MAX_MS  300000u
 static uint32_t s_retomar_ms    = 0;   // proxima procura (0 = nao agendada)
 static uint32_t s_retomar_passo = 0;
-static volatile bool s_descendo = false;   // distingue queda de verdade de stop() nosso (lido pela tarefa de eventos)
-// MODO SO RADIO: rádio ligado, SEM roteador - para o ESP-NOW usar
-// um canal que nao e o do roteador (o radio so fica num canal por vez). Nao
-// reconecta, e nao desiste-e-para-o-radio como faria fora do alcance do roteador.
-static volatile bool s_so_radio = false;
+// O QUE A TAREFA DO WI-FI QUER DO RADIO AGORA - a unica coisa que a tarefa de
+// eventos consulta para decidir se uma queda e falha e se o STA_START conecta.
+// Os eventos chegam DEPOIS de quem os provocou; por isso e um estado que dura
+// ate o proximo pedido, e nunca uma bandeira ligada so em volta de uma chamada.
+//   PARADO    desligado de proposito (ou desistiu): queda nao reconecta
+//   PROCURAR  varrendo: o STA_START nao conecta (a associacao abortaria o scan)
+//   SO_RADIO  radio ligado SEM roteador - o ESP-NOW num canal que nao e o do
+//             roteador (o radio so fica num canal por vez); nao reconecta
+//   CONECTAR  quer a rede s_ssid: queda dela conta tentativa e reconecta
+enum modo_t { MODO_PARADO, MODO_PROCURAR, MODO_SO_RADIO, MODO_CONECTAR };
+static volatile modo_t s_modo = MODO_PARADO;
 // O RADIO ESTA INICIADO (esp_wifi_start) - com ou sem roteador. E o que o
 // ESP-NOW precisa, e NAO e o mesmo que o enlace: desligar o WiFi em Ajustes (ou
 // a desistencia fora do alcance do roteador) para o radio com o C6 alimentado e o enlace de
@@ -101,17 +112,58 @@ static void (* volatile s_ao_subir)(void) = nullptr;   // ver tab5_wifi_ao_subir
 static volatile uint32_t s_acordado = 0;   // pedidos de "receptor sempre ligado"
 static int s_ps_aplicado = -1;             // o ultimo WIFI_PS_* mandado ao C6 (-1 = nenhum)
 
+// EM REPOUSO, ECONOMIA MAXIMA. Medido com 'energia ensaio' (2026-10-16): o
+// Wi-Fi conectado em modem sleep minimo custava 28 mA dos 74 do repouso - 40%
+// da bateria com a tela apagada. Com a tela apagada ninguem espera resposta na
+// hora: WIFI_PS_MAX_MODEM acorda o C6 a cada LISTEN_INTERVAL beacons (~1 s) em
+// vez de todo beacon, e o roteador guarda o que chegar nesse meio tempo (o
+// MQTT do Mesh chega com ate ~1 s de atraso). Acordado volta ao minimo; um
+// pedido de receptor ligado (ESP-NOW conversando, CSI, farejo) vence os dois.
+#define LISTEN_INTERVAL 10
+static bool s_ps_repouso = false;   // o repouso que aplicar_economia() viu por ultimo
+
+// TELA ACESA: CAPACIDADE QUANDO HA TRAFEGO. O mesmo desenho dos celulares (o
+// "power save dinamico"): com pacote passando, o rádio fica acordado (sem
+// power save - menor latencia, maior vazao); TRAFEGO_SEGURA_MS sem pacote, volta
+// ao modem sleep minimo (acorda a cada beacon). Quem conta e o transporte do
+// esp_hosted (CONFIG_ESP_HOSTED_HOST_PKT_STATS: 7 contadores, mesma forma de
+// eh_host_pkt_stats.h). Vale para qualquer C6: e so o esp_wifi_set_ps de sempre.
+#if CONFIG_ESP_HOSTED_HOST_PKT_STATS
+struct pkt_stats_espelho_t { uint32_t tx_in, tx_trans, tx_out, tx_drop, rx_in, rx_out, stalls; };
+extern "C" pkt_stats_espelho_t pkt_stats;
+static uint32_t pacotes_agora(void) { return pkt_stats.rx_in + pkt_stats.tx_out; }
+#else
+static uint32_t pacotes_agora(void) { return 0; }
+#endif
+static const uint32_t TRAFEGO_PACOTES   = 4;      // numa volta (~250 ms): "ha trafego"
+static const uint32_t TRAFEGO_SEGURA_MS = 2000;   // sem pacote por isto: volta ao power save
+static uint32_t s_pacotes_ant = 0;
+static uint32_t s_trafego_ate = 0;                // ms (tick) ate quando conta como "com trafego"
+
+static uint32_t agora_ms(void) { return (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount()); }
+
 // So com o esp_wifi iniciado (subir_pilha, ou o comando com a stack de pe).
 static void aplicar_economia(void)
 {
-  const int ps = s_acordado ? (int)WIFI_PS_NONE : (int)WIFI_PS_MIN_MODEM;
+  s_ps_repouso = tab5_power_em_repouso();
+  const uint32_t p = pacotes_agora();
+  if (p - s_pacotes_ant >= TRAFEGO_PACOTES) { s_trafego_ate = agora_ms() + TRAFEGO_SEGURA_MS; }
+  s_pacotes_ant = p;
+  const bool trafego = (int32_t)(s_trafego_ate - agora_ms()) > 0;
+  const int ps = s_acordado ? (int)WIFI_PS_NONE
+               : s_ps_repouso ? (int)WIFI_PS_MAX_MODEM
+               : trafego ? (int)WIFI_PS_NONE : (int)WIFI_PS_MIN_MODEM;
   if (ps == s_ps_aplicado) { return; }
   if (esp_wifi_set_ps((wifi_ps_type_t)ps) == ESP_OK) {
+    const bool so_trafego = !s_acordado && !s_ps_repouso;   // vai e volta a toda hora: so em debug
     s_ps_aplicado = ps;
-    ESP_LOGI(TAG, "radio: %s", s_acordado ? "receptor sempre ligado (pedido)" : "modem sleep (economia)");
+    if (so_trafego) {
+      ESP_LOGD(TAG, "radio: %s", trafego ? "acordado (trafego)" : "modem sleep (parado)");
+    } else {
+      ESP_LOGI(TAG, "radio: %s", s_acordado ? "receptor sempre ligado (pedido)" : "modem sleep maximo (repouso)");
+    }
   }
 }
-static bool s_varrendo   = false;   // suprime a reconexao automatica durante a varredura
 
 static char s_ssid[33] = { 0 };
 static char s_senha[65] = { 0 };
@@ -139,17 +191,23 @@ static char s_ip[16]   = "0.0.0.0";
 // por esptool. Secure boot e flash encryption ficam de fora de proposito -
 // queimam eFuse, sao irreversiveis e travam a regravacao por USB.
 //
-// CHAVE POR APARELHO: SHA-256 de um rotulo fixo + o MAC de fabrica (eFuse),
-// primeiros 16 bytes. Cada Tab5 tem a sua; o codigo publico nao carrega chave
-// nenhuma, e um cartao levado para outro Tab5 nao decifra la (a senha precisa
-// ser escrita de novo em texto - o sistema cifra sozinho no proximo boot).
+// A CHAVE: 16 BYTES SORTEADOS, GUARDADOS NA FLASH (NVS "seg"/"chave"),
+// sorteados uma vez no primeiro boot (tab5_wifi_chave_preparar, chamado por
+// ajustes_iniciar). Assim o que fica no cartao nao serve sem a flash deste
+// aparelho - e quem le a flash ja teria tudo de qualquer jeito.
 //
-// AES-128-CBC com IV aleatorio por gravacao (nunca reaproveitado - CBC com o
-// mesmo IV+chave duas vezes vaza padrao entre as duas cifras). O IV nao e
-// segredo: vai NA FRENTE do texto cifrado, os dois em hex numa linha so. PKCS7
-// preenche o ultimo bloco - o ultimo byte decifrado diz quantos bytes de
-// preenchimento cortar.
-static bool chave_do_aparelho(uint8_t chave[16])
+// ANTES a chave saia de um rotulo fixo + o MAC de fabrica. O rotulo esta no
+// codigo publico e o MAC nao e segredo (o USB-Serial-JTAG o entrega como
+// numero de serie a qualquer computador; e mesmo sem ele, com o prefixo da
+// Espressif sobram 2^24 tentativas - segundos num PC). Quem tivesse so o
+// cartao lia a senha. Esse formato ainda e LIDO (chave_legada) e regravado no
+// novo na mesma hora: no wifi.txt (ler_credenciais) e na lista MQTT
+// (ajustes.cpp, mq_carregar).
+//
+// O formato novo comeca por "k2" (fora do alfabeto hex: nunca se confunde com
+// o antigo); o resto e igual - IV + cifrado em hex.
+#define CIFRA_PREFIXO "k2"
+static bool chave_legada(uint8_t chave[16])
 {
   uint8_t mac[6];
   if (esp_efuse_mac_get_default(mac) != ESP_OK) { return false; }
@@ -165,9 +223,55 @@ static bool chave_do_aparelho(uint8_t chave[16])
   memcpy(chave, dig, 16);
   return true;
 }
+
+static uint8_t       s_chave[16];
+static volatile bool s_chave_ok = false;
+
+// Le a chave da NVS, ou sorteia e grava. Grava na flash: so de uma tarefa com
+// a pilha na RAM interna (o boot) - ver o aviso em ajustes.cpp (pilha_na_psram).
+bool tab5_wifi_chave_preparar(void)
+{
+  if (s_chave_ok) { return true; }
+  int aqui = 0;
+  if (esp_ptr_external_ram(&aqui)) { return false; }
+  nvs_handle_t h;
+  if (nvs_open("seg", NVS_READWRITE, &h) != ESP_OK) { return false; }
+  uint8_t k[16];
+  size_t t = sizeof(k);
+  bool ok = nvs_get_blob(h, "chave", k, &t) == ESP_OK && t == sizeof(k);
+  if (!ok) {
+    // O sorteio do chip, misturado com o relogio e o MAC: mesmo que uma fonte
+    // ande fraca no boot, a chave nao fica previsivel.
+    uint8_t sorteio[32];
+    esp_fill_random(sorteio, sizeof(sorteio));
+    const int64_t agora = esp_timer_get_time();
+    uint8_t mac[6] = { };
+    esp_efuse_mac_get_default(mac);
+    uint8_t dig[32];
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    mbedtls_sha256_update(&c, sorteio, sizeof(sorteio));
+    mbedtls_sha256_update(&c, (const uint8_t*)&agora, sizeof(agora));
+    mbedtls_sha256_update(&c, mac, sizeof(mac));
+    mbedtls_sha256_finish(&c, dig);
+    mbedtls_sha256_free(&c);
+    memcpy(k, dig, sizeof(k));
+    memset(sorteio, 0, sizeof(sorteio));
+    memset(dig, 0, sizeof(dig));
+    ok = nvs_set_blob(h, "chave", k, sizeof(k)) == ESP_OK && nvs_commit(h) == ESP_OK;
+    if (ok) { ESP_LOGI(TAG, "chave das senhas criada"); }
+  }
+  nvs_close(h);
+  if (ok) { memcpy(s_chave, k, sizeof(k)); s_chave_ok = true; }
+  memset(k, 0, sizeof(k));
+  if (!ok) { ESP_LOGE(TAG, "sem a chave das senhas na NVS - cifrando no formato antigo"); }
+  return ok;
+}
+
 #define CIFRA_BLOCO   16
 #define CIFRA_MAX_BRUTO 80   // sizeof(s_senha)-1 (64) arredondado para cima ao proximo bloco de 16
-#define CIFRA_MAX_HEX ((CIFRA_BLOCO + CIFRA_MAX_BRUTO) * 2 + 1)   // IV + cifrado, em hex
+#define CIFRA_MAX_HEX ((CIFRA_BLOCO + CIFRA_MAX_BRUTO) * 2 + 3)   // "k2" + IV + cifrado, em hex
 
 // true so quando 'texto' pode mesmo ser a saida de cifrar_senha() - usado para
 // distinguir uma senha CIFRADA (escrita por este firmware a partir de
@@ -181,6 +285,7 @@ static bool chave_do_aparelho(uint8_t chave[16])
 // nunca confundir).
 static bool parece_cifrado(const char* texto)
 {
+  if (!strncmp(texto, CIFRA_PREFIXO, 2)) { texto += 2; }
   const size_t n = strlen(texto);
   if (n < CIFRA_BLOCO * 2 * 2 || (n % 2) != 0) { return false; }
   for (size_t i = 0; i < n; ++i) {
@@ -208,24 +313,32 @@ static bool cifrar_senha(const char* claro, char* saida_hex, size_t tam_saida)
   memcpy(iv_trabalho, iv, sizeof(iv));   // mbedtls consome/atualiza o IV que recebe - guarda uma copia
 
   uint8_t chave[16];
-  if (!chave_do_aparelho(chave)) { return false; }
+  const bool nova = tab5_wifi_chave_preparar();
+  if (nova) { memcpy(chave, s_chave, sizeof(chave)); }
+  else if (!chave_legada(chave)) { return false; }
   mbedtls_aes_context ctx;
   mbedtls_aes_init(&ctx);
   mbedtls_aes_setkey_enc(&ctx, chave, 128);
+  memset(chave, 0, sizeof(chave));
   uint8_t cifrado[CIFRA_MAX_BRUTO];
   const int r = mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_ENCRYPT, bruto, iv_trabalho, buf, cifrado);
   mbedtls_aes_free(&ctx);
-  if (r != 0 || tam_saida < (size_t)(sizeof(iv) + bruto) * 2 + 1) { return false; }
+  if (r != 0 || tam_saida < (size_t)(sizeof(iv) + bruto) * 2 + 3) { return false; }
 
   // IV na frente, cifrado atras - tudo em hex, numa linha so.
   size_t p = 0;
+  if (nova) { p = (size_t)snprintf(saida_hex, tam_saida, "%s", CIFRA_PREFIXO); }
   for (size_t i = 0; i < sizeof(iv); ++i) { p += (size_t)snprintf(saida_hex + p, tam_saida - p, "%02x", iv[i]); }
   for (size_t i = 0; i < bruto;       ++i) { p += (size_t)snprintf(saida_hex + p, tam_saida - p, "%02x", cifrado[i]); }
   return true;
 }
 
-static bool decifrar_senha(const char* hex, char* saida, size_t tam_saida)
+// 'legado' (opcional) = true quando veio no formato antigo: quem leu regrava.
+static bool decifrar_senha(const char* hex, char* saida, size_t tam_saida, bool* legado = nullptr)
 {
+  const bool nova = !strncmp(hex, CIFRA_PREFIXO, 2);
+  if (nova) { hex += 2; }
+  if (legado) { *legado = !nova; }
   const size_t hl = strlen(hex);
   const size_t bruto_bytes = hl / 2;
   if (hl < CIFRA_BLOCO * 2 * 2 || (hl % 2) != 0
@@ -246,10 +359,14 @@ static bool decifrar_senha(const char* hex, char* saida, size_t tam_saida)
 
   uint8_t claro[CIFRA_MAX_BRUTO];
   uint8_t chave[16];
-  if (!chave_do_aparelho(chave)) { return false; }
+  if (nova) {
+    if (!tab5_wifi_chave_preparar()) { return false; }
+    memcpy(chave, s_chave, sizeof(chave));
+  } else if (!chave_legada(chave)) { return false; }
   mbedtls_aes_context ctx;
   mbedtls_aes_init(&ctx);
   mbedtls_aes_setkey_dec(&ctx, chave, 128);
+  memset(chave, 0, sizeof(chave));
   const int r = mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, n_cifrado, iv, cifrado, claro);
   mbedtls_aes_free(&ctx);
   if (r != 0) { return false; }
@@ -262,6 +379,49 @@ static bool decifrar_senha(const char* hex, char* saida, size_t tam_saida)
   saida[texto_n] = 0;
   return true;
 }
+// SENHA ESTRAGADA POR UM FIRMWARE ANTIGO - e o conserto, quando da.
+//
+// Uma versao de antes da chave sorteada (formato "k2") nao reconhece o
+// formato novo: le "k2<hex>" como senha em TEXTO PURO, corta em 64
+// caracteres (o buffer dela) e regrava o wifi.txt cifrando ISSO na cifra
+// antiga. De volta a uma versao nova, a senha decifrada sai "k2<62 hex>" -
+// e o roteador recusa (reason 15, handshake). Aconteceu numa bissecao em
+// 2026-10-21; acontece com quem volta para uma versao antiga e atualiza.
+//
+// O "k2<hex>" e a senha VERDADEIRA cifrada no formato novo, menos o ultimo
+// byte (os 2 caracteres cortados). Senha de ate 15 caracteres cabe num bloco
+// so: o byte que falta sai por tentativa (256), e a certa e a que decifra com
+// preenchimento valido e texto legivel - se for UMA so. Senha maior perdeu um
+// bloco inteiro: nao tem volta, e o log pede para digitar de novo.
+static bool hex_minusculo(const char* t)
+{
+  for (; *t; ++t) { if (!((*t >= '0' && *t <= '9') || (*t >= 'a' && *t <= 'f'))) { return false; } }
+  return true;
+}
+
+static bool consertar_senha_cortada(const char* estragada, char* saida, size_t tam_saida)
+{
+  if (strncmp(estragada, CIFRA_PREFIXO, 2) != 0 || strlen(estragada) != 64 || !hex_minusculo(estragada + 2)) {
+    return false;
+  }
+  char tentativa[70], achada[65] = "";
+  int achadas = 0;
+  for (int b = 0; b < 256 && achadas < 2; ++b) {
+    snprintf(tentativa, sizeof(tentativa), "%s%02x", estragada, b);
+    char claro[65];
+    if (!decifrar_senha(tentativa, claro, sizeof(claro))) { continue; }
+    bool legivel = claro[0] != 0;
+    for (const char* c = claro; *c && legivel; ++c) { legivel = (unsigned char)*c >= 0x20 && (unsigned char)*c < 0x7F; }
+    if (legivel) { snprintf(achada, sizeof(achada), "%s", claro); ++achadas; }
+    memset(claro, 0, sizeof(claro));
+  }
+  memset(tentativa, 0, sizeof(tentativa));
+  if (achadas != 1) { memset(achada, 0, sizeof(achada)); return false; }
+  snprintf(saida, tam_saida, "%s", achada);
+  memset(achada, 0, sizeof(achada));
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // REDES CONHECIDAS - varias, no mesmo wifi.txt
 // ---------------------------------------------------------------------------
@@ -281,9 +441,10 @@ static bool             s_arquivo_lido = false;
 
 // Redes vistas na ultima procura (para a tela de Ajustes).
 static tab5_wifi_visto_t s_vistas[TAB5_WIFI_MAX_VISTAS];
+static tab5_wifi_visto_t s_vistas_novas[TAB5_WIFI_MAX_VISTAS];   // a procura monta aqui (ver procurar_redes)
 static volatile int      s_n_vistas = 0;
 static volatile bool     s_procurando = false;
-static volatile uint32_t s_redes_ver = 1;
+static std::atomic<uint32_t> s_redes_ver = 1;
 static char              s_alvo[33];                 // CMD_TROCAR: para qual rede
 
 // A lista e mexida pela tarefa do Wi-Fi (ler ao ligar) e por quem grava rede
@@ -368,7 +529,7 @@ static bool ler_credenciais(void)
 
   char linha[CIFRA_MAX_HEX + 4];
   char ssid[33] = "";
-  bool tem_ssid = false, tinha_texto_puro = false, alguma_ilegivel = false;
+  bool tem_ssid = false, tinha_texto_puro = false, alguma_ilegivel = false, tinha_legado = false;
   s_n_redes = 0;
   while (fgets(linha, sizeof(linha), f) && s_n_redes < TAB5_WIFI_MAX_REDES) {
     // tira \r e \n do fim - arquivo salvo no Windows traz \r e ele entraria
@@ -383,7 +544,26 @@ static bool ler_credenciais(void)
     if (strcmp(linha, "-") == 0) {
       // rede aberta
     } else if (parece_cifrado(linha)) {
-      if (!decifrar_senha(linha, senha, sizeof(senha))) {
+      bool legado = false;
+      const bool ok_dec = decifrar_senha(linha, senha, sizeof(senha), &legado);
+      if (ok_dec && legado) { tinha_legado = true; }
+      // Decifrou, mas a "senha" e o formato novo cortado por um firmware antigo.
+      if (ok_dec && !strncmp(senha, CIFRA_PREFIXO, 2) && strlen(senha) == 64 && hex_minusculo(senha + 2)) {
+        char certa[65];
+        if (consertar_senha_cortada(senha, certa, sizeof(certa))) {
+          snprintf(senha, sizeof(senha), "%s", certa);
+          memset(certa, 0, sizeof(certa));
+          tinha_legado = true;   // regrava no formato novo, logo abaixo
+          ESP_LOGW(TAG, "%s: a senha de \"%s\" tinha sido estragada por um firmware antigo - recuperada",
+                   TAB5_WIFI_ARQUIVO, ssid);
+        } else {
+          ESP_LOGE(TAG, "%s: a senha de \"%s\" foi estragada por um firmware antigo e nao tem conserto - "
+                        "escolha a rede em Ajustes > Wi-Fi e digite de novo", TAB5_WIFI_ARQUIVO, ssid);
+          alguma_ilegivel = true;
+          continue;
+        }
+      }
+      if (!ok_dec) {
         // Cifrada por OUTRO aparelho (a chave e de cada Tab5) ou arquivo
         // corrompido: a rede fica de fora, e o log diz como resolver.
         ESP_LOGE(TAG, "%s: a senha de \"%s\" nao e deste aparelho - escreva-a de novo em "
@@ -407,8 +587,10 @@ static bool ler_credenciais(void)
   // MIGRACAO AUTOMATICA: senha em texto puro vira cifrada aqui mesmo. E
   // SEGURO mexer no cartao neste ponto pelo mesmo motivo de toda esta funcao:
   // ela roda uma vez por boot, ANTES do enlace com o C6.
-  if (tinha_texto_puro) {
-    if (escrever_arquivo()) { ESP_LOGW(TAG, "%s: senha em texto puro - agora esta cifrada", TAB5_WIFI_ARQUIVO); }
+  // A mesma coisa para a cifra antiga (chave tirada do MAC): regrava com a nova.
+  if (tinha_texto_puro || tinha_legado) {
+    if (escrever_arquivo()) { ESP_LOGW(TAG, "%s: senha %s - agora esta cifrada com a chave nova", TAB5_WIFI_ARQUIVO,
+                                       tinha_texto_puro ? "em texto puro" : "na cifra antiga"); }
     else                    { ESP_LOGE(TAG, "%s: senha em texto puro e NAO consegui cifrar o arquivo", TAB5_WIFI_ARQUIVO); }
   }
   (void)alguma_ilegivel;
@@ -432,30 +614,36 @@ static bool procurar_redes(void)
   wifi_ap_record_t* aps = n ? (wifi_ap_record_t*)calloc(n, sizeof(wifi_ap_record_t)) : nullptr;
   if (n && !aps) { esp_wifi_clear_ap_list(); return false; }
   if (n) { esp_wifi_scan_get_ap_records(&n, aps); }
+  // Monta na lista de TRABALHO e so troca no fim, sob a trava das redes: a
+  // tela le s_vistas (tab5_wifi_vista) a qualquer hora, e antes podia pegar
+  // um nome pela metade (W2 da analise de 22/10).
+  tab5_wifi_visto_t* v = s_vistas_novas;
   int k = 0;
   for (uint16_t i = 0; i < n; ++i) {
     const char* nome = (const char*)aps[i].ssid;
     if (!nome[0]) { continue; }
     int j = 0;
-    while (j < k && strcmp(s_vistas[j].ssid, nome) != 0) { ++j; }
-    if (j < k) { if (aps[i].rssi > s_vistas[j].rssi) { s_vistas[j].rssi = aps[i].rssi; } continue; }
+    while (j < k && strcmp(v[j].ssid, nome) != 0) { ++j; }
+    if (j < k) { if (aps[i].rssi > v[j].rssi) { v[j].rssi = aps[i].rssi; } continue; }
     if (k >= TAB5_WIFI_MAX_VISTAS) { continue; }
-    snprintf(s_vistas[k].ssid, sizeof(s_vistas[k].ssid), "%s", nome);
-    s_vistas[k].rssi = aps[i].rssi;
-    s_vistas[k].canal = aps[i].primary;
-    s_vistas[k].aberta = (aps[i].authmode == WIFI_AUTH_OPEN);
+    snprintf(v[k].ssid, sizeof(v[k].ssid), "%s", nome);
+    v[k].rssi = aps[i].rssi;
+    v[k].canal = aps[i].primary;
+    v[k].aberta = (aps[i].authmode == WIFI_AUTH_OPEN);
     ++k;
   }
   free(aps);
   for (int i = 1; i < k; ++i) {   // mais forte primeiro
-    tab5_wifi_visto_t t = s_vistas[i];
+    tab5_wifi_visto_t t = v[i];
     int j = i - 1;
-    while (j >= 0 && s_vistas[j].rssi < t.rssi) { s_vistas[j + 1] = s_vistas[j]; --j; }
-    s_vistas[j + 1] = t;
+    while (j >= 0 && v[j].rssi < t.rssi) { v[j + 1] = v[j]; --j; }
+    v[j + 1] = t;
   }
-  for (int i = 0; i < k; ++i) { s_vistas[i].conhecida = achar_rede(s_vistas[i].ssid) >= 0; }
+  trava_redes_t trava;
+  for (int i = 0; i < k; ++i) { v[i].conhecida = achar_rede(v[i].ssid) >= 0; }
+  memcpy(s_vistas, v, sizeof(tab5_wifi_visto_t) * (size_t)k);
   s_n_vistas = k;
-  s_redes_ver = s_redes_ver + 1;
+  ++s_redes_ver;
   return true;
 }
 
@@ -476,23 +664,19 @@ static void ao_evento(void* arg, esp_event_base_t base, int32_t id, void* dados)
 {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START)
   {
-    // Durante a varredura o start NAO pode disparar conexao: o esp_wifi nao faz
-    // as duas coisas ao mesmo tempo, e a associacao abortaria o scan.
-    if (s_varrendo) { return; }
-    // Radio de pe, sem roteador (ver s_so_radio). O estado tem que sair do
-    // SUBINDO: ligar o WiFi em Ajustes com o canal fixo ativo parava aqui, e a
-    // barra dizia "subindo" para sempre.
-    if (s_so_radio) { s_estado = TAB5_WIFI_DESLIGADO; return; }
+    // So conecta quem quer rede (ver s_modo). No SO_RADIO o estado tem que
+    // sair do SUBINDO: senao a barra diria "subindo" para sempre.
+    if (s_modo == MODO_SO_RADIO) { s_estado = TAB5_WIFI_DESLIGADO; return; }
+    if (s_modo != MODO_CONECTAR) { return; }
     s_estado = TAB5_WIFI_CONECTANDO;
     esp_wifi_connect();
   }
   else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
   {
     s_rssi = TAB5_WIFI_RSSI_DESCONHECIDO;
-    s_ip[0] = 0;
     strcpy(s_ip, "0.0.0.0");
 
-    // Queda provocada pelo nosso proprio esp_wifi_stop(): nao e falha, e nao
+    // Queda sem querer rede (desligar, varrer, so radio): nao e falha, e nao
     // se reconecta. Sem esta guarda, desligar o WiFi dispararia uma rajada de
     // tentativas de reconexao - exatamente o oposto do pedido.
     //
@@ -501,13 +685,22 @@ static void ao_evento(void* arg, esp_event_base_t base, int32_t id, void* dados)
     // queda que esse stop gera chegava aqui e trocava FALHOU por DESLIGADO. A
     // retomada (que so olhava FALHOU) nunca mais procurava: voltar para casa
     // nao reconectava, e so a procura de Ajustes > Wi-Fi destravava.
-    if (s_descendo) {
+    if (s_modo != MODO_CONECTAR) {
       if (s_estado == TAB5_WIFI_CONECTADO || s_estado == TAB5_WIFI_CONECTANDO) { s_estado = TAB5_WIFI_DESLIGADO; }
       return;
     }
-    if (s_so_radio) { s_estado = TAB5_WIFI_DESLIGADO; return; }   // saida pedida: sem reconexao
 
-    s_tentativas = s_tentativas + 1;   // volatile: sem ++ (o C++20 o deprecia)
+    // A QUEDA DA REDE ANTIGA, NA TROCA. tratar_trocar() solta a rede antiga e
+    // ja conecta na nova; esta queda chega DEPOIS, com o modo ja em CONECTAR.
+    // O evento diz de qual rede caiu: outra que nao a alvo nao e falha.
+    const wifi_event_sta_disconnected_t* q = (const wifi_event_sta_disconnected_t*)dados;
+    if (q && q->ssid_len > 0 && s_estado == TAB5_WIFI_CONECTANDO
+     && (q->ssid_len != strnlen(s_ssid, sizeof(s_ssid)) || memcmp(q->ssid, s_ssid, q->ssid_len) != 0)) {
+      ESP_LOGI(TAG, "saiu de \"%.*s\" (troca de rede) - nao e falha", (int)q->ssid_len, (const char*)q->ssid);
+      return;
+    }
+
+    ++s_tentativas;
     if (s_tentativas > MAX_TENTATIVAS)
     {
       ESP_LOGW(TAG, "desisti depois de %d tentativas - parando o radio",
@@ -522,7 +715,7 @@ static void ao_evento(void* arg, esp_event_base_t base, int32_t id, void* dados)
       xQueueSend(s_fila, &c, 0);
       return;
     }
-    ESP_LOGI(TAG, "caiu, tentativa %d/%d", s_tentativas, MAX_TENTATIVAS);
+    ESP_LOGI(TAG, "caiu, tentativa %d/%d", s_tentativas.load(), MAX_TENTATIVAS);
     s_estado = TAB5_WIFI_CONECTANDO;
     // NAO DORME AQUI. Isto roda na tarefa de eventos PADRAO do ESP-IDF - a
     // mesma de todos os eventos do sistema (IP, Wi-Fi, esp_hosted). O
@@ -555,15 +748,19 @@ static bool subir_pilha(void)
   // tab5_wifi_iniciar). Entao a mensagem aqui tem que ser autossuficiente:
   // dizer o que aconteceu, o que provavelmente causou, e como ver o cru.
   tab5_mem_marco("C6: antes do esp_hosted");
+  // O slot 1 sobe no controlador que o cartao divide (ver tab5_sd.hpp).
+  tab5_sd_controlador_travar();
   int rc = esp_hosted_init();
   tab5_mem_marco("esp_hosted_init (SDIO)");
   if (rc != 0) {
     ESP_LOGE(TAG, "esp_hosted_init falhou: %d - o C6 nao respondeu no SDIO. "
                   "Para ver o log cru: 'log eh_sdio 4' e 'log sdmmc_io 4'", rc);
+    tab5_sd_controlador_soltar();
     return false;
   }
 
-  rc = esp_hosted_connect_to_slave();
+  rc = esp_hosted_connect_to_slave();   // card_init do slot 1: ainda com a trava
+  tab5_sd_controlador_soltar();
   if (rc == 0) {
     // Marcado AQUI, e nao no fim: daqui para baixo tudo depende de RPC, e e
     // exatamente o que pode faltar num C6 com firmware ruim. O enlace ja
@@ -708,6 +905,7 @@ static void aplicar_config(void)
   wifi_config_t wc = { };
   strncpy((char*)wc.sta.ssid,     s_ssid,  sizeof(wc.sta.ssid)     - 1);
   strncpy((char*)wc.sta.password, s_senha, sizeof(wc.sta.password) - 1);
+  wc.sta.listen_interval = LISTEN_INTERVAL;   // so vale em WIFI_PS_MAX_MODEM (repouso)
   esp_wifi_set_config(WIFI_IF_STA, &wc);
 }
 
@@ -742,17 +940,17 @@ static void tratar_ligar(void)
   }
 
   s_tentativas = 0;
-  s_descendo   = false;
+  const modo_t depois = (s_modo == MODO_SO_RADIO) ? MODO_SO_RADIO : MODO_CONECTAR;
 
   // A REDE MAIS FORTE ENTRE AS CONHECIDAS. Com mais de uma rede guardada,
-  // procura antes de conectar: o radio sobe SEM conectar (s_varrendo segura o
-  // STA_START), procura, e so entao escolhe. Com uma so, ou se a procura
-  // falhar, vai direto na primeira (pode ser uma rede oculta).
-  s_varrendo = true;
+  // procura antes de conectar: o radio sobe SEM conectar (o modo PROCURAR
+  // segura o STA_START), procura, e so entao escolhe. Com uma so, ou se a
+  // procura falhar, vai direto na primeira (pode ser uma rede oculta).
+  s_modo = MODO_PROCURAR;
   esp_err_t err = esp_wifi_start();
   s_radio_ativo = (err == ESP_OK);
   if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-    s_varrendo = false;
+    s_modo = MODO_PARADO;
     ESP_LOGE(TAG, "esp_wifi_start: %s", esp_err_to_name(err));
     s_estado = TAB5_WIFI_FALHOU;
     return;
@@ -762,10 +960,10 @@ static void tratar_ligar(void)
     if (r >= 0) { usar_rede(r); ESP_LOGI(TAG, "rede conhecida mais forte: \"%s\"", s_ssid); }
     else        { ESP_LOGW(TAG, "nenhuma rede conhecida a vista - tentando \"%s\"", s_ssid); }
   }
-  s_varrendo = false;
+  s_modo = depois;
 
   aplicar_config();
-  if (s_so_radio) { s_estado = TAB5_WIFI_DESLIGADO; return; }   // ESP-NOW em canal fixo: sem roteador
+  if (s_modo == MODO_SO_RADIO) { s_estado = TAB5_WIFI_DESLIGADO; return; }   // ESP-NOW em canal fixo: sem roteador
   s_estado = TAB5_WIFI_CONECTANDO;
   esp_wifi_connect();
 }
@@ -780,13 +978,13 @@ static bool ligado_ou_ligando(void)
 // radio precisa estar iniciado. true = conectando.
 static bool conectar_conhecida_vista(void)
 {
-  if (!s_querer || s_so_radio || ligado_ou_ligando()) { return false; }
+  if (!s_querer || s_modo == MODO_SO_RADIO || ligado_ou_ligando()) { return false; }
   const int r = melhor_conhecida();
   if (r < 0) { return false; }
   usar_rede(r);
   aplicar_config();
   s_tentativas = 0;
-  s_descendo = false;
+  s_modo = MODO_CONECTAR;
   s_radio_ativo = true;
   s_estado = TAB5_WIFI_CONECTANDO;
   ESP_LOGI(TAG, "rede conhecida a vista: conectando em \"%s\"", s_ssid);
@@ -801,20 +999,21 @@ static bool conectar_conhecida_vista(void)
 static void tratar_procurar(void)
 {
   s_procurando = true;
-  s_redes_ver = s_redes_ver + 1;
+  ++s_redes_ver;
   if (s_pilha_de_pe) {
     const bool estava = s_radio_ativo;
-    if (!estava) { s_varrendo = true; esp_wifi_start(); }
+    const modo_t antes = s_modo;
+    if (!estava) { s_modo = MODO_PROCURAR; esp_wifi_start(); }
     if (!procurar_redes()) { ESP_LOGW(TAG, "procura de redes recusada (conectando?)"); }
-    s_varrendo = false;
+    s_modo = antes;
     const bool conectou = conectar_conhecida_vista();   // conectando: o radio fica
     if (!estava && !conectou) {
-      if (s_so_radio || ligado_ou_ligando()) { s_radio_ativo = true; }
+      if (s_modo == MODO_SO_RADIO || ligado_ou_ligando()) { s_radio_ativo = true; }
       else                                   { esp_wifi_stop(); }
     }
   }
   s_procurando = false;
-  s_redes_ver = s_redes_ver + 1;
+  ++s_redes_ver;
 }
 
 // Chamada a cada volta da tarefa. Age quando o WiFi esta LIGADO EM AJUSTES e,
@@ -831,7 +1030,7 @@ static void retomar_se_preciso(void)
   const bool dorme = tab5_power_em_repouso();
   const bool acordou = dormia && !dorme;
   dormia = dorme;
-  if (!s_querer || !s_pilha_de_pe || s_so_radio
+  if (!s_querer || !s_pilha_de_pe || s_modo == MODO_SO_RADIO
    || (s_estado != TAB5_WIFI_FALHOU && s_estado != TAB5_WIFI_DESLIGADO)) {
     s_retomar_ms = 0;
     return;
@@ -860,19 +1059,18 @@ static void tratar_trocar(void)
   usar_rede(r);
   if (!s_pilha_de_pe) { tratar_ligar(); return; }
   s_tentativas = 0;
-  s_descendo = false;
-  s_so_radio = false;
+  s_modo = MODO_CONECTAR;
+  // CONECTANDO antes do disconnect: e o que faz ao_evento reconhecer a queda
+  // da rede antiga, que pode chegar antes desta funcao terminar.
+  s_estado = TAB5_WIFI_CONECTANDO;
   if (!s_radio_ativo) {
     aplicar_config();
     s_radio_ativo = (esp_wifi_start() == ESP_OK);   // STA_START conecta
   } else {
-    s_descendo = true;          // a queda da rede antiga nao e falha
-    esp_wifi_disconnect();
-    s_descendo = false;
+    esp_wifi_disconnect();      // a queda da rede antiga nao conta (ver ao_evento)
     aplicar_config();
     esp_wifi_connect();
   }
-  s_estado = TAB5_WIFI_CONECTANDO;
   ESP_LOGI(TAG, "trocando para \"%s\"", s_ssid);
 }
 
@@ -897,9 +1095,8 @@ static void tratar_pilha(void)
 static void tratar_so_radio(void)
 {
   if (!s_pilha_de_pe) { return; }
-  s_so_radio = true;
+  s_modo = MODO_SO_RADIO;
   s_tentativas = 0;
-  s_descendo = false;
   esp_wifi_start();       // ja iniciado: erro benigno
   s_radio_ativo = true;
   esp_wifi_disconnect();
@@ -912,9 +1109,11 @@ static void tratar_so_radio(void)
 static void tratar_roteador(void)
 {
   if (!s_pilha_de_pe) { return; }
-  s_so_radio = false;
+  // Ja conectando ou conectado (uma rede escolhida em Ajustes chegou antes):
+  // conectar de novo so atrapalharia a tentativa em andamento.
+  if (s_modo == MODO_CONECTAR && ligado_ou_ligando()) { return; }
+  s_modo = MODO_CONECTAR;
   s_tentativas = 0;
-  s_descendo = false;
   esp_wifi_start();
   s_radio_ativo = true;
   s_estado = TAB5_WIFI_CONECTANDO;
@@ -926,7 +1125,9 @@ static void tratar_desligar(void)
 {
   if (!s_pilha_de_pe) { s_estado = TAB5_WIFI_DESLIGADO; return; }
 
-  s_descendo = true;
+  // O SO_RADIO e escolha do ESP-NOW (canal fixo): sobrevive a desligar e
+  // religar, e nunca reconecta sozinho - para o evento, vale o mesmo que PARADO.
+  if (s_modo != MODO_SO_RADIO) { s_modo = MODO_PARADO; }
   esp_wifi_disconnect();
   esp_wifi_stop();       // nivel 1: stack e link SDIO seguem de pe
   s_radio_ativo = false;
@@ -943,82 +1144,6 @@ static void tratar_desligar(void)
   ESP_LOGI(TAG, "WiFi desligado (o C6 segue alimentado, religa rapido)");
 }
 
-static void varrer_e_listar(void);
-
-// VARREDURA DO CONSOLE. Ela solta o roteador para varrer; no fim, devolve:
-// sem isto o s_descendo ficava de pe (toda queda seguinte era tratada como
-// "desligado de proposito") e o Tab5 ficava sem rede ate religar o WiFi.
-static void tratar_varrer(void)
-{
-  const bool tinha_rede = (s_estado == TAB5_WIFI_CONECTADO || s_estado == TAB5_WIFI_CONECTANDO);
-  varrer_e_listar();
-  s_varrendo = false;
-  s_descendo = false;
-  if (s_pilha_de_pe && tinha_rede && s_querer && !s_so_radio) {
-    s_tentativas = 0;
-    s_estado = TAB5_WIFI_CONECTANDO;
-    esp_wifi_connect();
-  }
-}
-
-static void varrer_e_listar(void)
-{
-  if (!s_pilha_de_pe)
-  {
-    printf("WiFi nunca foi ligado neste boot - ligue no app Ajustes primeiro.\n");
-    return;
-  }
-
-  s_varrendo = true;
-  s_descendo = true;          // uma queda aqui nao e falha, e consequencia
-
-  esp_wifi_disconnect();
-  esp_wifi_start();           // se ja estiver iniciado, devolve erro benigno
-  s_radio_ativo = true;
-
-  wifi_scan_config_t sc = { };
-  sc.show_hidden = true;      // rede oculta aparece com SSID vazio
-
-  printf("varrendo...\n");
-  esp_err_t err = esp_wifi_scan_start(&sc, true);   // bloqueante
-  if (err != ESP_OK)
-  {
-    printf("varredura falhou: %s\n", esp_err_to_name(err));
-    s_varrendo = false;
-    return;
-  }
-
-  uint16_t n = 0;
-  esp_wifi_scan_get_ap_num(&n);
-  if (n == 0)
-  {
-    printf("NENHUMA rede encontrada.\n"
-           "  Se ha redes 2.4GHz por perto, o problema e o radio do C6, nao a sua rede.\n");
-    s_varrendo = false;
-    return;
-  }
-
-  wifi_ap_record_t* aps = (wifi_ap_record_t*) calloc(n, sizeof(wifi_ap_record_t));
-  if (!aps) { printf("sem memoria para %u redes\n", (unsigned)n); s_varrendo = false; return; }
-
-  esp_wifi_scan_get_ap_records(&n, aps);
-  printf("%u rede(s):\n", (unsigned)n);
-  printf("  %-32s %5s %3s %s\n", "SSID", "dBm", "ch", "seguranca");
-  for (uint16_t i = 0; i < n; ++i)
-  {
-    printf("  %-32s %5d %3d %s\n",
-           aps[i].ssid[0] ? (const char*)aps[i].ssid : "(oculta)",
-           (int)aps[i].rssi, (int)aps[i].primary,
-           aps[i].authmode == WIFI_AUTH_OPEN ? "aberta" : "com senha");
-  }
-  free(aps);
-
-  printf("\nO Tab5 so enxerga 2.4GHz (o radio e um ESP32-C6).\n"
-         "Se a sua rede nao esta na lista, ela e 5GHz ou o nome esta diferente -\n"
-         "compare LETRA POR LETRA, maiuscula conta.\n");
-  s_varrendo = false;
-}
-
 // CONECTANDO SEM FIM. Cada tentativa termina num evento (IP ou queda), e e a
 // queda que conta as tentativas ate a desistencia. Se o esp_wifi_connect for
 // recusado ou o evento se perder no caminho do C6, nenhum dos dois vem: o
@@ -1028,7 +1153,7 @@ static void varrer_e_listar(void)
 static void vigiar_conectando(void)
 {
   static uint32_t desde = 0;
-  if (s_estado != TAB5_WIFI_CONECTANDO || s_descendo) { desde = 0; return; }
+  if (s_estado != TAB5_WIFI_CONECTANDO || s_modo != MODO_CONECTAR) { desde = 0; return; }
   const uint32_t agora = (uint32_t)pdTICKS_TO_MS(xTaskGetTickCount());
   if (!desde) { desde = agora | 1u; return; }
   if (agora - desde < CONECTANDO_PRAZO_MS) { return; }
@@ -1039,6 +1164,22 @@ static void vigiar_conectando(void)
   tratar_desligar();
 }
 
+// A cada volta desta tarefa: repouso, trafego e pedidos decidem o modem sleep
+// (ver EM REPOUSO, ECONOMIA MAXIMA e TELA ACESA). aplicar_economia() so vai ao
+// C6 quando o modo muda; o RPC ao C6 e daqui.
+static void seguir_repouso(void)
+{
+  if (s_pilha_de_pe && s_estado == TAB5_WIFI_CONECTADO) { aplicar_economia(); }
+  else if (s_pilha_de_pe && tab5_power_em_repouso() != s_ps_repouso) { aplicar_economia(); }
+}
+
+// O ritmo desta tarefa: com a tela acesa e conectado, 250 ms (o power save
+// dinamico precisa ver o trafego chegando); fora disso, os 5 s de sempre.
+static uint32_t prazo_da_volta_ms(void)
+{
+  return (s_estado == TAB5_WIFI_CONECTADO && !tab5_power_em_repouso()) ? 250 : 5000;
+}
+
 static void vTaskWifi(void*)
 {
   comando_t c;
@@ -1047,10 +1188,9 @@ static void vTaskWifi(void*)
     // Espera com prazo em vez de portMAX_DELAY: o prazo e o batimento que
     // atualiza o RSSI. Ir ao C6 pelo SDIO e caro, entao 5s - a barra de status
     // le o cache e nunca vai ao radio.
-    if (xQueueReceive(s_fila, &c, pdMS_TO_TICKS(5000)) == pdTRUE)
+    if (xQueueReceive(s_fila, &c, pdMS_TO_TICKS(prazo_da_volta_ms())) == pdTRUE)
     {
       if      (c == CMD_LIGAR)    { tratar_ligar(); }
-      else if (c == CMD_VARRER)   { tratar_varrer(); }
       else if (c == CMD_SO_RADIO) { tratar_so_radio(); }
       else if (c == CMD_ROTEADOR) { tratar_roteador(); }
       else if (c == CMD_ECONOMIA) { if (s_pilha_de_pe) { aplicar_economia(); } }
@@ -1062,20 +1202,26 @@ static void vTaskWifi(void*)
         // piscou), agora fora da tarefa de eventos. Se nesse meio tempo
         // pediram para descer ou para soltar o roteador, nao reconecta.
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!s_descendo && !s_so_radio && s_estado == TAB5_WIFI_CONECTANDO) { esp_wifi_connect(); }
+        if (s_modo == MODO_CONECTAR && s_estado == TAB5_WIFI_CONECTANDO) { esp_wifi_connect(); }
       }
       else                        { tratar_desligar(); }
       vigiar_conectando();
       retomar_se_preciso();
+      seguir_repouso();
       continue;
     }
     vigiar_conectando();
     retomar_se_preciso();
+    seguir_repouso();
 
     // Em repouso ninguem ve a barra: medir o sinal seria uma ida ao C6 pelo
-    // SDIO a cada 5 s para nada. Ao acordar, a proxima volta mede.
-    if (s_estado == TAB5_WIFI_CONECTADO && !tab5_power_em_repouso())
+    // SDIO a cada 5 s para nada. Ao acordar, a proxima volta mede. E so a
+    // cada 5 s: a volta e de 250 ms com a tela acesa (power save dinamico).
+    static uint32_t s_rssi_ms = 0;
+    if (s_estado == TAB5_WIFI_CONECTADO && !tab5_power_em_repouso()
+     && agora_ms() - s_rssi_ms >= 5000)
     {
+      s_rssi_ms = agora_ms();
       wifi_ap_record_t ap = { };
       const esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
 
@@ -1217,7 +1363,7 @@ void tab5_wifi_definir_credenciais(const char* ssid, const char* senha)
   snprintf(s_senhas[i], sizeof(s_senhas[0]), "%s", aberta ? "" : senha);
   usar_rede(i);
   s_lido = true;
-  s_redes_ver = s_redes_ver + 1;
+  ++s_redes_ver;
   ESP_LOGI(TAG, "rede \"%s\" guardada (%d conhecida(s))", ssid, s_n_redes);
 }
 
@@ -1250,7 +1396,7 @@ bool tab5_wifi_esquecer(const char* ssid)
   --s_n_redes;
   memset(s_senhas[s_n_redes], 0, sizeof(s_senhas[0]));
   for (int k = 0; k < s_n_vistas; ++k) { s_vistas[k].conhecida = achar_rede(s_vistas[k].ssid) >= 0; }
-  s_redes_ver = s_redes_ver + 1;
+  ++s_redes_ver;
   return escrever_arquivo();
 }
 
@@ -1276,6 +1422,7 @@ bool     tab5_wifi_procurando(void)  { return s_procurando; }
 int      tab5_wifi_n_vistas(void)    { return s_n_vistas; }
 bool     tab5_wifi_vista(int i, tab5_wifi_visto_t* out)
 {
+  trava_redes_t trava;
   if (!out || i < 0 || i >= s_n_vistas) { return false; }
   *out = s_vistas[i];
   return true;
@@ -1294,25 +1441,30 @@ bool tab5_wifi_rede_guardada(int i, char* ssid, size_t tam_ssid, char* senha, si
 }
 
 bool tab5_wifi_cifrar_texto(const char* claro, char* hex, size_t tam_hex) { return cifrar_senha(claro, hex, tam_hex); }
-bool tab5_wifi_decifrar_texto(const char* hex, char* claro, size_t tam_claro) { return decifrar_senha(hex, claro, tam_claro); }
-
-void tab5_wifi_varrer(void)
-{
-  comando_t c = CMD_VARRER;
-  xQueueSend(s_fila, &c, 0);
-}
+bool tab5_wifi_decifrar_texto(const char* hex, char* claro, size_t tam_claro, bool* legado) { return decifrar_senha(hex, claro, tam_claro, legado); }
 
 bool tab5_wifi_pilha_de_pe(void) { return s_pilha_de_pe; }
 void tab5_wifi_ao_subir(void (*fn)(void)) { s_ao_subir = fn; }
 bool tab5_wifi_c6_enlace(void)    { return s_c6_enlace; }
 bool tab5_wifi_c6_nosso(void)     { return s_c6_nosso; }
-bool tab5_wifi_so_radio(void)     { return s_so_radio; }
+bool tab5_wifi_so_radio(void)     { return s_modo == MODO_SO_RADIO; }
 bool tab5_wifi_radio_ativo(void)  { return s_radio_ativo; }
+
+bool tab5_wifi_receptor_pedido(void) { return __atomic_load_n(&s_acordado, __ATOMIC_ACQUIRE) != 0; }
+
+static uint32_t s_precisam = 0;   // tab5_wifi_precisar: bits de quem precisa da rede
+void tab5_wifi_precisar(uint32_t quem, bool sim)
+{
+  if (sim) { __atomic_fetch_or(&s_precisam, quem, __ATOMIC_ACQ_REL); }
+  else     { __atomic_fetch_and(&s_precisam, ~quem, __ATOMIC_ACQ_REL); }
+}
+bool tab5_wifi_precisada(void) { return __atomic_load_n(&s_precisam, __ATOMIC_ACQUIRE) != 0; }
 
 void tab5_wifi_manter_acordado(uint32_t quem, bool sim)
 {
-  // ATOMICO: ESP-NOW (a cada 1 s), CSI e Farejo chamam isto de tarefas
-  // diferentes. Com ler-modificar-escrever comum, um apagava o bit que o
+  // ATOMICO: ESP-NOW, CSI e Farejo declaram RECURSO_RADIO_ESCUTA e o kernel
+  // aplica o receptor ligado (kernel/recursos.h); o kernel e o comando radio do
+  // console chamam isto de tarefas diferentes. Com ler-modificar-escrever comum, um apagava o bit que o
   // outro tinha acabado de ligar (o CSI perdia o receptor ligado).
   const uint32_t antes = sim ? __atomic_fetch_or(&s_acordado, quem, __ATOMIC_ACQ_REL)
                              : __atomic_fetch_and(&s_acordado, ~quem, __ATOMIC_ACQ_REL);
@@ -1339,12 +1491,12 @@ const char* tab5_wifi_descricao(void)
   switch (s_estado)
   {
     case TAB5_WIFI_DESLIGADO:      return "WiFi";
-    case TAB5_WIFI_SUBINDO:        return "ligando";
-    case TAB5_WIFI_CONECTANDO:     return "conectando";
+    case TAB5_WIFI_SUBINDO:        return N_("ligando");
+    case TAB5_WIFI_CONECTANDO:     return N_("conectando");
     case TAB5_WIFI_CONECTADO:      return s_ssid;
-    case TAB5_WIFI_SEM_CREDENCIAL: return "sem rede";
-    case TAB5_WIFI_FALHOU:         return "falhou";
-    case TAB5_WIFI_C6_MUDO:        return "C6 nao responde";
+    case TAB5_WIFI_SEM_CREDENCIAL: return N_("sem rede");
+    case TAB5_WIFI_FALHOU:         return N_("falhou");
+    case TAB5_WIFI_C6_MUDO:        return N_("C6 nao responde");
   }
   return "WiFi";
 }

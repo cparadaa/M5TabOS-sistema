@@ -11,14 +11,15 @@
 
 #include "sdkconfig.h"
 #include "app.h"
+#include "idioma.h"
 #include "tab5_tela.hpp"
 #include "tab5_ui.hpp"
+#include "tab5_tema.hpp"
 #include "tab5_monitor.hpp"
 #include "tab5_donos.hpp"
+#include "tab5_web.hpp"
 #include "lista.hpp"
 #include "esp_log.h"
-#include "esp_ota_ops.h"
-#include "esp_image_format.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -41,17 +42,18 @@ static const int LIN = 34;
 // declarado por quem criou a tarefa - hal/tab5_donos.hpp -, nao adivinhado
 // pelo nome. Cada linha da lista e um cabecalho de grupo ou uma tarefa.
 static const dono_tipo_t GRUPOS[] = { DONO_APP, DONO_FUNDO, DONO_SERVICO, DONO_SISTEMA };
-static const char* const GRUPO_NOME[] = { "SISTEMA", "SERVIÇOS", "APP ABERTO", "APPS EM FUNDO" };   // por dono_tipo_t
+static const char* const GRUPO_NOME[] = { N_("SISTEMA"), N_("SERVIÇOS"), N_("APP ABERTO"), N_("APPS EM FUNDO") };   // por dono_tipo_t
 static int s_linhas[MON_MAX_TAREFAS + 4];   // >= 0: indice em s_f.t; < 0: cabecalho (-1 - dono_tipo_t)
 static int s_nlinhas = 0;
 
 static uint16_t cor_grupo(int tipo)
 {
   switch (tipo) {
-    case DONO_APP:     return TFT_CYAN;
-    case DONO_FUNDO:   return TFT_VIOLET;
-    case DONO_SERVICO: return TFT_GOLD;
-    default:           return TFT_DARKGREY;
+    // Cores de CATEGORIA (quem e o dono da tarefa), nos tons do tema.
+    case DONO_APP:     return TEMA_APP_CIANO;
+    case DONO_FUNDO:   return TEMA_APP_ROXO;
+    case DONO_SERVICO: return TEMA_APP_AMARELO;
+    default:           return TEMA_TEXTO_3;
   }
 }
 
@@ -81,14 +83,7 @@ static const int BT_L = 280, BT_A = 56;
 
 static void ler_flash_programa(void)
 {
-  const esp_partition_t* p = esp_ota_get_running_partition();
-  if (!p) { return; }
-  esp_partition_pos_t pos = { .offset = p->address, .size = p->size };
-  esp_image_metadata_t meta;
-  if (esp_image_get_metadata(&pos, &meta) != ESP_OK) { return; }
-  s_flash_usado = meta.image_len;
-  s_flash_total = (uint32_t)p->size;
-  s_tem_flash   = true;
+  s_tem_flash = tab5_monitor_programa(&s_flash_usado, &s_flash_total);
 }
 
 static bool ao_abrir(void)
@@ -128,17 +123,24 @@ static void ha_quanto(char* buf, size_t n, uint32_t agora, uint32_t em)
 
 static uint16_t cor_folga(uint32_t livre, uint32_t total)
 {
-  if (total == 0) { return TFT_DARKGREY; }
+  if (total == 0) { return TEMA_TEXTO_3; }
   const int pct = (int)((uint64_t)livre * 100 / total);
-  return (pct < 10) ? TFT_RED : (pct < 25) ? TFT_YELLOW : TFT_GREENYELLOW;
+  return (pct < 10) ? TEMA_PERIGO : (pct < 25) ? TEMA_ALERTA : TEMA_SUCESSO;
 }
 
 static void corpo(lgfx::LovyanGFX& d)   { tab5_fonte_corpo(d); tab5_texto(d, TAM_CORPO); }
 static void titulo(lgfx::LovyanGFX& d)  { tab5_fonte_corpo(d); tab5_texto(d, TAM_TITULO); }
-static void mono(lgfx::LovyanGFX& d)    { d.setFont(&fonts::Font0); d.setTextSize(2); }   // 12px por caractere
+// Monoespacada: 12 px por caractere em pe; deitada, 1,6x (~10 px), para as
+// linhas de memoria (53 caracteres) caberem na coluna da direita.
+static float s_mono = 2.0f;
+static void mono(lgfx::LovyanGFX& d)    { d.setFont(&fonts::Font0); d.setTextSize(s_mono); }
 
 // A geometria da tela, a mesma para o desenho e para o toque.
-typedef struct { int y_rodape, y_prog, y_psram, y_bloco, y_ram, graf_y0, graf_y1, ev_y0, tab_y0, tab_y1, y_resumo, y_cab; } geo_t;
+// x1/l1: a coluna da tabela; x2/l2: a de eventos, grafico e memoria. Em pe
+// sao a mesma (uma embaixo da outra); deitada, lado a lado.
+typedef struct { int y_rodape, y_prog, y_psram, y_bloco, y_ram, graf_y0, graf_y1, ev_y0, tab_y0, tab_y1, y_resumo, y_recursos, y_cab;
+                 int x1, l1, x2, l2, tab_l; } geo_t;
+static const int TAB_L = 720;   // a largura da tabela (as colunas sao fixas)
 static const int EV_N = 5;
 static geo_t geometria(const area_t& a)
 {
@@ -152,11 +154,28 @@ static geo_t geometria(const area_t& a)
   g.graf_y0  = g.graf_y1 - 170;
   g.ev_y0    = g.graf_y0 - 14 - 40 - EV_N * 26;
   g.y_resumo = a.y + 12;                 // quais apps estao abertos
-  g.y_cab    = g.y_resumo + LIN + 4;     // cabecalho da tabela
+  g.y_recursos = g.y_resumo + LIN + 2;   // o que segura a suspensao (kernel/recursos)
+  g.y_cab    = g.y_recursos + LIN + 4;   // cabecalho da tabela
   g.tab_y0   = g.y_cab + LIN + 6;        // abaixo do cabecalho da tabela
   g.tab_y1   = g.ev_y0 - 10;
+  g.x1 = g.x2 = a.x + 16;
+  g.l1 = g.l2 = a.largura - 32;
+  g.tab_l = a.largura;
+  if (a.largura > a.altura && a.largura >= TAB_L + 400) {
+    // DEITADA: a tabela a esquerda com a altura toda; eventos, grafico e
+    // memoria (556 px) cabem na direita (584 px), sem rolar a tela.
+    g.tab_y1 = a.y + a.altura - 8;
+    g.tab_l  = TAB_L;
+    g.l1     = TAB_L - 32;
+    g.x2     = a.x + TAB_L;
+    g.l2     = a.largura - TAB_L - 16;
+  }
   return g;
 }
+
+// DEITADA (teclado fisico, kernel/orientacao) a area tem ~584 px. Antes a
+// tela inteira rolava (a tabela, e depois eventos, grafico e memoria); agora
+// sao duas colunas (ver geometria) e nada rola alem da tabela, como em pe.
 
 static int linha_altura(int, void*) { return LIN; }
 
@@ -178,13 +197,13 @@ static void linha_texto(int li, linha_txt_t* t)
     for (int k = 0; k < s_f.n; ++k) { if (s_f.t[k].tipo == tipo) { ++n; } }
     t->cabecalho = true;
     t->cor_grupo = cor_grupo(tipo);
-    snprintf(t->nome, sizeof(t->nome), "%s (%d)", GRUPO_NOME[tipo], n);
+    snprintf(t->nome, sizeof(t->nome), "%s (%d)", tr(GRUPO_NOME[tipo]), n);
     return;
   }
   const mon_tarefa_t& m = s_f.t[i];
   t->cor_grupo = cor_grupo(m.tipo);
-  t->cor_nome  = m.pilha_livre < 512 ? TFT_RED : TFT_WHITE;
-  t->cor_pico  = m.pct_pico > 60 ? TFT_ORANGE : TFT_LIGHTGREY;
+  t->cor_nome  = m.pilha_livre < 512 ? TEMA_PERIGO : TEMA_TEXTO;
+  t->cor_pico  = m.pct_pico > 60 ? TEMA_ALERTA : TEMA_TEXTO_2;
   snprintf(t->nome, sizeof(t->nome), "%-14.14s", m.nome);
   snprintf(t->cpu,  sizeof(t->cpu),  "%5.1f", (double)m.pct);
   snprintf(t->pico, sizeof(t->pico), "%5.1f", (double)m.pct_pico);
@@ -213,18 +232,18 @@ static void linha_desenhar(lgfx::LovyanGFX& d, int li, int x0, int y, int, void*
   corpo(d);
   d.setTextDatum(top_left);
   if (t.cabecalho) {
-    d.setTextColor(t.cor_grupo, TFT_BLACK);
+    d.setTextColor(t.cor_grupo, TEMA_FUNDO);
     d.drawString(t.nome, x, y + 2);
     d.drawFastHLine(x + (int)d.textWidth(t.nome) + 12, y + LIN / 2, 400, t.cor_grupo);
     return;
   }
   d.fillRect(x0 + 4, y + 4, 6, LIN - 8, t.cor_grupo);   // a marca do grupo
-  d.setTextColor(t.cor_nome, TFT_BLACK);
+  d.setTextColor(t.cor_nome, TEMA_FUNDO);
   d.drawString(t.nome, x, y);
   d.drawString(t.cpu,  x + 240, y);
-  d.setTextColor(t.cor_pico, TFT_BLACK);
+  d.setTextColor(t.cor_pico, TEMA_FUNDO);
   d.drawString(t.pico, x + 340, y);
-  d.setTextColor(t.cor_nome, TFT_BLACK);
+  d.setTextColor(t.cor_nome, TEMA_FUNDO);
   d.drawString(t.nucleo, x + 465, y);
   d.drawString(t.prio,   x + 540, y);
   d.drawString(t.pilha,  x + 590, y);
@@ -242,7 +261,7 @@ static void linha_desenhar(lgfx::LovyanGFX& d, int li, int x0, int y, int, void*
 // grafico, os "ha Ns" - e so isso que vai para a tela.
 typedef struct { char txt[96]; uint16_t cor; bool ok; } campo_t;
 
-static campo_t  s_c_resumo, s_c_ev_tit, s_c_ev[EV_N], s_c_cpu_tit, s_c_cpu_val;
+static campo_t  s_c_resumo, s_c_recursos, s_c_ev_tit, s_c_ev[EV_N], s_c_cpu_tit, s_c_cpu_val;
 static campo_t  s_c_ram, s_c_bloco, s_c_psram, s_c_prog, s_c_rodape;
 static uint32_t s_sig[MON_MAX_TAREFAS + 4];
 static int      s_sig_n = -1;              // -1 = a tabela inteira de novo
@@ -250,7 +269,7 @@ static uint32_t s_graf_uptime = 0;         // amostra que o grafico mostra
 
 static void esquecer_campos(void)
 {
-  campo_t* todos[] = { &s_c_resumo, &s_c_ev_tit, &s_c_cpu_tit, &s_c_cpu_val,
+  campo_t* todos[] = { &s_c_resumo, &s_c_recursos, &s_c_ev_tit, &s_c_cpu_tit, &s_c_cpu_val,
                        &s_c_ram, &s_c_bloco, &s_c_psram, &s_c_prog, &s_c_rodape };
   for (campo_t* c : todos) { c->ok = false; }
   for (int k = 0; k < EV_N; ++k) { s_c_ev[k].ok = false; }
@@ -267,9 +286,9 @@ static void campo(lgfx::LovyanGFX& d, campo_t* c, const char* txt, uint16_t cor,
   snprintf(c->txt, sizeof(c->txt), "%s", txt);
   c->cor = cor;
   c->ok = true;
-  d.fillRect(direita ? x - l : x, y, l, a, TFT_BLACK);
+  d.fillRect(direita ? x - l : x, y, l, a, TEMA_FUNDO);
   d.setTextDatum(direita ? top_right : top_left);
-  d.setTextColor(cor, TFT_BLACK);
+  d.setTextColor(cor, TEMA_FUNDO);
   d.drawString(txt, x, y);
   d.setTextDatum(top_left);
 }
@@ -278,7 +297,8 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 {
   const auto estilo = d.getTextStyle();
   const geo_t g = geometria(a);
-  const area_t janela = { a.x, g.tab_y0, a.largura, g.tab_y1 - g.tab_y0 };
+  const area_t janela = { a.x, g.tab_y0, g.tab_l, g.tab_y1 - g.tab_y0 };
+  s_mono = g.x2 != g.x1 ? 1.6f : 2.0f;
 
   // A ESTRUTURA (titulos, linhas, moldura, botao) so quando o sistema acabou
   // de limpar a area - abrir, voltar do repouso. Nesse caso tudo o que os
@@ -295,19 +315,20 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   const uint32_t agora_s = (uint32_t)(esp_timer_get_time() / 1000000LL);
   const uint32_t atraso = (tem && agora_s > s_nova.uptime_s) ? agora_s - s_nova.uptime_s : 0;
   if (tem && !estrutura && s_nova.uptime_s == s_f.uptime_s && atraso <= 3) {
-    lista_desenhar(&s_lista, d, janela, TFT_BLACK, false);
+    lista_desenhar(&s_lista, d, janela, TEMA_FUNDO, false);
     d.setTextStyle(estilo);
     return;
   }
   s_forcar = false;
   d.setTextDatum(top_left);
 
-  const int x = a.x + 16, larg = a.largura - 32, lin = LIN;
+  const int x = g.x1, larg = g.l1, lin = LIN;
+  const int xb = g.x2, lb = g.l2;   // eventos, grafico, memoria e rodape
   char buf[96], m1[12], m2[12], m3[12], h[16];
 
   if (!tem) {
     corpo(d);
-    campo(d, &s_c_resumo, "monitor ainda sem a primeira amostra...", TFT_LIGHTGREY, x, g.y_resumo, larg, lin);
+    campo(d, &s_c_resumo, tr("monitor ainda sem a primeira amostra..."), TEMA_TEXTO_2, x, g.y_resumo, larg, lin);
     d.setTextStyle(estilo);
     return;
   }
@@ -321,19 +342,19 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
 
   if (estrutura) {
     // Cabecalho da tabela.
-    titulo(d); d.setTextColor(TFT_CYAN, TFT_BLACK);
-    d.drawString("TAREFA", x, g.y_cab);
-    d.drawString("CPU",    x + 250, g.y_cab);
-    d.drawString("PICO",   x + 345, g.y_cab);
-    d.drawString("NUC",    x + 460, g.y_cab);
-    d.drawString("PRI",    x + 535, g.y_cab);
-    d.drawString("PILHA",  x + 600, g.y_cab);
-    d.drawFastHLine(x, g.y_cab + lin, larg, TFT_DARKGREY);
+    titulo(d); d.setTextColor(TEMA_TEXTO_2, TEMA_FUNDO);
+    d.drawString(tr("TAREFA"), x, g.y_cab);
+    d.drawString(tr("CPU"),    x + 250, g.y_cab);
+    d.drawString(tr("PICO"),   x + 345, g.y_cab);
+    d.drawString(tr("NUC"),    x + 460, g.y_cab);
+    d.drawString(tr("PRI"),    x + 535, g.y_cab);
+    d.drawString(tr("PILHA"),  x + 600, g.y_cab);
+    d.drawFastHLine(x, g.y_cab + lin, larg, TEMA_LINHA);
     // Moldura do grafico e separador da memoria.
-    d.drawRect(x, gy0, larg, gh, TFT_DARKGREY);
-    d.drawFastHLine(x, y_ram - 8, larg, TFT_DARKGREY);
-    tab5_botao(d, a.x + a.largura - 16 - BT_L, y_rodape, BT_L, BT_A, "ZERAR PICOS", TFT_ORANGE,
-               TFT_BLACK, TAB5_BOTAO_TEXTO_GRANDE);
+    d.drawRect(xb, gy0, lb, gh, TEMA_LINHA);
+    d.drawFastHLine(xb, y_ram - 8, lb, TEMA_LINHA);
+    tab5_botao(d, a.x + a.largura - 16 - BT_L, y_rodape, BT_L, BT_A, tr("ZERAR PICOS"), TEMA_ALERTA,
+               TEMA_FUNDO, TAB5_BOTAO_TEXTO_GRANDE);
   }
 
   // ---- quem esta aberto: o app na frente e as partes de fundo ------------
@@ -342,12 +363,34 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
     fundo_info_t fi[4];
     const int nf = sistema_fundo_listar(fi, 4);
     char resumo[96];
-    int k = snprintf(resumo, sizeof(resumo), "EM FUNDO: ");
-    if (nf == 0) { snprintf(resumo + k, sizeof(resumo) - k, "nenhum app"); }
+    int k = snprintf(resumo, sizeof(resumo), tr("EM FUNDO: "));
+    // Cada app aberto no servidor web conta como rodando de fundo (no PC).
+    const char* web[WEB_PARTES_MAX];
+    const int nw = tab5_web_abertos(web, WEB_PARTES_MAX);
+    if (nf == 0 && nw == 0) { snprintf(resumo + k, sizeof(resumo) - k, tr("nenhum app")); }
     for (int j = 0; j < nf && k < (int)sizeof(resumo); ++j) {
       k += snprintf(resumo + k, sizeof(resumo) - k, "%s%s", j ? ", " : "", fi[j].nome);
     }
-    campo(d, &s_c_resumo, resumo, nf ? TFT_VIOLET : TFT_DARKGREY, x, g.y_resumo, larg, lin);
+    for (int j = 0; j < nw && k < (int)sizeof(resumo); ++j) {
+      k += snprintf(resumo + k, sizeof(resumo) - k, tr("%s%s (no PC)"), (nf || j) ? ", " : "", tr(web[j]));
+    }
+    campo(d, &s_c_resumo, resumo, (nf || nw) ? TEMA_APP_ROXO : TEMA_TEXTO_3, x, g.y_resumo, larg, lin);
+  }
+
+  // ---- o que segura a suspensao: os recursos em uso (kernel/recursos.h) ---
+  // Responde "por que nao dorme": cada linha e um recurso e quem o declarou
+  // (o app, o navegador, o Mesh). Nenhum = a tela apagada desce a 40 MHz.
+  {
+    corpo(d);
+    recurso_uso_t u[RECURSOS_MAX];
+    const int nr = sistema_recursos(u, RECURSOS_MAX);
+    char rr[96];
+    int k = snprintf(rr, sizeof(rr), tr("EM USO: "));
+    if (nr == 0) { snprintf(rr + k, sizeof(rr) - k, tr("nenhum recurso")); }
+    for (int j = 0; j < nr && k < (int)sizeof(rr); ++j) {
+      k += snprintf(rr + k, sizeof(rr) - k, "%s%s (%s)", j ? ", " : "", tr(sistema_recurso_nome(u[j].r)), u[j].quem);
+    }
+    campo(d, &s_c_recursos, rr, nr ? TEMA_ALERTA : TEMA_TEXTO_3, x, g.y_recursos, larg, lin);
   }
 
   // ---- tabela de tarefas: so as linhas que mudaram ------------------------
@@ -363,63 +406,64 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
       lista_itens_mudaram(&s_lista, s_nlinhas);
       for (int li = 0; li < s_nlinhas; ++li) { s_sig[li] = linha_assinatura(li); }
       s_sig_n = s_nlinhas;
-      lista_desenhar(&s_lista, d, janela, TFT_BLACK, true);
+      lista_desenhar(&s_lista, d, janela, TEMA_FUNDO, true);
     } else {
       for (int li = 0; li < s_nlinhas; ++li) {
         const uint32_t sg = linha_assinatura(li);
         if (sg != s_sig[li]) { s_sig[li] = sg; lista_item_mudou(&s_lista, li); }
       }
-      lista_desenhar(&s_lista, d, janela, TFT_BLACK, estrutura);
+      lista_desenhar(&s_lista, d, janela, TEMA_FUNDO, estrutura);
     }
   }
 
   // ---- eventos (o que os gatilhos registraram) ----------------------------
   titulo(d);
-  snprintf(buf, sizeof(buf), "EVENTOS  (%lu desde o boot)", (unsigned long)tab5_monitor_total_eventos());
-  campo(d, &s_c_ev_tit, buf, TFT_CYAN, x, ev_y0, larg, 36);
+  snprintf(buf, sizeof(buf), tr("EVENTOS  (%lu desde o boot)"), (unsigned long)tab5_monitor_total_eventos());
+  campo(d, &s_c_ev_tit, buf, TEMA_TEXTO, xb, ev_y0, lb, 36);
   mono(d);
   const int nev = tab5_monitor_eventos(s_ev, EV_N);
   for (int k = 0; k < EV_N; ++k) {
     const int ey = ev_y0 + 40 + k * 26;
-    uint16_t cor = TFT_LIGHTGREY;
+    uint16_t cor = TEMA_TEXTO_2;
     if (k >= nev) {
       buf[0] = '\0';
-      if (k == 0) { snprintf(buf, sizeof(buf), "nenhum - tudo dentro dos limites"); cor = TFT_DARKGREY; }
+      if (k == 0) { snprintf(buf, sizeof(buf), tr("nenhum - tudo dentro dos limites")); cor = TEMA_TEXTO_3; }
     } else {
       ha_quanto(h, sizeof(h), agora, s_ev[k].uptime_s);
-      snprintf(buf, sizeof(buf), "%-8s %.46s", h, s_ev[k].texto);
-      cor = (k == 0) ? TFT_YELLOW : TFT_LIGHTGREY;
+      snprintf(buf, sizeof(buf), "%-8s %.*s", h, (int)(lb / (6.0f * s_mono)) - 9, s_ev[k].texto);
+      cor = (k == 0) ? TEMA_ALERTA : TEMA_TEXTO_2;
     }
-    campo(d, &s_c_ev[k], buf, cor, x, ey, larg, 26);
+    campo(d, &s_c_ev[k], buf, cor, xb, ey, lb, 26);
   }
 
   // ---- grafico de CPU (5 min) ---------------------------------------------
   {
     titulo(d);
     ha_quanto(h, sizeof(h), agora, s_f.cpu_pico_em);
-    snprintf(buf, sizeof(buf), "CPU 5 min   pico %.0f%% %s", (double)s_f.cpu_pico, h);
-    campo(d, &s_c_cpu_tit, buf, TFT_CYAN, x, graf_y0, larg - 120, 36);
+    snprintf(buf, sizeof(buf), tr("CPU 5 min   pico %.0f%% %s"), (double)s_f.cpu_pico, h);
+    campo(d, &s_c_cpu_tit, buf, TEMA_TEXTO, xb, graf_y0, lb - 120, 36);
     snprintf(buf, sizeof(buf), "%.0f%%", (double)s_f.cpu);
-    campo(d, &s_c_cpu_val, buf, s_f.cpu > 80 ? TFT_RED : s_f.cpu > 50 ? TFT_YELLOW : TFT_GREENYELLOW,
-          x + larg, graf_y0, 120, 36, true);
+    campo(d, &s_c_cpu_val, buf, s_f.cpu > 80 ? TEMA_PERIGO : s_f.cpu > 50 ? TEMA_ALERTA : TEMA_SUCESSO,
+          xb + lb, graf_y0, 120, 36, true);
 
     // O grafico muda a cada amostra (uma nova entra pela direita): o MIOLO e
     // repintado, uma vez por amostra; a moldura fica.
     if (s_graf_uptime != agora) {
       s_graf_uptime = agora;
-      d.fillRect(x + 1, gy0 + 1, larg - 2, gh - 2, TFT_BLACK);
+      d.fillRect(xb + 1, gy0 + 1, lb - 2, gh - 2, TEMA_FUNDO);
       for (int k = 1; k < 4; ++k) {
-        d.drawFastHLine(x + 1, gy0 + (gh * k) / 4, larg - 2, TAB5_GRAFICO_COR_GRADE);
-        d.drawFastVLine(x + (larg * k) / 4, gy0 + 1, gh - 2, TAB5_GRAFICO_COR_GRADE);
+        d.drawFastHLine(xb + 1, gy0 + (gh * k) / 4, lb - 2, TAB5_GRAFICO_COR_GRADE);
+        d.drawFastVLine(xb + (lb * k) / 4, gy0 + 1, gh - 2, TAB5_GRAFICO_COR_GRADE);
       }
       const int n = tab5_monitor_historico(s_cpu, nullptr, nullptr, MON_HIST_N);
       int px0 = 0, py0 = 0;
       for (int k = 0; k < n; ++k) {
         // Alinhado a direita: o mais novo sempre na borda, o grafico enche da
         // direita para a esquerda nos primeiros 5 minutos.
-        const int px = x + 2 + ((MON_HIST_N - n + k) * (larg - 4)) / (MON_HIST_N - 1);
+        const int px = xb + 2 + ((MON_HIST_N - n + k) * (lb - 4)) / (MON_HIST_N - 1);
         const int py = gy0 + gh - 2 - (int)(s_cpu[k] * (float)(gh - 4) / 100.0f);
-        if (k > 0) { d.drawLine(px0, py0, px, py, TFT_GREENYELLOW); }
+        // cor de DADO: a curva da CPU
+        if (k > 0) { d.drawLine(px0, py0, px, py, TEMA_APP_LIMA); }
         px0 = px; py0 = py;
       }
     }
@@ -438,23 +482,23 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   // proprios espacos e o "min" do bloco saia 2 casas fora.
   char v[24];
   snprintf(v, sizeof(v), "%s/%s", m1, m2);
-  snprintf(buf, sizeof(buf), "%-6s%-12s%-14s min %s %s", "RAM", "livre", v, m3, h);
-  campo(d, &s_c_ram, buf, cor_folga(r.livre, r.total), x, y_ram, larg, 24);
+  snprintf(buf, sizeof(buf), tr("%-6s%-12s%-14s min %s %s"), tr("RAM"), tr("livre"), v, m3, h);
+  campo(d, &s_c_ram, buf, cor_folga(r.livre, r.total), xb, y_ram, lb, 24);
   mem_txt(m1, sizeof(m1), r.maior_bloco); mem_txt(m3, sizeof(m3), r.min_bloco);
   ha_quanto(h, sizeof(h), agora, r.min_bloco_em);
-  snprintf(buf, sizeof(buf), "%-6s%-12s%-14s min %s %s", "", "maior bloco", m1, m3, h);
-  campo(d, &s_c_bloco, buf, r.maior_bloco < 16 * 1024 ? TFT_RED : TFT_LIGHTGREY, x, y_bloco, larg, 24);
+  snprintf(buf, sizeof(buf), tr("%-6s%-12s%-14s min %s %s"), "", tr("maior bloco"), m1, m3, h);
+  campo(d, &s_c_bloco, buf, r.maior_bloco < 16 * 1024 ? TEMA_PERIGO : TEMA_TEXTO_2, xb, y_bloco, lb, 24);
   const mon_mem_t& p = s_f.psram;
   mem_txt(m1, sizeof(m1), p.livre); mem_txt(m2, sizeof(m2), p.total); mem_txt(m3, sizeof(m3), p.min_livre);
   ha_quanto(h, sizeof(h), agora, p.min_livre_em);
   snprintf(v, sizeof(v), "%s/%s", m1, m2);
-  snprintf(buf, sizeof(buf), "%-6s%-12s%-14s min %s %s", "PSRAM", "livre", v, m3, h);
-  campo(d, &s_c_psram, buf, cor_folga(p.livre, p.total), x, y_psram, larg, 24);
+  snprintf(buf, sizeof(buf), tr("%-6s%-12s%-14s min %s %s"), tr("PSRAM"), tr("livre"), v, m3, h);
+  campo(d, &s_c_psram, buf, cor_folga(p.livre, p.total), xb, y_psram, lb, 24);
   if (s_tem_flash) {
     mem_txt(m1, sizeof(m1), s_flash_usado); mem_txt(m2, sizeof(m2), s_flash_total);
     snprintf(v, sizeof(v), "%s/%s", m1, m2);
-    snprintf(buf, sizeof(buf), "%-6s%-12s%-14s", "PROG", "usado", v);
-    campo(d, &s_c_prog, buf, cor_folga(s_flash_total - s_flash_usado, s_flash_total), x, y_prog, larg, 24);
+    snprintf(buf, sizeof(buf), "%-6s%-12s%-14s", tr("PROG"), tr("usado"), v);
+    campo(d, &s_c_prog, buf, cor_folga(s_flash_total - s_flash_usado, s_flash_total), xb, y_prog, lb, 24);
   }
 
   // ---- rodape: uptime (o botao ZERAR PICOS e estrutura) -------------------
@@ -464,11 +508,11 @@ static void desenhar(lgfx::LovyanGFX& d, const area_t& a)
   else                 { snprintf(h, sizeof(h), "%ud%02uh", (unsigned)(up / 86400), (unsigned)((up % 86400) / 3600)); }
   corpo(d);
   if (atraso > 3) {
-    snprintf(buf, sizeof(buf), "monitor sem amostra há %us", (unsigned)atraso);
-    campo(d, &s_c_rodape, buf, TFT_YELLOW, x, y_rodape + 10, larg - BT_L - 16, lin);
+    snprintf(buf, sizeof(buf), tr("monitor sem amostra há %us"), (unsigned)atraso);
+    campo(d, &s_c_rodape, buf, TEMA_ALERTA, xb, y_rodape + 10, lb - BT_L - 16, lin);
   } else {
-    snprintf(buf, sizeof(buf), "%d tarefas | no ar %s", s_f.n, h);
-    campo(d, &s_c_rodape, buf, TFT_LIGHTGREY, x, y_rodape + 10, larg - BT_L - 16, lin);
+    snprintf(buf, sizeof(buf), tr("%d tarefas | no ar %s"), s_f.n, h);
+    campo(d, &s_c_rodape, buf, TEMA_TEXTO_2, xb, y_rodape + 10, lb - BT_L - 16, lin);
   }
 
   d.setTextStyle(estilo);
@@ -531,7 +575,6 @@ extern const app_t APP_TAREFAS = {
   .nome  = "Tarefas",
   .cor   = TFT_GREENYELLOW,
   .perfil = { },
-  .piso_repouso_mhz = 0,
   .ao_abrir  = ao_abrir,
   .ao_fechar = ao_fechar,
   .desenhar  = desenhar,
@@ -539,4 +582,5 @@ extern const app_t APP_TAREFAS = {
   .ao_tocar_nivel = ao_tocar_nivel,
   .periodo_ms = 1000,   // o monitor amostra a 1Hz; a janela acompanha
   .icone = icone_tarefas,
+  .fundo_tema = true,
 };
