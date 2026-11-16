@@ -7,6 +7,22 @@ lançar uma versão (`ferramentas/lancar.sh`), estão em `docs/VERSIONAMENTO.md`
 
 ## [Não lançado]
 
+## [0.9.1] - 2026-11-15
+
+### Adicionado
+- **Animação de boot** (`kernel/boot_anim`): no lugar do "M5Tab OS"
+  parado, uma teia viva - sete nós fixos da malha, com halo, e 60 pontos de
+  fundo que passeiam se ligando e se soltando deles; dos nós saem caracteres
+  que voam até o centro, o nome "M5tabOS" é decifrado letra por letra (com
+  cursor de terminal) e aparece "[ conectado ]". ~1,9 s, sorteada a cada boot,
+  ~30 quadros/s pelo compositor; um toque pula. Só ao ligar (não ao acordar),
+  e a chave `TAB5_MOSTRAR_ANIM_BOOT` (kernel/internal.hpp) a desliga no
+  desenvolvimento. A teia é pintada em faixas de 32 linhas na RAM interna e
+  cada faixa vai para a tela pelo DMA2D (`comp_copiar_faixa`): escrever as
+  linhas direto na PSRAM disputava a memória com o painel e, num boot a
+  frio, fez a tela piscar azul. O nome fica junto com a teia (sem caixa
+  por trás). Se a tela falhar um quadro durante a animação, o log avisa.
+
 ## [0.9.0] - 2026-11-15
 
 ### Adicionado

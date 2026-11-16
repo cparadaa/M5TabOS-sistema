@@ -42,6 +42,7 @@
 #include "ritmo.hpp"
 #include "rolagem.hpp"
 #include "tela_virtual.hpp"
+#include "boot_anim.hpp"
 #include "orientacao.hpp"
 #include "compositor.hpp"
 #include "trabalho.hpp"
@@ -618,10 +619,11 @@ static void vTaskInterface(void *pvParameters)
   // fazer isso com a tela ja em uso apagaria o conteudo por um instante.
   if (tab5_painel_toque_gt911()) { tab5_power_relogio_dpi((int)ajustes_relogio_painel()); }   // TDDI: fica o de fabrica
 
-#ifdef TAB5_MOSTRAR_SPLASH
+#ifdef TAB5_MOSTRAR_ANIM_BOOT
   // SO AGORA: o painel ja tem o relogio final e nao vai mais ser desmontado
-  // neste boot - ver o aviso grande junto de desenhar_splash() (shell.cpp).
-  desenhar_splash();
+  // neste boot (a troca de relogio apagaria a tela no meio da animacao), e a
+  // tela virtual ja existe para desenhar por ela.
+  boot_anim_mostrar();
 #endif
 
   // Quem esta no Grove? A vigia (kernel/grove.cpp) sonda um instante depois,

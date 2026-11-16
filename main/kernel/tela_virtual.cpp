@@ -358,6 +358,16 @@ bool tela_virtual_colar(lgfx::LGFXBase* gfx, int x, int y, int w, int h, const u
   return s_tv->painel.colar(x, y, w, h, src, passo);
 }
 
+bool tela_virtual_colar_faixa(const uint16_t* faixa, int y0, int alt)
+{
+  if (!s_tv || s_tv->getRotation() != 0) { return false; }
+  if (!comp_copiar_faixa(faixa, y0, alt)) { return false; }
+  // A copia abriu o quadro: o rastreador passa a apontar para a pagina de
+  // tras ja agora (o mesmo de sistema_superficie_mudou).
+  s_tv->painel.abrir();
+  return true;
+}
+
 void tela_virtual_invalidar_tudo(void)
 {
   comp_invalidar_tudo();

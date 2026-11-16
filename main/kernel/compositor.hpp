@@ -61,6 +61,14 @@ bool comp_copiar_da_frente(const tab5_ret_t& r, int ox, int oy);
 // de um app - camera) para a pagina de tras, por DMA, e o marca.
 bool comp_copiar_imagem(const void* imagem, const tab5_ret_t& r);
 
+// Leva uma FAIXA de tela inteira (FB_L x 'alt' linhas RGB565, contigua, em
+// memoria que o DMA alcanca) para as linhas y0..y0+alt da pagina de tras,
+// por DMA2D, e a marca coberta e desenhada. E o jeito de quem monta a tela
+// aos pedacos numa memoria rapida (a animacao de boot) entregar cada pedaco
+// sem a CPU copiar pixel a pixel na PSRAM. false = nao deu (quem chamou
+// cola pela CPU).
+bool comp_copiar_faixa(const void* faixa, int y0, int alt);
+
 // Apresenta o quadro, se houver algo desenhado (false = nada a fazer, ou sem
 // painel - nesse caso o quadro e descartado).
 bool comp_apresentar(void);

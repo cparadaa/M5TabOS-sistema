@@ -53,11 +53,11 @@ static const int ALTURA_NAV   = 72;   // era 96 - alta demais com a fonte suave
 static const int TOQUE_DY = 10;
 
 // ---------------------------------------------------------------------------
-// SPLASH DE BOOT - liga/desliga nos dois arquivos ao mesmo tempo (a
-// DEFINICAO mora em shell.cpp, a CHAMADA em core.cpp). Ver o aviso original
-// junto de desenhar_splash() em shell.cpp para o porque de existir.
+// ANIMACAO DE BOOT (kernel/boot_anim.hpp) - a teia com o nome decifrado.
+// Comente a linha abaixo para tirar a animacao enquanto desenvolve: quem
+// reinicia o aparelho toda hora nao precisa assistir a ela a cada vez.
 // ---------------------------------------------------------------------------
-#define TAB5_MOSTRAR_SPLASH
+#define TAB5_MOSTRAR_ANIM_BOOT
 
 // ---------------------------------------------------------------------------
 // ESTADO COMPARTILHADO - definido em core.cpp, lido (nunca escrito) por
@@ -116,9 +116,6 @@ void fechar_app(void);
 // ---------------------------------------------------------------------------
 // FUNCOES DE shell.cpp, chamadas por core.cpp (desenho e o loop principal).
 // ---------------------------------------------------------------------------
-#ifdef TAB5_MOSTRAR_SPLASH
-void desenhar_splash(void);
-#endif
 void tratar_toque(int tx, int ty);
 void desenhar_barra_status(lgfx::LovyanGFX& d, bool completo);
 bool recado_pendente(void);   // o recado da barra mudou (sistema_recado): repintar ja

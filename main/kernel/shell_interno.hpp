@@ -5,7 +5,7 @@
 // este); app fala com o sistema so por app.h.
 //
 // O shell foi partido por assunto (so mudou de arquivo, nada de logica):
-//   shell.cpp           geometria do toque, correcao vertical, diagnostico, gestos, splash, tratar_toque
+//   shell.cpp           geometria do toque, correcao vertical, diagnostico, gestos, tratar_toque
 //   shell_barra.cpp     icone de bateria, barra de status, hora, faixa de baixo da home, botao da navegacao
 //   shell_home.cpp      paginas da home, ordem dos icones, mover/remover icone, desenho da home
 //   shell_bloqueio.cpp  tela de bloqueio

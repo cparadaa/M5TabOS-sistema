@@ -50,6 +50,11 @@ bool tela_virtual_misturar_mascara(lgfx::LGFXBase* gfx, int x, int y, int w, int
 // false = 'gfx' nao e este objeto.
 bool tela_virtual_colar(lgfx::LGFXBase* gfx, int x, int y, int w, int h, const uint16_t* src, int passo);
 
+// Cola uma faixa de tela inteira (largura toda, 'alt' linhas a partir de
+// y0) pelo DMA2D (comp_copiar_faixa). So com a tela em pe (rotacao 0) e a
+// faixa em memoria de DMA. false = nao deu (use tela_virtual_colar).
+bool tela_virtual_colar_faixa(const uint16_t* faixa, int y0, int alt);
+
 // Pede a tela inteira no proximo quadro (qualquer tarefa).
 void tela_virtual_invalidar_tudo(void);
 

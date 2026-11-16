@@ -341,6 +341,18 @@ bool comp_copiar_imagem(const void* imagem, const tab5_ret_t& r)
   return true;
 }
 
+bool comp_copiar_faixa(const void* faixa, int y0, int alt)
+{
+  void* tras = comp_abrir();
+  if (!tras || !faixa || y0 < 0 || alt <= 0 || y0 + alt > (int)FB_A) { return false; }
+  const tab5_ret_t r = { 0, (int16_t)y0, (int16_t)FB_L, (int16_t)alt };
+  // A faixa e uma imagem de FB_L de largura comecando na sua propria linha 0.
+  if (!copiar(tras, r, faixa, 0, 0)) { return false; }
+  comp_cobrir(r);
+  comp_invalidar(r);
+  return true;
+}
+
 void comp_invalidar_tudo(void) { s_pedido_tudo.store(true, std::memory_order_relaxed); }
 
 bool comp_apresentar(void)

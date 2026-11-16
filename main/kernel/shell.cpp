@@ -23,7 +23,7 @@
 // PARTIDO POR ASSUNTO (so mudou de arquivo, nada de logica)
 // -------------------------------------------------------------------------
 // Este arquivo ficou com a geometria do toque, a correcao vertical, o
-// diagnostico de toque, os gestos, o splash de boot e tratar_toque() (o
+// diagnostico de toque, os gestos, tratar_toque() (o
 // roteamento do toque). O resto foi para kernel/shell_*.cpp; o que as partes
 // compartilham esta em kernel/shell_interno.hpp:
 //   shell_barra.cpp     icone de bateria, barra de status, hora, faixa de baixo da home, botao da navegacao
@@ -113,84 +113,6 @@ void tratar_gesto(int dx, int dy, int y0)
     home_mudar_pagina(dx < 0 ? +1 : -1);   // arrastar para a esquerda avanca
   }
 }
-
-// ---------------------------------------------------------------------------
-// SPLASH DE BOOT - "M5Tab OS" grande no meio da tela.
-// ---------------------------------------------------------------------------
-// #ifdef DE PROPOSITO, nao uma preferencia em runtime:
-// durante o desenvolvimento normal a gente reinicia o aparelho o tempo todo
-// para testar uma mudanca, e um splash de 1,4s a cada boot vira atrito puro
-// sem agregar nada - o usuario ja SABE que e o M5tabOS. A chave mora em
-// kernel/internal.hpp (TAB5_MOSTRAR_SPLASH) porque core.cpp precisa ver a
-// MESMA definicao para decidir se chama esta funcao.
-//
-// MORA NO SHELL, e a CHAMADA mora em core.cpp, depois de
-// tab5_power_relogio_dpi() - defeito observado: o splash piscava e sumia
-// antes dos apps. Causa: desenhar antes daquela chamada
-// significa desenhar antes do painel assumir o relogio final, e a troca de
-// relogio DESMONTA E REMONTA o DSI, apagando o que estiver na tela.
-#ifdef TAB5_MOSTRAR_SPLASH
-void desenhar_splash(void)
-{
-  auto& d = M5.Display;
-  d.fillScreen(TFT_BLACK);
-
-  // FONTE PROPRIA DO SPLASH, DE PROPOSITO DIFERENTE da tab5_fonte_titulo()
-  // atual.
-  // TODO titulo do sistema (barra, rotulo da home, secao
-  // dentro de um app) era a Orbitron_Light_32; naquele dia ela foi trocada
-  // por FreeMonoBold12pt7b em tab5_fonte_titulo() (ver o comentario grande
-  // em tab5_ui.hpp) e passou a valer em todo lugar - MENOS aqui: o splash
-  // continua com a Orbitron de proposito, e por isso NAO chama
-  // tab5_fonte_titulo() como o resto do sistema.
-  //
-  // TAMANHO 2 (dobro do nativo), NAO um valor fracionario tipo 1.5 - pedido
-  // foi "uns 150% maior" (ou seja, 2,5x), mas fonte bitmap-por-
-  // glifo como esta so pode escalar por MULTIPLO INTEIRO sem descartar/
-  // duplicar linha de pixel de um jeito irregular (ver o aviso grande sobre
-  // isso em tab5_ui.hpp - foi exatamente esse defeito que fez "CONFIG" na
-  // barra parecer outra fonte). Entre o 1x de antes (pequeno demais, motivo
-  // deste pedido) e o 3x (passaria de 500px so no "M5Tab OS", too largo para
-  // o pedido de "uns 150%"), 2x e o degrau limpo mais proximo.
-  d.setFont(&fonts::Orbitron_Light_32);
-  d.setTextSize(2);
-  d.setTextDatum(middle_center);
-
-  // NEGRITO FALSO, - a Orbitron_Light e
-  // "light" por DESENHO (ver o aviso ali em cima), e a biblioteca so tem essa
-  // variante dela (nenhuma bold, em nenhum tamanho) - nao ha fonte pronta
-  // mais grossa para trocar.
-  //
-  // SEM COR DE FUNDO aqui (so um argumento em setTextColor = so estampa
-  // pixel branco, nunca apaga o que ja esta atras) - a tela inteira ja
-  // nasceu preta no fillScreen() ali em cima, entao nao falta nada para
-  // apagar. Desenhando a MESMA string 5x, deslocada 1px para cada lado
-  // (cruz: centro + cima/baixo/esquerda/direita), cada copia so ACRESCENTA
-  // pixel branco - o traco engorda em vez de borrar.
-  //
-  // NO TAMANHO 1x (nativo) isto borraria em vez de engordar - foi o achado
-  // documentado na Orbitron da barra de status (tab5_ui.hpp): la, 1px de
-  // tela E um pixel de fonte INTEIRO, entao deslocar por 1 e pular para o
-  // pixel vizinho, nao dividir o mesmo. Aqui a fonte ja esta em 2x: 1px de
-  // tela e so METADE de um pixel de fonte, fino o bastante para engrossar a
-  // borda sem deslocar o desenho inteiro para um vizinho visivel.
-  const int cx = d.width() / 2, cy = d.height() / 2;
-  d.setTextColor(TFT_WHITE);
-  d.drawString("M5Tab OS", cx,     cy);
-  d.drawString("M5Tab OS", cx - 1, cy);
-  d.drawString("M5Tab OS", cx + 1, cy);
-  d.drawString("M5Tab OS", cx,     cy - 1);
-  d.drawString("M5Tab OS", cx,     cy + 1);
-
-  // Devolve o estado global do texto - MESMA pegadinha do datum/fonte vazando
-  // documentada em tab5_botao()/tab5_ui.hpp. O loop principal de core.cpp,
-  // logo depois, conta com top_left e a fonte de corpo, como sempre.
-  d.setTextDatum(top_left);
-  tab5_fonte_corpo(d);
-
-  vTaskDelay(pdMS_TO_TICKS(1400));
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // Toque

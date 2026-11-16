@@ -6968,6 +6968,10 @@ msgstr ""
 msgid "C6 nao responde"
 msgstr ""
 
+#: main/kernel/abertura.cpp
+msgid "[ conectado ]"
+msgstr ""
+
 #: main/kernel/boas_vindas.cpp
 msgid "CONCLUIR"
 msgstr ""

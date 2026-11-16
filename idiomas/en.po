@@ -5227,6 +5227,9 @@ msgstr "failed"
 msgid "C6 nao responde"
 msgstr "C6 does not respond"
 
+msgid "[ conectado ]"
+msgstr "[ connected ]"
+
 msgid "CONCLUIR"
 msgstr "FINISH"
 
